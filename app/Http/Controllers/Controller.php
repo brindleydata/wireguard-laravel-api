@@ -6,46 +6,76 @@ use Illuminate\Foundation\Auth\Access\AuthorizesRequests;
 use Illuminate\Foundation\Bus\DispatchesJobs;
 use Illuminate\Foundation\Validation\ValidatesRequests;
 use Illuminate\Routing\Controller as BaseController;
-use Illuminate\Support\Facades\Artisan;
+use App\WgService;
+use App\WgInterface;
+use App\WgPeer;
 
 class Controller extends BaseController
 {
     use AuthorizesRequests, DispatchesJobs, ValidatesRequests;
 
+    protected $wg;
+
+    public function __construct()
+    {
+        $this->wg = new WgService;
+    }
+
     public function index()
     {
-        $out = null;
-        $ret = Artisan::call('wg:list', [], $out);
-        var_dump($ret, $out);
+        return $this->wg->getInterfaces();
     }
 
     public function getInterface(string $link)
     {
-        return "Getting ".$link;
+        $iface = $this->wg->getInterface($link);
+        return response()->json($iface);
     }
 
-    public function storeInterface(string $link)
+    public function storeInterface(string $link, string $ip)
     {
-        return "Storing ".$link;
+        if (!$ip) {
+            throw new \InvalidArgumentException("'vpn_address' field is required.");
+        }
+
+        $ifout = request()->post('ifout', 'eth0');
+        $port = request()->post('port', mt_rand(33000, 65000));
+
+        $ret = $this->wg->storeInterface($link, $ip, $ifout, $port);
+        return response()->json($ret);
     }
 
     public function destroyInterface(string $link)
     {
-        return "Destroying ".$link;
+        $ret = $this->wg->destroyInterface($link);
+        return response()->json($ret);
     }
 
     public function getClient(string $link, string $client)
     {
-        return "Getting ".$client." on ".$link;
+        $ret = $this->wg->getPeer($link, $client);
+        return response()->json($ret);
     }
 
     public function storeClient(string $link, string $client)
     {
-        return "Storing ".$client." on ".$link;
+        $ret = $this->wg->storePeer($link, $client);
+        return response()->json($ret);
     }
 
     public function destroyClient(string $link, string $client)
     {
-        return "Destroying ".$client." on ".$link;
+        $ret = $this->wg->destroyPeer($link, $client);
+        return response()->json($ret);
+    }
+
+    public function genPubKey($priv = null)
+    {
+        if (!$priv) {
+            $priv = request()->post('priv');
+        }
+
+        $ret = $this->wg->genPubKey($priv);
+        return response()->json($ret);
     }
 }

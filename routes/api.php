@@ -19,9 +19,14 @@ Route::middleware('auth:api')->get('/user', function (Request $request) {
 });
 
 Route::get('/', 'Controller@index');
+
 Route::get('/link/{link}', 'Controller@getInterface');
-Route::post('/link/{link}', 'Controller@storeInterface');
+Route::post('/link/{link}/{ip}', 'Controller@storeInterface');
 Route::delete('/link/{link}', 'Controller@destroyInterface');
-Route::get('/{link}/{client}', 'Controller@getClient');
-Route::post('/{link}/{client}', 'Controller@storeClient');
-Route::delete('/{link}/{client}', 'Controller@destroyClient');
+
+Route::get('/client/{link}/{ip}', 'Controller@getClient');
+Route::post('/client/{link}/{client}', 'Controller@storeClient');
+Route::delete('/client/{link}/{client}', 'Controller@destroyClient');
+
+Route::get('/gen/pubkey/{priv}', 'Controller@genPubKey');
+Route::post('/gen/pubkey', 'Controller@genPubKey');
