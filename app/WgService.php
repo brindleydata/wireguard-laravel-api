@@ -91,21 +91,22 @@ class WgService
 
         $privkey = $this->genPrivKey();
         $pubkey = $this->genPubKey($privkey);
+        $allowed_net = env('WIREGUARD_ALLOWED_NET');
 
         $template = <<<EOF
         [Interface]
-        Address    = {$ip}/32
+        Address    = {$ip}/16
         SaveConfig = true
         PrivateKey = {$privkey}
         ListenPort = {$port}
-        PostUp     = iptables -A FORWARD -i %i -j ACCEPT; iptables -A FORWARD -o %i -j ACCEPT; iptables -t nat -A POSTROUTING -o {$ifout} -j MASQUERADE;
-        PostDown   = iptables -D FORWARD -i %i -j ACCEPT; iptables -D FORWARD -o %i -j ACCEPT; iptables -t nat -D POSTROUTING -o {$ifout} -j MASQUERADE;
+        PostUp     = iptables -A FORWARD -i %i -j ACCEPT; iptables -A FORWARD -o %i -j ACCEPT; iptables -t nat -A POSTROUTING -d {$allowed_net} -o {$ifout} -j MASQUERADE;
+        PostDown   = iptables -D FORWARD -i %i -j ACCEPT; iptables -D FORWARD -o %i -j ACCEPT; iptables -t nat -D POSTROUTING -d {$allowed_net} -o {$ifout} -j MASQUERADE;
         EOF;
 
         $this->_system("rm /etc/wireguard/{$link}.conf");
         $this->_system("chown -R www-data /etc/wireguard");
 
-        $ret = $this->_system("echo '{$template}\n\n' > /etc/wireguard/{$link}.conf");
+        $ret = $this->_system("echo '{$template}' > /etc/wireguard/{$link}.conf");
         if ($ret === false) {
             return false;
         }
@@ -164,8 +165,8 @@ class WgService
                 'dns',
             ], $key);
 
-            if (preg_match('~/\d+$~', $value)) {
-                $value = preg_replace('~/\d+$~', '', $value);
+            if (preg_match('~/32$~', $value)) {
+                $value = preg_replace('~/32$~', '', $value);
             }
 
             $config[$key] = $value;
@@ -191,7 +192,7 @@ class WgService
             }
         }
 
-        if ($ip == preg_replace('~/\d+$~', '', $iface->vpn_address)) {
+        if ($ip == preg_replace('~/32$~', '', $iface->vpn_address)) {
             return false;
         }
 
@@ -224,7 +225,7 @@ class WgService
 
         $this->_system("mkdir -p /etc/wireguard/clients/{$link}");
         $this->_system("chown -R www-data /etc/wireguard");
-        $ret = $this->_system("echo '{$template}\n\n' > '/etc/wireguard/clients/{$link}/{$ip}.conf'");
+        $ret = $this->_system("echo '{$template}' > '/etc/wireguard/clients/{$link}/{$ip}.conf'");
         if ($ret === false) {
             return $ret;
         }
