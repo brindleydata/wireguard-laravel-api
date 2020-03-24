@@ -1,14 +1,14 @@
 <?php
 
-namespace App;
+namespace App\WireGuard;
 
-class WgInterface
+class Adapter
 {
     public $interface;
-    public $public_key;
-    public $private_key;
-    public $listen_port;
-    public $vpn_address;
+    public $port;
+    public $subnet;
+    public $pubkey;
+    public $privkey;
     public $peers;
 
     public function __construct(?array $args)

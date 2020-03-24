@@ -6,9 +6,7 @@ use Illuminate\Foundation\Auth\Access\AuthorizesRequests;
 use Illuminate\Foundation\Bus\DispatchesJobs;
 use Illuminate\Foundation\Validation\ValidatesRequests;
 use Illuminate\Routing\Controller as BaseController;
-use App\WgService;
-use App\WgInterface;
-use App\WgPeer;
+use App\WireGuard\Service as WireGuard;
 
 class Controller extends BaseController
 {
@@ -16,9 +14,9 @@ class Controller extends BaseController
 
     protected $wg;
 
-    public function __construct()
+    public function __construct(WireGuard $wg)
     {
-        $this->wg = new WgService;
+        $this->wg = $wg;
     }
 
     public function index()

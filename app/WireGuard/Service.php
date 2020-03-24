@@ -1,39 +1,41 @@
 <?php
 
-namespace App;
+namespace App\WireGuard;
 
-class WgService
+class Service
 {
-    protected function _system($cmd)
+    protected $config;
+    protected $os;
+
+    public function __construct($config)
     {
-        exec($cmd, $output, $ret);
-        if ($ret) {
-            return false;
+        $this->config = $config;
+        $this->os = System::shot('uname');
+        if ($this->os !== 'Linux') {
+            throw new Exception("The only operating system supported yet is Linux.");
         }
-
-        return $output;
     }
 
-    public function genPsk(): ?string
+    public function genPsk(): string
     {
-        return $this->_system("wg genpsk")[0] ?? null;
+        return System::shot('wg genpsk');
     }
 
-    public function genPrivKey(): ?string
+    public function genPrivKey(): string
     {
-        return $this->_system("wg genkey")[0] ?? null;
+        return System::shot('wg genkey');
     }
 
-    public function genPubKey($priv): ?string
+    public function genPubKey($priv): string
     {
         $priv = escapeshellarg($priv);
-        return $this->_system("echo {$priv} | wg pubkey")[0] ?? null;
+        return System::shot("echo {$priv} | wg pubkey");
     }
 
     public function getInterfaces(): array
     {
-        $interfaces = $this->_system('wg show interfaces');
-        return (!empty($interfaces[0])) ? explode(' ', $interfaces[0]) : [];
+        $interfaces = System::shot('wg show interfaces');
+        return explode(' ', $interfaces);
     }
 
     public function interfaceExists(string $link)
@@ -42,16 +44,16 @@ class WgService
         return in_array($link, $interfaces);
     }
 
-    public function getInterface(string $link): ?WgInterface
+    public function getInterface(string $link): ?Adapter
     {
         if (!$this->interfaceExists($link)) {
             return null;
         }
 
-        $public_key = $this->_system("wg show {$link} public-key")[0] ?? '(none)';
-        $private_key = $this->_system("wg show {$link} private-key")[0] ?? '(none)';
-        $listen_port = $this->_system("wg show {$link} listen-port")[0] ?? '(none)';
-        $vpn_address = $this->_system("ip address show {$link} | grep inet | awk '{print $2}'")[0] ?? '(none)';
+        $public_key = System::shot("wg show {$link} public-key") ?? '(none)';
+        $private_key = System::shot("wg show {$link} private-key") ?? '(none)';
+        $listen_port = System::shot("wg show {$link} listen-port") ?? '(none)';
+        $vpn_address = System::shot("ip address show {$link} | grep inet | awk '{print $2}'") ?? '(none)';
 
         $peers = [];
         $peers_ips = $this->_system("wg show {$link} allowed-ips");
@@ -69,7 +71,7 @@ class WgService
             }
         }
 
-        return new WgInterface([
+        return new Adapter([
             'interface' => $link,
             'public_key' => $public_key,
             'private_key' => $private_key,
@@ -85,17 +87,13 @@ class WgService
             return false;
         }
 
-        if (!filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) {
-            return false;
-        }
-
         $privkey = $this->genPrivKey();
         $pubkey = $this->genPubKey($privkey);
         $allowed_net = env('WIREGUARD_ALLOWED_NET');
 
         $template = <<<EOF
         [Interface]
-        Address    = {$ip}/16
+        Address    = {$ip}
         SaveConfig = true
         PrivateKey = {$privkey}
         ListenPort = {$port}

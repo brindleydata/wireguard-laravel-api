@@ -1,8 +1,8 @@
 <?php
 
-namespace App;
+namespace App\WireGuard;
 
-class WgPeer
+class Peer
 {
     public $private_key;
     public $vpn_address;
