@@ -35,7 +35,7 @@ class Service
     public function getInterfaces(): array
     {
         $interfaces = System::shot('wg show interfaces');
-        return explode(' ', $interfaces);
+        return $interfaces ? explode(' ', $interfaces) : [];
     }
 
     public function interfaceExists(string $link)
