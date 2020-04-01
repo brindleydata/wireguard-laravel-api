@@ -7,61 +7,147 @@ class Service
     protected $config;
     protected $os;
 
+    /**
+     * Service constructor.
+     * @param $config
+     * @throws Exception
+     */
     public function __construct($config)
     {
         $this->config = $config;
         $this->os = System::shot('uname');
         if ($this->os !== 'Linux') {
-            throw new Exception("The only operating system supported yet is Linux.");
+            throw new Exception('The only operating system supported is Linux.');
         }
     }
 
-    public function genPsk(): string
+    /**
+     * @return array
+     * @throws Exception
+     */
+    public function getStatus(): array
     {
-        return System::shot('wg genpsk');
+        $cpu_cores = (int) System::shot('cat /proc/cpuinfo | grep processor | wc -l');
+        $cpu_load = (float) preg_replace('~\s.+~', '', System::shot('cat /proc/loadavg'));
+        $cpu_usage = round(($cpu_load / $cpu_cores) * 100);
+
+        $ram_free = 0;
+        $ram_total = 0;
+        foreach (System::exec('cat /proc/meminfo') as $line) {
+            list($name, $value) = preg_split('~:\s+~', $line);
+            if ($name == 'MemTotal') {
+                $ram_total = (int) $value;
+            } else if ($name == 'MemFree') {
+                $ram_free = (int) $value;
+            }
+        }
+
+        list($disk_partition, $disk_size, , $disk_free, $disk_usage, ) = preg_split('~\s+~', System::exec('df /')[1]);
+
+        return [
+            'cpu' => [
+                'cores' => $cpu_cores,
+                'load' => $cpu_load,
+                'usage' => $cpu_usage,
+            ],
+
+            'ram' => [
+                'total' => $ram_total,
+                'free' => $ram_free,
+                'usage' => round(($ram_free / $ram_total) * 100),
+            ],
+
+            'disk' => [
+                'partition' => $disk_partition,
+                'size' => (int) $disk_size,
+                'free' => (int) $disk_free,
+                'usage' => (int) preg_replace('~\s*%~', '', $disk_usage),
+            ],
+        ];
     }
 
-    public function genPrivKey(): string
-    {
-        return System::shot('wg genkey');
-    }
-
-    public function genPubKey($priv): string
-    {
-        $priv = escapeshellarg($priv);
-        return System::shot("echo {$priv} | wg pubkey");
-    }
-
+    /**
+     * @return array
+     * @throws Exception
+     */
     public function getInterfaces(): array
     {
         $interfaces = System::shot('wg show interfaces');
         return $interfaces ? explode(' ', $interfaces) : [];
     }
 
-    public function interfaceExists(string $link)
+    /**
+     * @param string $name
+     * @param bool $wireguard_only
+     * @return bool
+     * @throws Exception
+     */
+    public function interfaceExists(string $name, bool $wireguard_only = true): bool
     {
-        $interfaces = $this->getInterfaces();
-        return in_array($link, $interfaces);
+        if ($wireguard_only) {
+            return in_array($name, $this->getInterfaces());
+        }
+
+        $name = escapeshellarg($name);
+        try {
+            System::shot("ip link show {$name}");
+        } catch (\Throwable $e) {
+            return false;
+        }
+
+        return true;
     }
 
-    public function getInterface(string $link): ?Adapter
+    /**
+     * @return string
+     * @throws Exception
+     */
+    public function genPsk(): string
     {
-        if (!$this->interfaceExists($link)) {
+        return System::shot('wg genpsk');
+    }
+
+    /**
+     * @return string
+     * @throws Exception
+     */
+    public function genPrivKey(): string
+    {
+        return System::shot('wg genkey');
+    }
+
+    /**
+     * @param string $privKey
+     * @return string
+     * @throws Exception
+     */
+    public function genPubKey(string $privKey): string
+    {
+        $privKey = escapeshellarg($privKey);
+        return System::shot("echo {$privKey} | wg pubkey");
+    }
+
+
+    /*
+    public function getInterface(string $name): ?Adapter
+    {
+        if (!$this->interfaceExists($name)) {
             return null;
         }
 
-        $public_key = System::shot("wg show {$link} public-key") ?? '(none)';
-        $private_key = System::shot("wg show {$link} private-key") ?? '(none)';
-        $listen_port = System::shot("wg show {$link} listen-port") ?? '(none)';
-        $vpn_address = System::shot("ip address show {$link} | grep inet | awk '{print $2}'") ?? '(none)';
+        $name = escapeshellarg($name);
+        $public_key = System::shot("wg show {$name} public-key") ?? '(none)';
+        $private_key = System::shot("wg show {$name} private-key") ?? '(none)';
+        $listen_port = System::shot("wg show {$name} listen-port") ?? '(none)';
+        $vpn_address = System::shot("ip address show {$name} | grep inet | awk '{print $2}'") ?? '(none)';
 
         $peers = [];
-        $peers_ips = $this->_system("wg show {$link} allowed-ips");
+        $peers_ips = $this->_system("wg show {$name} allowed-ips");
 
         foreach ($peers_ips as $peer_ip) {
-            list ($peer, $ip) = preg_split('~\s+~', $peer_ip);
+            list (, $ip) = preg_split('~\s+~', $peer_ip);
             $ip = preg_replace('~/.+$~', '', $ip);
-            $peer = $this->getPeer($link, $ip);
+            $peer = $this->getPeer($name, $ip);
             if ($ip == '(none)') {
                 continue;
             }
@@ -72,7 +158,7 @@ class Service
         }
 
         return new Adapter([
-            'interface' => $link,
+            'interface' => $name,
             'public_key' => $public_key,
             'private_key' => $private_key,
             'listen_port' => $listen_port,
@@ -80,40 +166,6 @@ class Service
             'peers' => $peers,
         ]);
     }
-
-    public function storeInterface(string $link, string $ip, string $ifout, int $port): bool
-    {
-        if ($this->interfaceExists($link)) {
-            return false;
-        }
-
-        $privkey = $this->genPrivKey();
-        $pubkey = $this->genPubKey($privkey);
-        $allowed_net = env('WIREGUARD_ALLOWED_NET');
-
-        $template = <<<EOF
-        [Interface]
-        Address    = {$ip}
-        SaveConfig = true
-        PrivateKey = {$privkey}
-        ListenPort = {$port}
-        PostUp     = iptables -A FORWARD -i %i -j ACCEPT; iptables -A FORWARD -o %i -j ACCEPT; iptables -t nat -A POSTROUTING -d {$allowed_net} -o {$ifout} -j MASQUERADE;
-        PostDown   = iptables -D FORWARD -i %i -j ACCEPT; iptables -D FORWARD -o %i -j ACCEPT; iptables -t nat -D POSTROUTING -d {$allowed_net} -o {$ifout} -j MASQUERADE;
-        EOF;
-
-        $this->_system("rm /etc/wireguard/{$link}.conf");
-        $this->_system("chown -R www-data /etc/wireguard");
-
-        $ret = $this->_system("echo '{$template}' > /etc/wireguard/{$link}.conf");
-        if ($ret === false) {
-            return false;
-        }
-
-        $this->_system("systemctl enable wg-quick@{$link}", "Could not enable {$link}");
-        $this->_system("systemctl start wg-quick@{$link}", "Could not start {$link}");
-        return true;
-    }
-
 
     public function destroyInterface(string $link): bool
     {
@@ -258,5 +310,6 @@ class Service
         $this->_system("wg set {$link} peer {$id} remove");
         return true;
     }
+    */
 }
 

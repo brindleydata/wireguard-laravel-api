@@ -2,13 +2,15 @@
 
 namespace App\Http\Controllers;
 
+use App\WireGuard\Adapter;
 use Illuminate\Foundation\Auth\Access\AuthorizesRequests;
 use Illuminate\Foundation\Bus\DispatchesJobs;
 use Illuminate\Foundation\Validation\ValidatesRequests;
 use Illuminate\Routing\Controller as BaseController;
 use App\WireGuard\Service as WireGuard;
+use InvalidArgumentException;
 
-class Controller extends BaseController
+class WireGuardController extends BaseController
 {
     use AuthorizesRequests, DispatchesJobs, ValidatesRequests;
 
@@ -19,36 +21,38 @@ class Controller extends BaseController
         $this->wg = $wg;
     }
 
-    public function index()
+    public function getStatus()
+    {
+        return $this->wg->getStatus();
+    }
+
+    public function getInterfaces()
     {
         return $this->wg->getInterfaces();
     }
 
-    public function getInterface(string $link)
+    public function getInterface(string $name)
     {
-        $iface = $this->wg->getInterface($link);
-        return response()->json($iface);
+        $interface = Adapter::Read($name);
+        return response()->json($interface);
     }
 
-    public function storeInterface(string $link, string $ip)
+    public function storeInterface()
     {
-        if (!$ip) {
-            throw new \InvalidArgumentException("'vpn_address' field is required.");
-        }
+        $data = request()->all();
+        $interface = Adapter::Create($data);
+        $interface->save();
+        return response()->json($interface);
+    }
 
-        $ifout = request()->post('ifout', 'eth0');
-        $port = request()->post('port', mt_rand(33000, 65000));
-
-        $ret = $this->wg->storeInterface($link, $ip, $ifout, $port);
+    public function destroyInterface(string $name)
+    {
+        $interface = Adapter::Read($name);
+        $ret = $interface->delete();
         return response()->json($ret);
     }
 
-    public function destroyInterface(string $link)
-    {
-        $ret = $this->wg->destroyInterface($link);
-        return response()->json($ret);
-    }
-
+    /*
     public function getClient(string $link, string $client)
     {
         $ret = $this->wg->getPeer($link, $client);
@@ -76,4 +80,5 @@ class Controller extends BaseController
         $ret = $this->wg->genPubKey($priv);
         return response()->json($ret);
     }
+    */
 }

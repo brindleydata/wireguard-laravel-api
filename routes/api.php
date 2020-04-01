@@ -14,19 +14,11 @@ use Illuminate\Support\Facades\Route;
 |
 */
 
-Route::middleware('auth:api')->get('/user', function (Request $request) {
-    return $request->user();
-});
+Route::get('/interfaces', 'WireGuardController@getInterfaces');
+Route::post('/interfaces', 'WireGuardController@storeInterface');
+Route::get('/interfaces/{interface}', 'WireGuardController@getInterface');
+Route::delete('/interfaces/{interface}', 'WireGuardController@destroyInterface');
+Route::get('/status', 'WireGuardController@getStatus');
 
-Route::get('/', 'Controller@index');
-
-Route::get('/link/{link}', 'Controller@getInterface');
-Route::post('/link/{link}/{ip}', 'Controller@storeInterface');
-Route::delete('/link/{link}', 'Controller@destroyInterface');
-
-Route::get('/client/{link}/{ip}', 'Controller@getClient');
-Route::post('/client/{link}/{client}', 'Controller@storeClient');
-Route::delete('/client/{link}/{client}', 'Controller@destroyClient');
-
-Route::get('/gen/pubkey/{priv}', 'Controller@genPubKey');
-Route::post('/gen/pubkey', 'Controller@genPubKey');
+Route::post('/interfaces/{interface}/client', 'WireGuardController@storeClient');
+Route::delete('/interfaces/{interface}/client/{client}', 'WireGuardController@destroyClient');

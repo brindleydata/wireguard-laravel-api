@@ -2,22 +2,169 @@
 
 namespace App\WireGuard;
 
+use App\WireGuard\Service as WireGuard;
+
 class Adapter
 {
-    public $interface;
-    public $port;
-    public $subnet;
-    public $pubkey;
-    public $privkey;
-    public $peers;
+    private $wg;
 
-    public function __construct(?array $args)
+    public $name;
+    public $port;
+    public $ip;
+    public $subnet;
+    public $ifout;
+    public $privkey;
+    public $pubkey;
+
+    /**
+     * Adapter constructor.
+     * @param Service $wg
+     * @param string|null $privkey
+     * @throws Exception
+     */
+    public function __construct(WireGuard $wg, string $privkey = null)
     {
-        $this->interface = $args['interface'] ?? null;
-        $this->public_key = $args['public_key'] ?? null;
-        $this->private_key = $args['private_key'] ?? null;
-        $this->listen_port = $args['listen_port'] ?? null;
-        $this->vpn_address = $args['vpn_address'] ?? null;
-        $this->peers = $args['peers'] ?? [];
+        $this->wg = $wg;
+        $this->privkey = $privkey ? $privkey : $wg->genPrivKey();
+        $this->pubkey = $wg->genPubKey($this->privkey);
+    }
+
+    /**
+     * @return bool
+     * @throws Exception
+     */
+    protected function checkReadyState(): bool
+    {
+        if (empty($this->name)) {
+            throw new Exception('Missed network adapter name.');
+        }
+
+        if (empty($this->port)) {
+            throw new Exception('Missed network adapter port number.');
+        }
+
+        if (empty($this->ip)) {
+            throw new Exception('Missed network adapter IP address.');
+        }
+
+        if (empty($this->subnet)) {
+            throw new Exception('Missed network adapter subnet.');
+        }
+
+        if (empty($this->ifout)) {
+            throw new Exception('Missed output (masquerading) network adapter name.');
+        }
+
+        return true;
+    }
+
+    /**
+     * @return bool
+     * @throws Exception
+     */
+    public function save(): bool
+    {
+        if ($this->wg->interfaceExists($this->name, $wireguard_only = false)) {
+            throw new Exception("Network adapter '{$this->name}' already exists.");
+        }
+
+        $this->checkReadyState();
+
+        $template = <<<EOF
+        [Interface]
+        Address = {$this->ip}
+        SaveConfig = true
+        PrivateKey = {$this->privkey}
+        ListenPort = {$this->port}
+        PostUp = iptables -A FORWARD -i %i -j ACCEPT; iptables -A FORWARD -o %i -j ACCEPT; iptables -t nat -A POSTROUTING -d {$this->subnet} -o {$this->ifout} -j MASQUERADE;
+        PostDown = iptables -D FORWARD -i %i -j ACCEPT; iptables -D FORWARD -o %i -j ACCEPT; iptables -t nat -D POSTROUTING -d {$this->subnet} -o {$this->ifout} -j MASQUERADE;
+        EOF;
+
+        try {
+            System::shot("sudo systemctl stop wg-quick@{$this->name}");
+            System::shot("sudo systemctl disable wg-quick@{$this->name}");
+            System::shot("sudo rm /etc/wireguard/{$this->name}.conf");
+        } catch (Exception $ignore) {
+            // no action needed
+        }
+
+        try {
+            System::shot("echo '{$template}' | sudo tee /etc/wireguard/{$this->name}.conf");
+            System::shot("sudo systemctl enable wg-quick@{$this->name}");
+            System::shot("sudo systemctl start wg-quick@{$this->name}");
+        } catch (Exception $e) {
+            try {
+                System::shot("sudo systemctl stop wg-quick@{$this->name}");
+                System::shot("sudo systemctl disable wg-quick@{$this->name}");
+            } catch (Exception $ignore) {
+                // do nothing
+            }
+
+            throw $e;
+        }
+
+        return true;
+    }
+
+    /**
+     * @return bool
+     * @throws Exception
+     */
+    public function delete(): bool
+    {
+        System::shot("sudo systemctl stop wg-quick@{$this->name}");
+        System::shot("sudo systemctl disable wg-quick@{$this->name}");
+        return true;
+    }
+
+    /**
+     * @param array $data
+     * @return Adapter
+     * @throws Exception
+     */
+    public static function Create(array $data): Adapter
+    {
+        $name = strval($data['name'] ?? null);
+        $port = intval($data['port'] ?? mt_rand(32767, 65535));
+        $ifout = strval($data['ifout'] ?? 'eth0');
+        $subnet = strval($data['subnet'] ?? '0.0.0.0/0');
+        $ip = strval($data['ip'] ?? null);
+
+        if (!strpos($ip, '/')) {
+            $ip .= "/24";
+        }
+        
+        $interface = new Adapter(app()->get(WireGuard::class));
+        $interface->name = $name;
+        $interface->port = $port;
+        $interface->ip = $ip;
+        $interface->ifout = $ifout;
+        $interface->subnet = $subnet;
+
+        return $interface;
+    }
+
+    /**
+     * @param string $name
+     * @return Adapter
+     * @throws Exception
+     */
+    public static function Read(string $name): Adapter
+    {
+        try {
+            $privkey = System::shot("sudo wg show {$name} private-key");
+        } catch (Exception $e) {
+            throw new Exception("Could not find network adapter '{$name}'.");
+        }
+
+        $interface = new Adapter(app()->get(WireGuard::class), $privkey);
+        $interface->name = $name;
+        $ip = System::shot("sudo ip address show {$name} | grep inet | awk '{print $2}'");
+        $interface->ip = preg_replace('~/\d+$~', '', $ip);
+        $interface->port = System::shot("sudo wg show {$name} listen-port");
+        $interface->subnet = System::shot("sudo iptables -t nat -L POSTROUTING -n -v | grep MASQUERADE | awk '{print $8}'");
+        $interface->ifout = System::shot("sudo iptables -t nat -L POSTROUTING -n -v | grep MASQUERADE | awk '{print $7}'");
+
+        return $interface;
     }
 }
