@@ -2,7 +2,7 @@
 
 namespace App\Http;
 
-use App\Http\Middleware\AuthenticateApiKey;
+use App\Http\Middleware\AuthenticateByApiKey;
 use App\Http\Middleware\TrimStrings;
 use Illuminate\Foundation\Http\Kernel as HttpKernel;
 use Illuminate\Foundation\Http\Middleware\ConvertEmptyStringsToNull;
@@ -19,6 +19,5 @@ class Kernel extends HttpKernel
     protected $middleware = [
         TrimStrings::class,
         ConvertEmptyStringsToNull::class,
-        AuthenticateApiKey::class,
     ];
 }

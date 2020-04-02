@@ -11,7 +11,7 @@ class Adapter
     public $name;
     public $port;
     public $ip;
-    public $subnet;
+    public $subnets;
     public $ifout;
     public $privkey;
     public $pubkey;
@@ -47,8 +47,8 @@ class Adapter
             throw new Exception('Missed network adapter IP address.');
         }
 
-        if (empty($this->subnet)) {
-            throw new Exception('Missed network adapter subnet.');
+        if (empty($this->subnets)) {
+            throw new Exception('Missed target subnets.');
         }
 
         if (empty($this->ifout)) {
@@ -56,6 +56,16 @@ class Adapter
         }
 
         return true;
+    }
+
+    /**
+     * @return string
+     * @throws Exception
+     */
+    public function getEndPoint(): string
+    {
+        $public_ip = System::shot("curl --interface {$this->ifout} ifconfig.me");
+        return $public_ip . ":" . $this->port;
     }
 
     /**
@@ -76,8 +86,8 @@ class Adapter
         SaveConfig = true
         PrivateKey = {$this->privkey}
         ListenPort = {$this->port}
-        PostUp = iptables -A FORWARD -i %i -j ACCEPT; iptables -A FORWARD -o %i -j ACCEPT; iptables -t nat -A POSTROUTING -d {$this->subnet} -o {$this->ifout} -j MASQUERADE;
-        PostDown = iptables -D FORWARD -i %i -j ACCEPT; iptables -D FORWARD -o %i -j ACCEPT; iptables -t nat -D POSTROUTING -d {$this->subnet} -o {$this->ifout} -j MASQUERADE;
+        PostUp = iptables -A FORWARD -i %i -j ACCEPT; iptables -A FORWARD -o %i -j ACCEPT; iptables -t nat -A POSTROUTING -d {$this->subnets} -o {$this->ifout} -j MASQUERADE;
+        PostDown = iptables -D FORWARD -i %i -j ACCEPT; iptables -D FORWARD -o %i -j ACCEPT; iptables -t nat -D POSTROUTING -d {$this->subnets} -o {$this->ifout} -j MASQUERADE;
         EOF;
 
         try {
@@ -127,19 +137,19 @@ class Adapter
         $name = strval($data['name'] ?? null);
         $port = intval($data['port'] ?? mt_rand(32767, 65535));
         $ifout = strval($data['ifout'] ?? 'eth0');
-        $subnet = strval($data['subnet'] ?? '0.0.0.0/0');
+        $subnets = strval($data['subnets'] ?? null);
         $ip = strval($data['ip'] ?? null);
 
         if (!strpos($ip, '/')) {
             $ip .= "/24";
         }
-        
+
         $interface = new Adapter(app()->get(WireGuard::class));
         $interface->name = $name;
         $interface->port = $port;
         $interface->ip = $ip;
         $interface->ifout = $ifout;
-        $interface->subnet = $subnet;
+        $interface->subnets = $subnets;
 
         return $interface;
     }
@@ -159,11 +169,10 @@ class Adapter
 
         $interface = new Adapter(app()->get(WireGuard::class), $privkey);
         $interface->name = $name;
-        $ip = System::shot("sudo ip address show {$name} | grep inet | awk '{print $2}'");
-        $interface->ip = preg_replace('~/\d+$~', '', $ip);
+        $interface->ip = System::shot("sudo ip address show dev {$name} | grep inet | awk '{print $2}'");
         $interface->port = System::shot("sudo wg show {$name} listen-port");
-        $interface->subnet = System::shot("sudo iptables -t nat -L POSTROUTING -n -v | grep MASQUERADE | awk '{print $8}'");
         $interface->ifout = System::shot("sudo iptables -t nat -L POSTROUTING -n -v | grep MASQUERADE | awk '{print $7}'");
+        $interface->subnets = System::shot("sudo cat /etc/wireguard/{$name}.conf | grep PostUp | awk '{print $23}'");
 
         return $interface;
     }

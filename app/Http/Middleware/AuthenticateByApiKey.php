@@ -5,7 +5,7 @@ namespace App\Http\Middleware;
 use Illuminate\Auth\Middleware\Authenticate as Middleware;
 use Closure;
 
-class AuthenticateApiKey extends Middleware
+class AuthenticateByApiKey extends Middleware
 {
     public function handle($request, Closure $next, ...$guards)
     {

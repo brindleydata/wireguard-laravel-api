@@ -1,6 +1,5 @@
 <?php
 
-use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Route;
 
 /*
@@ -14,11 +13,17 @@ use Illuminate\Support\Facades\Route;
 |
 */
 
-Route::get('/interfaces', 'WireGuardController@getInterfaces');
-Route::post('/interfaces', 'WireGuardController@storeInterface');
-Route::get('/interfaces/{interface}', 'WireGuardController@getInterface');
-Route::delete('/interfaces/{interface}', 'WireGuardController@destroyInterface');
+use App\Http\Middleware\AuthenticateByApiKey;
+
 Route::get('/status', 'WireGuardController@getStatus');
 
-Route::post('/interfaces/{interface}/client', 'WireGuardController@storeClient');
-Route::delete('/interfaces/{interface}/client/{client}', 'WireGuardController@destroyClient');
+Route::middleware(AuthenticateByApiKey::class)->group(function () {
+    Route::get('/interfaces', 'WireGuardController@getInterfaces');
+    Route::post('/interfaces', 'WireGuardController@storeInterface');
+    Route::get('/interfaces/{interface}', 'WireGuardController@getInterface');
+    Route::delete('/interfaces/{interface}', 'WireGuardController@destroyInterface');
+
+    Route::get('/clients/{interface}', 'WireGuardController@getClients');
+    Route::post('/clients/{interface}', 'WireGuardController@storeClient');
+    Route::delete('/clients/{interface}/{client}', 'WireGuardController@destroyClient');
+});

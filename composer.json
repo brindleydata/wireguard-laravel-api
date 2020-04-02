@@ -1,10 +1,10 @@
 {
-    "name": "laravel/laravel",
+    "name": "iloveyou/wireguard",
     "type": "project",
     "description": "The Laravel Framework.",
     "keywords": [
-        "framework",
-        "laravel"
+        "wireguard",
+        "brindley"
     ],
     "license": "MIT",
     "require": {
@@ -36,15 +36,6 @@
     "autoload": {
         "psr-4": {
             "App\\": "app/"
-        },
-        "classmap": [
-            "database/seeds",
-            "database/factories"
-        ]
-    },
-    "autoload-dev": {
-        "psr-4": {
-            "Tests\\": "tests/"
         }
     },
     "minimum-stability": "dev",

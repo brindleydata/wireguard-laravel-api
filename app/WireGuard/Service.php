@@ -19,6 +19,8 @@ class Service
         if ($this->os !== 'Linux') {
             throw new Exception('The only operating system supported is Linux.');
         }
+
+
     }
 
     /**
@@ -129,55 +131,6 @@ class Service
 
 
     /*
-    public function getInterface(string $name): ?Adapter
-    {
-        if (!$this->interfaceExists($name)) {
-            return null;
-        }
-
-        $name = escapeshellarg($name);
-        $public_key = System::shot("wg show {$name} public-key") ?? '(none)';
-        $private_key = System::shot("wg show {$name} private-key") ?? '(none)';
-        $listen_port = System::shot("wg show {$name} listen-port") ?? '(none)';
-        $vpn_address = System::shot("ip address show {$name} | grep inet | awk '{print $2}'") ?? '(none)';
-
-        $peers = [];
-        $peers_ips = $this->_system("wg show {$name} allowed-ips");
-
-        foreach ($peers_ips as $peer_ip) {
-            list (, $ip) = preg_split('~\s+~', $peer_ip);
-            $ip = preg_replace('~/.+$~', '', $ip);
-            $peer = $this->getPeer($name, $ip);
-            if ($ip == '(none)') {
-                continue;
-            }
-
-            if ($peer) {
-                $peers []= $peer;
-            }
-        }
-
-        return new Adapter([
-            'interface' => $name,
-            'public_key' => $public_key,
-            'private_key' => $private_key,
-            'listen_port' => $listen_port,
-            'vpn_address' => $vpn_address,
-            'peers' => $peers,
-        ]);
-    }
-
-    public function destroyInterface(string $link): bool
-    {
-        $iface = $this->getInterface($link);
-        if (!$iface) {
-            return false;
-        }
-
-        $this->_system("systemctl stop wg-quick@{$link}");
-        $this->_system("systemctl disable wg-quick@{$link}");
-        return true;
-    }
 
     public function getPeer(string $link, string $ip): ?WgPeer
     {
@@ -223,92 +176,6 @@ class Service
         }
 
         return new WgPeer($config);
-    }
-
-    public function storePeer(string $link, string $ip): bool
-    {
-        if (!filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) {
-            return false;
-        }
-
-        $iface = $this->getInterface($link);
-        if (!$iface) {
-            return false;
-        }
-
-        foreach ($iface->peers as $peer) {
-            if ($peer->vpn_address == $ip) {
-                return false;
-            }
-        }
-
-        if ($ip == preg_replace('~/32$~', '', $iface->vpn_address)) {
-            return false;
-        }
-
-        $privkey = $this->genPrivKey();
-        $pubkey = $this->genPubKey($privkey);
-        $psk = $this->genPsk();
-
-        $cmd = "bash -c 'wg set {$link} peer {$pubkey} preshared-key <(echo {$psk}) allowed-ips {$ip}/32'";
-        $ret = $this->_system($cmd);
-        if ($ret === false) {
-            return $ret;
-        }
-
-        $endpoint = env('WIREGUARD_ENDPOINT_IP');
-        $allowed_ips = env('WIREGUARD_ALLOWED_IPS');
-
-        $template = <<<EOF
-        [Interface]
-        PrivateKey = {$privkey}
-        Address    = {$ip}/32
-        DNS        = 8.8.8.8
-
-        [Peer]
-        PublicKey    = {$iface->public_key}
-        PresharedKey = {$psk}
-        AllowedIPs   = {$allowed_ips}
-        Endpoint     = {$endpoint}:{$iface->listen_port}
-        PersistentKeepalive = 25
-        EOF;
-
-        $this->_system("mkdir -p /etc/wireguard/clients/{$link}");
-        $this->_system("chown -R www-data /etc/wireguard");
-        $ret = $this->_system("echo '{$template}' > '/etc/wireguard/clients/{$link}/{$ip}.conf'");
-        if ($ret === false) {
-            return $ret;
-        }
-
-        return true;
-    }
-
-    public function destroyPeer(string $link, string $ip): bool
-    {
-        if (!filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) {
-            return false;
-        }
-
-        $iface = $this->getInterface($link);
-        if (!$iface) {
-            return false;
-        }
-
-        $peer = false;
-        foreach ($iface->peers as $src) {
-            if ($src->vpn_address == $ip) {
-                $peer = $src;
-                break;
-            }
-        }
-
-        if (!$peer) {
-            return false;
-        }
-
-        $id = $this->genPubkey($peer->private_key);
-        $this->_system("wg set {$link} peer {$id} remove");
-        return true;
     }
     */
 }
