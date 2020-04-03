@@ -47,6 +47,10 @@ class Service
         list($disk_partition, $disk_size, , $disk_free, $disk_usage, ) = preg_split('~\s+~', System::exec('df /')[1]);
 
         return [
+            'app' => [
+                'name' => env('APP_NAME'),
+                'version' => env('APP_VERSION'),
+            ],
             'cpu' => [
                 'cores' => $cpu_cores,
                 'load' => $cpu_load,
@@ -128,55 +132,5 @@ class Service
         $privKey = escapeshellarg($privKey);
         return System::shot("echo {$privKey} | wg pubkey");
     }
-
-
-    /*
-
-    public function getPeer(string $link, string $ip): ?WgPeer
-    {
-        $config = [];
-        $peer_config_file = @file("/etc/wireguard/clients/{$link}/{$ip}.conf");
-        if (empty($peer_config_file)) {
-            return null;
-        }
-
-        foreach ($peer_config_file as $line) {
-            if (strpos($line, '=') === false) {
-                continue;
-            }
-
-            $line = trim(rtrim($line));
-
-            list($key, $value) = preg_split('~\s+=\s+~', $line);
-            $key = str_replace([
-                'PrivateKey',
-                'PresharedKey',
-                'Address',
-                'PublicKey',
-                'AllowedIPs',
-                'Endpoint',
-                'PersistentKeepalive',
-                'DNS',
-            ], [
-                'private_key',
-                'preshared_key',
-                'vpn_address',
-                'remote_public_key',
-                'remote_allowed_ips',
-                'remote_endpoint',
-                'persistent_keepalive',
-                'dns',
-            ], $key);
-
-            if (preg_match('~/32$~', $value)) {
-                $value = preg_replace('~/32$~', '', $value);
-            }
-
-            $config[$key] = $value;
-        }
-
-        return new WgPeer($config);
-    }
-    */
 }
 

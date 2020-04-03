@@ -78,6 +78,10 @@ class Adapter
             throw new Exception("Network adapter '{$this->name}' already exists.");
         }
 
+        if (!$this->wg->interfaceExists($this->ifout, $wireguard_only = false)) {
+            throw new Exception("Output Network adapter '{$this->ifout}' is not exists.");
+        }
+
         $this->checkReadyState();
 
         $template = <<<EOF
