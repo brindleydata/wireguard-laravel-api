@@ -2,6 +2,8 @@
 
 namespace App\WireGuard;
 
+use Illuminate\Support\Facades\Http;
+
 class Service
 {
     protected $config;
@@ -69,6 +71,7 @@ class Service
                 'free' => (int) $disk_free,
                 'usage' => (int) preg_replace('~\s*%~', '', $disk_usage),
             ],
+            'endpoint' => Http::timeout(1)->get('http://ifconfig.me/ip')->body(),
         ];
     }
 
