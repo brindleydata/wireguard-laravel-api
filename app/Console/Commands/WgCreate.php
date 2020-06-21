@@ -45,7 +45,7 @@ class WgCreate extends WgCommand
         }
 
         $privkey = $this->genPrivKey();
-        $pubkey = $this->genPubKey($privkey);
+        //$pubkey = $this->genPubKey($privkey);
 
         $template = <<<EOF
         [Interface]

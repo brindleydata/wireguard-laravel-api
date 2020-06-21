@@ -14,7 +14,7 @@ class WireGuardServiceProvider extends ServiceProvider
      */
     public function register()
     {
-        $this->app->singleton(WireGuard::class, function ($app) {
+        $this->app->singleton(WireGuard::class, function () {
             return new WireGuard(config('wireguard'));
         });
     }
