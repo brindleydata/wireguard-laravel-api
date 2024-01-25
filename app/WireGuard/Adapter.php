@@ -6,8 +6,6 @@ use App\WireGuard\Service as WireGuard;
 
 class Adapter
 {
-    private $wg;
-
     public $name;
     public $port;
     public $ip;
@@ -22,9 +20,8 @@ class Adapter
      * @param string|null $privkey
      * @throws Exception
      */
-    public function __construct(WireGuard $wg, string $privkey = null)
+    public function __construct(private WireGuard $wg, string $privkey = null)
     {
-        $this->wg = $wg;
         $this->privkey = $privkey ? $privkey : $wg->genPrivKey();
         $this->pubkey = $wg->genPubKey($this->privkey);
     }
@@ -97,13 +94,13 @@ class Adapter
         try {
             System::shot("sudo systemctl stop wg-quick@{$this->name}");
             System::shot("sudo systemctl disable wg-quick@{$this->name}");
-            System::shot("sudo rm /etc/wireguard/{$this->name}.conf");
+            System::shot("rm /etc/wireguard/{$this->name}.conf");
         } catch (Exception $ignore) {
             // no action needed
         }
 
         try {
-            System::shot("echo '{$template}' | sudo tee /etc/wireguard/{$this->name}.conf");
+            System::shot("echo '{$template}' | tee /etc/wireguard/{$this->name}.conf");
             System::shot("sudo systemctl enable wg-quick@{$this->name}");
             System::shot("sudo systemctl start wg-quick@{$this->name}");
         } catch (Exception $e) {
@@ -140,7 +137,7 @@ class Adapter
     {
         $name = strval($data['name'] ?? null);
         $port = intval($data['port'] ?? mt_rand(32767, 65535));
-        $ifout = strval($data['ifout'] ?? 'eth0');
+        $ifout = strval($data['ifout'] ?? 'ens5');
         $subnets = strval($data['subnets'] ?? null);
         $ip = strval($data['ip'] ?? null);
 
@@ -175,8 +172,8 @@ class Adapter
         $interface->name = $name;
         $interface->ip = System::shot("sudo ip address show dev {$name} | grep inet | awk '{print $2}'");
         $interface->port = System::shot("sudo wg show {$name} listen-port");
-        $interface->ifout = System::shot("sudo iptables -t nat -L POSTROUTING -n -v | grep MASQUERADE | awk '{print $7}'");
-        $interface->subnets = System::shot("sudo cat /etc/wireguard/{$name}.conf | grep PostUp | awk '{print $23}'");
+        $interface->ifout = System::shot("sudo /usr/sbin/iptables -t nat -L POSTROUTING -n -v | grep MASQUERADE | awk '{print $7}'");
+        $interface->subnets = System::shot("cat /etc/wireguard/{$name}.conf | grep PostUp | awk '{print $23}'");
 
         return $interface;
     }

@@ -4,9 +4,6 @@ namespace App\WireGuard;
 
 class Peer
 {
-    private $wg;
-    private $interface;
-
     public $ip;
     public $pubkey;
     public $privkey;
@@ -20,11 +17,11 @@ class Peer
      * @param bool $gen_keys
      * @throws Exception
      */
-    public function __construct(Service $wg, Adapter $interface, bool $gen_keys = true)
+    public function __construct(
+        private Service $wg,
+        private Adapter $interface,
+        bool $gen_keys = true)
     {
-        $this->wg = $wg;
-        $this->interface = $interface;
-
         if ($gen_keys) {
             $this->privkey = $wg->genPrivKey() ;
             $this->pubkey = $wg->genPubKey($this->privkey);
@@ -111,9 +108,9 @@ class Peer
         }
 
         $template = $this->getTemplate();
-        System::shot("sudo bash -c 'wg set {$this->interface->name} peer {$this->pubkey} preshared-key <(echo {$this->psk}) allowed-ips {$this->ip}/32'");
-        System::shot("sudo mkdir -p /etc/wireguard/clients/{$this->interface->name}");
-        System::shot("echo '{$template}' | sudo tee '/etc/wireguard/clients/{$this->interface->name}/{$this->ip}.conf'");
+        System::shot("bash -c 'sudo wg set {$this->interface->name} peer {$this->pubkey} preshared-key <(echo {$this->psk}) allowed-ips {$this->ip}/32'");
+        System::shot("mkdir -p /etc/wireguard/clients/{$this->interface->name}");
+        System::shot("echo '{$template}' | tee '/etc/wireguard/clients/{$this->interface->name}/{$this->ip}.conf'");
 
         return true;
     }
