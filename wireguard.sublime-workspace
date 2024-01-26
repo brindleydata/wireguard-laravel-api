@@ -1,0 +1,1106 @@
+{
+	"auto_complete":
+	{
+		"selected_items":
+		[
+			[
+				"attr",
+				"getAttribute"
+			],
+			[
+				"ar",
+				"aria-labelledby"
+			],
+			[
+				"q",
+				"querySelector"
+			],
+			[
+				"query",
+				"querySelectorAll"
+			],
+			[
+				"for",
+				"form-control"
+			],
+			[
+				"--link",
+				"--link-hover"
+			],
+			[
+				"backgroun",
+				"background-clip"
+			],
+			[
+				"--grid",
+				"--grid-column-gap"
+			],
+			[
+				"--row",
+				"--grid-row-gap"
+			],
+			[
+				"spa",
+				"space-around"
+			],
+			[
+				"align",
+				"align-content"
+			],
+			[
+				"content",
+				"justify-content"
+			],
+			[
+				"flex-",
+				"flex-grow"
+			],
+			[
+				"padd",
+				"padding-right"
+			],
+			[
+				"--row-",
+				"--row-column-gap"
+			],
+			[
+				"--",
+				"--row-columns-count"
+			],
+			[
+				"--row-col",
+				"--row-column-gap"
+			],
+			[
+				"--grid-c",
+				"--grid-column-gap"
+			],
+			[
+				"--grid-",
+				"--grid-column-gap"
+			],
+			[
+				"flex",
+				"flex-wrap"
+			],
+			[
+				"--s",
+				"small-screen-bound"
+			],
+			[
+				"S",
+				"Str"
+			],
+			[
+				"Collection",
+				"Collection"
+			],
+			[
+				"User",
+				"User [App\\Models]"
+			],
+			[
+				"sark_",
+				"sark_tenant_id"
+			],
+			[
+				"Sche",
+				"Schema [Illuminate\\Support\\Facades]"
+			],
+			[
+				"DB",
+				"DB [Illuminate\\Support\\Facades]"
+			],
+			[
+				"Builde",
+				"Builder [Illuminate\\Database\\Eloquent]"
+			],
+			[
+				"Builder",
+				"Builder [Illuminate\\Database\\Eloquent]"
+			],
+			[
+				"Carb",
+				"CarbonImmutable"
+			],
+			[
+				"Carbon",
+				"CarbonImmutable"
+			],
+			[
+				"Carbo",
+				"CarbonImmutable"
+			],
+			[
+				"Ten",
+				"TenantSource"
+			],
+			[
+				"Tenan",
+				"TenantSource"
+			],
+			[
+				"Billing",
+				"Billing [App\\Models]"
+			],
+			[
+				"Exc",
+				"Exception"
+			],
+			[
+				"ma",
+				"ext_max_length"
+			],
+			[
+				"createFr",
+				"createFromFormat"
+			],
+			[
+				"CarbonI",
+				"CarbonImmutable"
+			],
+			[
+				"exce",
+				"Exception"
+			],
+			[
+				"Throw",
+				"Throwable"
+			],
+			[
+				"Exce",
+				"Exception"
+			],
+			[
+				"fgetc",
+				"fgetcsv"
+			],
+			[
+				"sour",
+				"$source_id"
+			],
+			[
+				"source",
+				"$source_id"
+			],
+			[
+				"tena",
+				"$tenant_id"
+			],
+			[
+				"Redirector",
+				"Redirector [Illuminate\\Routing]"
+			],
+			[
+				"LazyC",
+				"LazyCollection"
+			],
+			[
+				"inp",
+				"input-group-sm"
+			],
+			[
+				"Password",
+				"Password [Illuminate\\Validation\\Rules]"
+			],
+			[
+				"InvoiceLin",
+				"InvoiceLineConfigPeriod"
+			],
+			[
+				"invoice_",
+				"invoice_number"
+			],
+			[
+				"invoice",
+				"invoices_lines_configs"
+			],
+			[
+				"InvoiceL",
+				"InvoiceLineConfigPeriod"
+			],
+			[
+				"LineConfi",
+				"InvoiceLineConfigType"
+			],
+			[
+				"InvoiceE",
+				"InvoiceExportType"
+			],
+			[
+				"Invoi",
+				"InvoiceTotals"
+			],
+			[
+				"Invoice",
+				"InvoiceTotals"
+			],
+			[
+				"InvoiceLine",
+				"InvoiceLineConfigPeriod"
+			],
+			[
+				"custom-",
+				"custom-checkbox"
+			],
+			[
+				"curren",
+				"current_ring"
+			],
+			[
+				"cur",
+				"current_ring"
+			],
+			[
+				"current_",
+				"current_ring"
+			],
+			[
+				"current",
+				"current_ring"
+			],
+			[
+				"curr",
+				"currentSrc"
+			],
+			[
+				"audio_",
+				"audio_ring_incoming"
+			],
+			[
+				"e",
+				"event"
+			],
+			[
+				"curre",
+				"current_session"
+			],
+			[
+				"call",
+				"calling"
+			],
+			[
+				"current_s",
+				"current_state"
+			],
+			[
+				"de",
+				"decline"
+			],
+			[
+				"c",
+				"connected"
+			],
+			[
+				"phone",
+				"phone_status_colors"
+			],
+			[
+				"phone_stat",
+				"phone_status_colors"
+			],
+			[
+				"editin",
+				"editing_source_intpeers"
+			],
+			[
+				"editi",
+				"editing_source_config"
+			],
+			[
+				"mode",
+				"mode_view_tenant"
+			],
+			[
+				"mode_",
+				"mode_edit_source"
+			],
+			[
+				"int",
+				"$intpeers"
+			],
+			[
+				"new_s",
+				"new_source_intpeers"
+			],
+			[
+				"is",
+				"isPhone"
+			],
+			[
+				"surch",
+				"$surcharge_cost"
+			],
+			[
+				"prefix",
+				"$prefix_copy"
+			],
+			[
+				"new",
+				"new_source_config"
+			],
+			[
+				"table",
+				"table-striped"
+			],
+			[
+				"get_va",
+				"get_class_vars()"
+			],
+			[
+				"Collec",
+				"Collection"
+			],
+			[
+				"selected_",
+				"selected_group"
+			],
+			[
+				"se",
+				"selected_extension"
+			],
+			[
+				"Extens",
+				"ExtensionTemplate"
+			],
+			[
+				"ondra",
+				"ondragover"
+			],
+			[
+				"sele",
+				"selected_extension"
+			],
+			[
+				"Ca",
+				"Carbon"
+			],
+			[
+				"Rate",
+				"RateUpload"
+			],
+			[
+				"the",
+				"$theme_path"
+			],
+			[
+				"view",
+				"$views_path"
+			],
+			[
+				"storage",
+				"Storage"
+			],
+			[
+				"Guzzl",
+				"GuzzleHttp\\Client"
+			],
+			[
+				"new_pa",
+				"new_password_repeat"
+			],
+			[
+				"new_",
+				"new_password_repeat"
+			],
+			[
+				"Pass",
+				"Password"
+			],
+			[
+				"new_pass",
+				"new_password_repeat"
+			],
+			[
+				"new_user",
+				"new_user_info"
+			],
+			[
+				"new_tenant",
+				"new_tenant_info"
+			],
+			[
+				"Valida",
+				"Validator"
+			],
+			[
+				"mess",
+				"messages"
+			],
+			[
+				"error",
+				"getErrorBag"
+			],
+			[
+				"dele",
+				"delete-marker"
+			],
+			[
+				"time",
+				"timestamps"
+			],
+			[
+				"server",
+				"server-url"
+			],
+			[
+				"ser",
+				"server-name"
+			],
+			[
+				"setLa",
+				"setLatLng"
+			],
+			[
+				"Ht",
+				"Http\\Livewire"
+			],
+			[
+				"tot",
+				"total_cost"
+			],
+			[
+				"intern",
+				"international_cost"
+			],
+			[
+				"natio",
+				"national_cost"
+			],
+			[
+				"national_c",
+				"national_count"
+			],
+			[
+				"LiveReload",
+				"livereload_plugin"
+			],
+			[
+				"pu",
+				"put\t  put($path, $contents [, $options])"
+			],
+			[
+				"get",
+				"get\t  get($path)"
+			],
+			[
+				"Mail",
+				"Mail\t  Illuminate\\Support\\Facades\\Mail"
+			],
+			[
+				"national_",
+				"$national_sum\t  mixed"
+			],
+			[
+				"DIRECTO",
+				"DIRECTORY_SEPARATOR\t  /"
+			],
+			[
+				"get_tmp",
+				"sys_get_temp_dir\t  sys_get_temp_dir()"
+			],
+			[
+				"isVa",
+				"isValidNumber\t  isValidNumber(PhoneNumber $number)"
+			],
+			[
+				"Tenant",
+				"TenantSource\t  namespace App\\Services"
+			],
+			[
+				"active",
+				"$active_ts_ids\t  mixed"
+			],
+			[
+				"endO",
+				"endOfMonth\t  endOfMonth()"
+			]
+		]
+	},
+	"buffers":
+	[
+	],
+	"build_system": "",
+	"build_system_choices":
+	[
+		[
+			[
+				[
+					"Packages/SASS Build/SASS - Compressed.sublime-build",
+					""
+				],
+				[
+					"Packages/SASS Build/SASS.sublime-build",
+					""
+				],
+				[
+					"Packages/User/SCSS.sublime-build",
+					""
+				]
+			],
+			[
+				"Packages/User/SCSS.sublime-build",
+				""
+			]
+		]
+	],
+	"build_varint": "",
+	"command_palette":
+	{
+		"height": 0.0,
+		"last_filter": "",
+		"selected_items":
+		[
+			[
+				"keyb",
+				"Preferences: Key Bindings"
+			],
+			[
+				"prefe",
+				"Preferences: Settings"
+			],
+			[
+				"reind",
+				"Indentation: Reindent Lines"
+			],
+			[
+				"install",
+				"Package Control: Install Package"
+			],
+			[
+				"pref",
+				"Preferences: Settings"
+			],
+			[
+				"menu",
+				"View: Toggle Menu"
+			],
+			[
+				"prefer",
+				"Preferences: Settings"
+			],
+			[
+				"lsp",
+				"Preferences: LSP Settings"
+			],
+			[
+				"remove pa",
+				"Package Control: Remove Package"
+			],
+			[
+				"install p",
+				"Package Control: Install Package"
+			],
+			[
+				"color",
+				"Color Picker"
+			],
+			[
+				"color pi",
+				"Color Picker"
+			],
+			[
+				"debug",
+				"Debugger: Open"
+			],
+			[
+				"setting",
+				"Preferences: Settings"
+			],
+			[
+				"form",
+				"LSP: Format File"
+			],
+			[
+				"colors",
+				"UI: Select Color Scheme"
+			],
+			[
+				"colla",
+				"Code Folding: Fold All"
+			],
+			[
+				"re",
+				"Indentation: Reindent Lines"
+			],
+			[
+				"r",
+				"Indentation: Reindent Lines"
+			],
+			[
+				"rein",
+				"Indentation: Reindent Lines"
+			],
+			[
+				"LSP",
+				"Preferences: LSP-intelephense Settings"
+			],
+			[
+				"remove",
+				"Package Control: Remove Package"
+			],
+			[
+				"html",
+				"HTMLPrettify"
+			],
+			[
+				"reinde",
+				"Indentation: Reindent Lines"
+			],
+			[
+				"theme",
+				"UI: Select Theme"
+			],
+			[
+				"them",
+				"UI: Select Theme"
+			],
+			[
+				"sche",
+				"UI: Select Color Scheme"
+			],
+			[
+				"scheme",
+				"UI: Select Color Scheme"
+			],
+			[
+				"livere",
+				"LiveReload: Enable/disable plug-ins"
+			],
+			[
+				"livereload",
+				"LiveReload: Enable/disable plug-ins"
+			],
+			[
+				"pro",
+				"Project: Edit Project"
+			],
+			[
+				"liverel",
+				"LiveReload: Enable/disable plug-ins"
+			],
+			[
+				"disable",
+				"Package Control: Disable Package"
+			],
+			[
+				"outli",
+				"Browse Mode: Outline (Right)"
+			],
+			[
+				"liverelo",
+				"Snippet: Insert livereload.js script"
+			],
+			[
+				"packa",
+				"Package Control: List Packages"
+			],
+			[
+				"package",
+				"Package Control: Enable Package"
+			],
+			[
+				"colo",
+				"UI: Select Color Scheme"
+			],
+			[
+				"the",
+				"UI: Select Theme"
+			],
+			[
+				"reind\t",
+				"Indentation: Reindent Lines"
+			],
+			[
+				"prett",
+				"HTMLPrettify"
+			],
+			[
+				"rei",
+				"Indentation: Reindent Lines"
+			],
+			[
+				"tabs",
+				"Indentation: Convert to Tabs"
+			],
+			[
+				"Source",
+				"Snippet: Redirect to URL, Route or Controller with Errors"
+			],
+			[
+				"install ",
+				"Package Control: Install Package"
+			],
+			[
+				"sublimelinter",
+				"SublimeLinter: Goto Error"
+			],
+			[
+				"ublimelinter",
+				"SublimeLinter: Goto Error"
+			],
+			[
+				"sublim",
+				"SublimeLinter: Lint This View"
+			],
+			[
+				"remove pack",
+				"Package Control: Remove Package"
+			],
+			[
+				"linter",
+				"SublimeLinter: Lint This View"
+			]
+		],
+		"width": 0.0
+	},
+	"console":
+	{
+		"height": 276.0,
+		"history":
+		[
+			"view.settings().get('LiveReload')",
+			"view.settings().get('livereload')",
+			"view.settings().get('plugins')",
+			"view.settings().get()",
+			"view.run_command('LiveReload');",
+			"view.run_command('LiveReloadasdasd');",
+			"view.run_command('LiveReload');",
+			"view.run_command(LiveReload);"
+		]
+	},
+	"distraction_free":
+	{
+		"menu_visible": true,
+		"show_minimap": false,
+		"show_open_files": false,
+		"show_tabs": false,
+		"side_bar_visible": false,
+		"status_bar_visible": false
+	},
+	"expanded_folders":
+	[
+		"/home/iloveyou/Sites/wireguard.local"
+	],
+	"file_history":
+	[
+		"/home/iloveyou/Sites/accounts.brindleyvcloud.net/public/themes/default/js/app.js",
+		"/home/iloveyou/Sites/wireguard.local/app/WireGuard/Peer.php",
+		"/home/iloveyou/Sites/accounts.brindleyvcloud.net/resources/views/livewire/dashboard.blade.php",
+		"/home/iloveyou/Sites/accounts.brindleyvcloud.net/public/themes/default/css/nav.css",
+		"/home/iloveyou/Sites/accounts.brindleyvcloud.net/resources/views/menu.blade.php",
+		"/home/iloveyou/Sites/accounts.brindleyvcloud.net/resources/views/layouts/app.blade.php",
+		"/home/iloveyou/Sites/accounts.brindleyvcloud.net/resources/views/layouts/html.blade.php",
+		"/home/iloveyou/Sites/accounts.brindleyvcloud.net/app/Console/Commands/BillingCalc.php",
+		"/home/iloveyou/Sites/accounts.brindleyvcloud.net/public/themes/default/css/main.css",
+		"/home/iloveyou/Sites/localhost/webo/index.html",
+		"/home/iloveyou/Sites/accounts.brindleyvcloud.net/config/session.php",
+		"/home/iloveyou/.cache/.fr-U6KJI2/Brindley Office.conf",
+		"/home/iloveyou/.cache/.fr-1AJMI2/Brindley AWS.conf",
+		"/home/iloveyou/Sites/accounts.brindleyvcloud.net/.env",
+		"/home/iloveyou/Downloads/i@blackrabbit.info Backup authentication codes.txt",
+		"/home/iloveyou/Documents/Keys/firefox",
+		"/home/iloveyou/Documents/Keys/moz.txt",
+		"/Users/iloveyou/Sites/localhost/webo/css/forms.css",
+		"/Users/iloveyou/Sites/localhost/webo/css/dropdown.css",
+		"/Users/iloveyou/Sites/localhost/webo/css/tooltip.css",
+		"/Users/iloveyou/Sites/localhost/webo/css/main.css",
+		"/Users/iloveyou/Sites/localhost/webo/index.html",
+		"/Users/iloveyou/Sites/localhost/webo/js/app.js",
+		"/Users/iloveyou/Sites/localhost/webo/css/typography.css",
+		"/Users/iloveyou/Sites/localhost/webo/css/nav.css",
+		"/Users/iloveyou/Sites/webo/css/panels.css",
+		"/Users/iloveyou/Sites/webo/css/typography.css",
+		"/Users/iloveyou/Sites/webo/css/nav.css",
+		"/Users/iloveyou/Sites/webo/css/layout.css",
+		"/Users/iloveyou/Sites/webo/css/main.css",
+		"/Users/iloveyou/Sites/webo/index.html",
+		"/Users/iloveyou/Sites/webo/assets/livereload/livereload.js",
+		"/Users/iloveyou/Sites/webo/css/icons.css",
+		"/Users/iloveyou/Sites/webo/assets/fontawesome/css/all.css",
+		"/Users/iloveyou/Downloads/fontawesome-free-6.5.1-web/css/all.css",
+		"/Users/iloveyou/Sites/webo/css/grid.css",
+		"/Users/iloveyou/Sites/webo/css/defaults.css",
+		"/Users/iloveyou/Sites/webo/js/app.js",
+		"/Users/iloveyou/Sites/webo/img/icons/billing.svg",
+		"/Users/iloveyou/Sites/webo/img/icons/agent.svg",
+		"/Users/iloveyou/Sites/webo/img/icons/dashboard.svg",
+		"/Users/iloveyou/Sites/webo/img/icons/wallboard.svg",
+		"/Users/iloveyou/Sites/webo/js/colour_scheme.js",
+		"/Users/iloveyou/Sites/webo/css/colours.css",
+		"/Users/iloveyou/Sites/webo/img/logo.png",
+		"/Users/iloveyou/Downloads/Poppins/OFL.txt",
+		"/Users/iloveyou/Sites/wallboard.brindleyvcloud.net/resources/themes/yds/auth/login.blade.php",
+		"/Users/iloveyou/Sites/wallboard.brindleyvcloud.net/resources/views/login2fa.blade.php",
+		"/Users/iloveyou/Sites/wallboard.brindleyvcloud.net/resources/views/emails/2fa.blade.php",
+		"/Users/iloveyou/Sites/wallboard.brindleyvcloud.net/app/Services/Sources/Didww.php",
+		"/Volumes/After Effects 22.3 U2B [RiD]/info.txt",
+		"/Volumes/Adobe Photoshop 2024 v 25.3.1/README CAREFULLY!.txt",
+		"/Users/iloveyou/Library/Containers/com.apple.mail/Data/Library/Mail Downloads/9681B624-8F13-4D20-9C77-DBE79E808D6D/Alert_CDRs_202401014135241.txt",
+		"/Users/iloveyou/Sites/wallboard.brindleyvcloud.net/vendor/laravel/framework/src/Illuminate/Foundation/Bootstrap/HandleExceptions.php",
+		"/Users/iloveyou/Sites/wallboard.brindleyvcloud.net/vendor/filp/whoops/src/Whoops/Run.php",
+		"/Users/iloveyou/Sites/wallboard.brindleyvcloud.net/artisan",
+		"/Users/iloveyou/Sites/wallboard.brindleyvcloud.net/vendor/laravel/framework/src/Illuminate/Foundation/Console/Kernel.php",
+		"/Users/iloveyou/Sites/wallboard.brindleyvcloud.net/vendor/symfony/console/Application.php",
+		"/Users/iloveyou/Sites/wallboard.brindleyvcloud.net/vendor/laravel/framework/src/Illuminate/Console/Command.php",
+		"/Users/iloveyou/Sites/wallboard.brindleyvcloud.net/vendor/guzzlehttp/guzzle/src/Handler/CurlFactory.php",
+		"/Users/iloveyou/Sites/wallboard.brindleyvcloud.net/vendor/guzzlehttp/guzzle/src/Handler/CurlMultiHandler.php",
+		"/Users/iloveyou/Sites/wallboard.brindleyvcloud.net/vendor/monolog/monolog/src/Monolog/Handler/Handler.php",
+		"/Users/iloveyou/Downloads/Alert_CDRs_202401014135241.txt",
+		"/Users/iloveyou/Sites/wallboard.brindleyvcloud.net/app/Models/Directory/snom.md",
+		"/Users/iloveyou/Sites/wallboard.brindleyvcloud.net/public/test.php",
+		"/Users/iloveyou/Sites/wallboard.brindleyvcloud.net/app/Http/Livewire/Tenant/Directory.php",
+		"/Users/iloveyou/Sites/wallboard.brindleyvcloud.net/resources/views/livewire/users/tenant/directory.blade.php",
+		"/Users/iloveyou/Sites/wallboard.brindleyvcloud.net/resources/views/errors/503.blade.php",
+		"/Users/iloveyou/Sites/wallboard.brindleyvcloud.net/routes/web.php",
+		"/Users/iloveyou/Sites/wallboard.brindleyvcloud.net/app/Http/Controllers/Provision/Directory.php",
+		"/Users/iloveyou/Sites/wallboard.brindleyvcloud.net/app/Models/Directory/Contact.php",
+		"/Users/iloveyou/Sites/wallboard.brindleyvcloud.net/resources/views/exports/provision/directory.blade.php",
+		"/Users/iloveyou/Sites/wallboard.brindleyvcloud.net/app/Models/Directory/Group.php",
+		"/Users/iloveyou/Sites/wallboard.brindleyvcloud.net/app/Models/Directory/Number.php",
+		"/Users/iloveyou/Sites/wallboard.brindleyvcloud.net/.env",
+		"/Users/iloveyou/Sites/wallboard.brindleyvcloud.net/app/Models/Rate.php",
+		"/Users/iloveyou/Sites/wallboard.brindleyvcloud.net/app/Models/Directory.php",
+		"/Users/iloveyou/Sites/wallboard.brindleyvcloud.net/app/Models/Directory/DirectoryGroup.php",
+		"/Users/iloveyou/Sites/wallboard.brindleyvcloud.net/app/Models/Directory/DirectoryContact.php",
+		"/Users/iloveyou/Sites/wallboard.brindleyvcloud.net/app/Services/Sources/A3cx.php",
+		"/Users/iloveyou/Sites/wallboard.brindleyvcloud.net/app/Services/Sources/AsteriskCsv.php",
+		"/Users/iloveyou/Sites/wallboard.brindleyvcloud.net/app/Services/Sources/Fusion.php",
+		"/Users/iloveyou/Sites/wallboard.brindleyvcloud.net/app/Console/Commands/BillingResetFrees.php",
+		"/Volumes/VMware VCSA/readme.txt",
+		"/Users/iloveyou/Documents/Keys/brace.to",
+		"/Users/iloveyou/Sites/wallboard.brindleyvcloud.net/app/Services/RatesService.php",
+		"/Users/iloveyou/Documents/firefox",
+		"/Users/iloveyou/Sites/wallboard.brindleyvcloud.net/app/Console/Commands/BillingMigrateFrees.php",
+		"/Users/iloveyou/Downloads/gold_041223/gold_rate_041223.csv",
+		"/Users/iloveyou/Sites/wallboard.brindleyvcloud.net/app/Console/Commands/RatesConverter.php",
+		"/Users/iloveyou/Sites/wallboard.brindleyvcloud.net/app/Console/Commands/BillingCalc.php",
+		"/Users/iloveyou/Sites/wallboard.brindleyvcloud.net/app/Models/Sources/TenantSource.php",
+		"/Users/iloveyou/Sites/wallboard.brindleyvcloud.net/app/Models/Sources/Source.php",
+		"/Users/iloveyou/Sites/wallboard.brindleyvcloud.net/app/Models/Sources/Processor.php",
+		"/Users/iloveyou/Sites/wallboard.brindleyvcloud.net/app/Services/Sources/Gamma.php",
+		"/Users/iloveyou/Sites/wallboard.brindleyvcloud.net/app/Models/Sources/Cdr/AsteriskCsv.php",
+		"/Users/iloveyou/Sites/wallboard.brindleyvcloud.net/app/Console/Commands/BillingUncalc.php",
+		"/Users/iloveyou/Sites/wallboard.brindleyvcloud.net/app/Services/SourceService.php",
+		"/Users/iloveyou/Sites/wallboard.brindleyvcloud.net/app/Exports/ReportSummary.php",
+		"/Users/iloveyou/Sites/wallboard.brindleyvcloud.net/app/Models/Tenant.php",
+		"/Users/iloveyou/Sites/wallboard.brindleyvcloud.net/app/Console/Kernel.php",
+		"/Users/iloveyou/Sites/wallboard.brindleyvcloud.net/app/Http/Livewire/Tenant/Frees.php",
+		"/Users/iloveyou/Sites/wallboard.brindleyvcloud.net/resources/views/livewire/users/tenant/free.blade.php",
+		"/Users/iloveyou/Sites/wallboard.brindleyvcloud.net/resources/views/livewire/users/tenant/frees.blade.php",
+		"/Users/iloveyou/Sites/wallboard.brindleyvcloud.net/resources/views/livewire/billing/index.blade.php",
+		"/Users/iloveyou/Sites/wallboard.brindleyvcloud.net/app/Models/Billing.php",
+		"/Users/iloveyou/Sites/wallboard.brindleyvcloud.net/app/Http/Livewire/Map.php",
+		"/Users/iloveyou/Sites/wallboard.brindleyvcloud.net/app/Console/Commands/Import3cxCallsReport.php",
+		"/Users/iloveyou/Sites/wallboard.brindleyvcloud.net/resources/views/livewire/map.blade.php",
+		"/Users/iloveyou/Downloads/960fd492dfd2cdf7aa0436c2208d2c89ee8552",
+		"/Users/iloveyou/Downloads/_2909_z2Miaj8yuHTls6JmJkAu.csv",
+		"/Users/iloveyou/Downloads/_2909_2d8Fl3N8jmdDw6sAGQzs.csv",
+		"/Users/iloveyou/Downloads/_2909_MoGMnB2VY9a3PHV0j6wy.csv",
+		"/Users/iloveyou/Downloads/call logs/fsd_2.csv",
+		"/Users/iloveyou/Downloads/call logs/fsd_1.csv",
+		"/Users/iloveyou/Downloads/_2909_COjGmk1xfc1xII95JQjK.csv",
+		"/Users/iloveyou/Downloads/_2909_88Kcye3tenjL8LpXzf5H.csv",
+		"/Users/iloveyou/Downloads/_2909_SVJtEHLuVs3EWAIsQQvS.csv",
+		"/Users/iloveyou/Downloads/_2909_GcPgZN5n3BGcCTP3ouYV.csv",
+		"/Users/iloveyou/Downloads/_2909_qk6PRk1rzf27THDBPLh1.csv",
+		"/Users/iloveyou/Downloads/_2909_V3W5BVHBWcOTDWIk8CRI.csv",
+		"/Users/iloveyou/Downloads/_2909_cisqQSzgveHvYKaOr488.csv",
+		"/Users/iloveyou/Downloads/_2909_wkSrkBvfyA5VJiUi3IKf.csv",
+		"/Users/iloveyou/Downloads/_2909_JJUrD1W1vLbeM22N4eK1.csv",
+		"/Users/iloveyou/Downloads/_2909_AHMgEo47v1o8nKq54gIz.csv",
+		"/Users/iloveyou/Downloads/_2909_TDmddroZoEAtaXCfWzw6.csv",
+		"/Users/iloveyou/Downloads/_2909_uNXRGWQO3oUUamN7d9mD.csv",
+		"/Users/iloveyou/Downloads/_2909_I7Tm0NmORc5GYgOE0Am7.csv"
+	],
+	"find":
+	{
+		"height": 24.0
+	},
+	"find_in_files":
+	{
+		"height": 107.0,
+		"where_history":
+		[
+		]
+	},
+	"find_state":
+	{
+		"case_sensitive": false,
+		"find_history":
+		[
+		],
+		"highlight": false,
+		"in_selection": false,
+		"preserve_case": false,
+		"regex": true,
+		"replace_history":
+		[
+		],
+		"reverse": false,
+		"scrollbar_highlights": true,
+		"show_context": true,
+		"use_buffer2": true,
+		"use_gitignore": true,
+		"whole_word": false,
+		"wrap": true
+	},
+	"groups":
+	[
+		{
+			"sheets":
+			[
+			]
+		}
+	],
+	"incremental_find":
+	{
+		"height": 24.0
+	},
+	"input":
+	{
+		"height": 36.0
+	},
+	"layout":
+	{
+		"cells":
+		[
+			[
+				0,
+				0,
+				1,
+				1
+			]
+		],
+		"cols":
+		[
+			0.0,
+			1.0
+		],
+		"rows":
+		[
+			0.0,
+			1.0
+		]
+	},
+	"menu_visible": false,
+	"output.Debugger":
+	{
+		"height": 316.0
+	},
+	"output.Debugger Console":
+	{
+		"height": 192.0
+	},
+	"output.LSP Log Panel":
+	{
+		"height": 0.0
+	},
+	"output.SublimeLinter":
+	{
+		"height": 98.0
+	},
+	"output.SublimeLinter Messages":
+	{
+		"height": 98.0
+	},
+	"output.Terminus":
+	{
+		"height": 264.0
+	},
+	"output.diagnostics":
+	{
+		"height": 190.0
+	},
+	"output.exec":
+	{
+		"height": 202.0
+	},
+	"output.find_results":
+	{
+		"height": 0.0
+	},
+	"output.language servers":
+	{
+		"height": 318.0
+	},
+	"output.mdpopups":
+	{
+		"height": 0.0
+	},
+	"output.references":
+	{
+		"height": 298.0
+	},
+	"output.rename":
+	{
+		"height": 429.0
+	},
+	"pinned_build_system": "Packages/User/SCSS - Laravel.sublime-build",
+	"project": "wireguard.sublime-project",
+	"replace":
+	{
+		"height": 44.0
+	},
+	"save_all_on_build": true,
+	"select_file":
+	{
+		"height": 0.0,
+		"last_filter": "",
+		"selected_items":
+		[
+			[
+				"rate.php",
+				"app/Models/Rate.php"
+			],
+			[
+				"directory.bl",
+				"resources/views/livewire/users/tenant/directory.blade.php"
+			],
+			[
+				"directory",
+				"app/Http/Livewire/Tenant/Directory.php"
+			],
+			[
+				"user.php",
+				"app/Models/User.php"
+			],
+			[
+				"tenant",
+				"app/Models/Tenant.php"
+			]
+		],
+		"width": 0.0
+	},
+	"select_project":
+	{
+		"height": 0.0,
+		"last_filter": "",
+		"selected_items":
+		[
+		],
+		"width": 0.0
+	},
+	"select_symbol":
+	{
+		"height": 0.0,
+		"last_filter": "",
+		"selected_items":
+		[
+		],
+		"width": 0.0
+	},
+	"selected_group": 0,
+	"settings":
+	{
+	},
+	"show_minimap": true,
+	"show_open_files": false,
+	"show_tabs": true,
+	"side_bar_visible": true,
+	"side_bar_width": 242.0,
+	"status_bar_visible": true,
+	"template_settings":
+	{
+	}
+}
