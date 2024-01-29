@@ -14,16 +14,17 @@ use Illuminate\Support\Facades\Route;
 */
 
 use App\Http\Middleware\AuthenticateByApiKey;
+use App\Http\Controllers\WireGuard;
 
-Route::get('/status', 'WireGuardController@getStatus');
+Route::get('/status', [ WireGuard::class, 'status' ]);
 
 Route::middleware(AuthenticateByApiKey::class)->group(function () {
-    Route::get('/interfaces', 'WireGuardController@getInterfaces');
-    Route::post('/interfaces', 'WireGuardController@storeInterface');
-    Route::get('/interfaces/{interface}', 'WireGuardController@getInterface');
-    Route::delete('/interfaces/{interface}', 'WireGuardController@destroyInterface');
+    Route::get('/links', [ WireGuard::class, 'links' ]);
+    Route::get('/link/{name}', [ WireGuard::class, 'link' ]);
+    Route::post('/link', [ WireGuard::class, 'link_add' ]);
+    Route::delete('/link/{name}', [ WireGuard::class, 'link_rm' ]);
 
-    Route::get('/clients/{interface}', 'WireGuardController@getClients');
-    Route::post('/clients/{interface}', 'WireGuardController@storeClient');
-    Route::delete('/clients/{interface}/{client}', 'WireGuardController@destroyClient');
+    //Route::get('/links/{link}/peers', [ WireGuard::class, 'clients_list' ]);
+    //Route::post('/links/{link}/peers', [ WireGuard::class, 'client_add' ]);
+    //Route::delete('/links/{link}/{peer}', [ WireGuard::class, 'client_kill' ]);
 });

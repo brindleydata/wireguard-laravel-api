@@ -1,95 +1,59 @@
 <?php
 
-namespace App\WireGuard;
+namespace App\Models;
 
-use App\WireGuard\Service as WireGuard;
+use App\Services\Host;
+use App\Services\WireGuard;
+use Illuminate\Support\Collection;
 
-class Adapter
+class Link
 {
-    public $name;
-    public $port;
-    public $ip;
-    public $subnets;
-    public $ifout;
-    public $privkey;
-    public $pubkey;
+    public string $ifname;
+    public string $address;
+    public int $port;
+    public string $privkey;
+    public string $pubkey;
+    public string $ifout;
+    public Collection $subnets;
 
-    /**
-     * Adapter constructor.
-     * @param Service $wg
-     * @param string|null $privkey
-     * @throws Exception
-     */
-    public function __construct(private WireGuard $wg, string $privkey = null)
-    {
-        $this->privkey = $privkey ? $privkey : $wg->genPrivKey();
-        $this->pubkey = $wg->genPubKey($this->privkey);
+    public function __construct(
+        private Host $host) {
     }
 
     /**
-     * @return bool
-     * @throws Exception
-     */
-    protected function checkReadyState(): bool
-    {
-        if (empty($this->name)) {
-            throw new Exception('Missed network adapter name.');
-        }
-
-        if (empty($this->port)) {
-            throw new Exception('Missed network adapter port number.');
-        }
-
-        if (empty($this->ip)) {
-            throw new Exception('Missed network adapter IP address.');
-        }
-
-        if (empty($this->subnets)) {
-            throw new Exception('Missed target subnets.');
-        }
-
-        if (empty($this->ifout)) {
-            throw new Exception('Missed output (masquerading) network adapter name.');
-        }
-
-        return true;
-    }
-
-    /**
-     * @return string
      * @throws Exception
      */
     public function getEndPoint(): string
     {
-        $public_ip = System::shot("curl --interface {$this->ifout} ifconfig.me");
+        $public_ip = $this->wg->cmd("curl --interface {$this->ifout} ifconfig.me");
         return $public_ip . ":" . $this->port;
     }
 
     /**
-     * @return bool
      * @throws Exception
      */
     public function save(): bool
     {
-        if ($this->wg->interfaceExists($this->name, $wireguard_only = false)) {
+        if ($this->wg->interfaceExists($this->name, $wireguard_only = false))
             throw new Exception("Network adapter '{$this->name}' already exists.");
-        }
 
-        if (!$this->wg->interfaceExists($this->ifout, $wireguard_only = false)) {
+        if (!$this->wg->interfaceExists($this->ifout, $wireguard_only = false))
             throw new Exception("Output Network adapter '{$this->ifout}' is not exists.");
-        }
 
-        $this->checkReadyState();
+        if (empty($this->name))
+            throw new Exception('Missed network adapter name.');
 
-        $template = <<<EOF
-        [Interface]
-        Address = {$this->ip}
-        SaveConfig = true
-        PrivateKey = {$this->privkey}
-        ListenPort = {$this->port}
-        PostUp = iptables -A FORWARD -i %i -j ACCEPT; iptables -A FORWARD -o %i -j ACCEPT; iptables -t nat -A POSTROUTING -d {$this->subnets} -o {$this->ifout} -j MASQUERADE;
-        PostDown = iptables -D FORWARD -i %i -j ACCEPT; iptables -D FORWARD -o %i -j ACCEPT; iptables -t nat -D POSTROUTING -d {$this->subnets} -o {$this->ifout} -j MASQUERADE;
-        EOF;
+        if (empty($this->port))
+            throw new Exception('Missed network adapter port number.');
+
+        if (empty($this->ip))
+            throw new Exception('Missed network adapter IP address.');
+
+        if (empty($this->subnets))
+            throw new Exception('Missed target subnets.');
+
+        if (empty($this->ifout))
+            throw new Exception('Missed output (masquerading) network adapter name.');
 
         try {
             System::shot("sudo systemctl stop wg-quick@{$this->name}");

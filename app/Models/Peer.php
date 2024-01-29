@@ -1,6 +1,8 @@
 <?php
 
-namespace App\WireGuard;
+namespace App\Models;
+
+use App\Services\WireGuard;
 
 class Peer
 {
@@ -18,7 +20,7 @@ class Peer
      * @throws Exception
      */
     public function __construct(
-        private Service $wg,
+        private WireGuard $wg,
         private Adapter $interface,
         bool $gen_keys = true)
     {
@@ -29,6 +31,25 @@ class Peer
         }
 
         $this->online = false;
+    }
+
+    /**
+     * Check if a given ip is in a given subnet
+     * @param string $ip IP to check in IPV4 format eg. 127.0.0.1.
+     * @param string $range IP[/CIDR], eg. 127.0.0.0/24. If the subnet part is empty, then a single host /32 is assumed.
+     */
+    protected function _ip_in_range(string $ip, string $range): bool
+    {
+        if (!strpos($range, '/')) {
+            $range .= '/32';
+        }
+
+        list($range, $netmask) = explode('/', $range, 2);
+        $range_dec = ip2long($range);
+        $ip_dec = ip2long($ip);
+        $wildcard_dec = pow(2, (32 - $netmask)) - 1;
+        $netmask_dec = ~$wildcard_dec;
+        return (($ip_dec & $netmask_dec) == ($range_dec & $netmask_dec));
     }
 
     /**
@@ -49,7 +70,7 @@ class Peer
             throw new Exception("Invalid IP address.");
         }
 
-        if (!System::ip_in_range($this->ip, $this->interface->ip)) {
+        if (!$this->_ip_in_range($this->ip, $this->interface->ip)) {
             throw new Exception("IP address is not in parent interface network.");
         }
 

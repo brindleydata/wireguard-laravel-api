@@ -2,20 +2,18 @@
 
 namespace App\Providers;
 
+use App\Services\Host;
+use App\Services\Link;
+use App\Services\WireGuard;
 use Illuminate\Support\ServiceProvider;
-use App\WireGuard\Service as wireGuard;
 
 class WireGuardServiceProvider extends ServiceProvider
 {
-    /**
-     * Register WireGuard application service.
-     *
-     * @return void
-     */
     public function register()
     {
-        $this->app->singleton(WireGuard::class, function () {
-            return new WireGuard(config('wireguard'));
-        });
+        $app = $this->app;
+        $app->singleton(Host::class, fn () => new Host);
+        $app->singleton(Link::class, fn () => new Link($app->make(Host::class)));
+        $app->singleton(WireGuard::class, fn () => new WireGuard(config('wireguard'), $app->make(Host::class)));
     }
 }
