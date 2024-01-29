@@ -21,8 +21,13 @@ git clone git@github.com:brindleydata/wireguard-laravel-api.git wireguard
 cd wireguard
 composer install
 ```
-Then, you will need to start the application. Use HTTP server, or Laravel's built-in `./artisan serve`.
-You can get some information about it on the Laravel documentation.
+Generate needed keys, you will the API_KEY to communicate with this API with HTTP:
+```bash
+./artisan key:generate
+echo API_KEY=`head -c48 /dev/urandom | base64` >> .env
+```
+Then, you will need to start the application. Use HTTP server of your choice, e.g. Laravel's built-in `./artisan serve`.
+You can get some information about it on the [Laravel documentation](https://laravel.com/docs/10.x#creating-a-laravel-project) website.
 
 ## Configuration.
 
@@ -34,17 +39,19 @@ If the application is run via Laravel's own `artisan serve`, then it will be the
 WGLA will need r/w access to the `/etc/wireguard` directory and ability to run `wg`, `iptables` and `curl`.
 To achieve the needed without crushing root-wide access rights, you can use `acl`, e.g.:
 ```bash
+# Allow WireGuard Laravel API to access WireGuard config directory
 setfacl  --recursive --modify u:http:rwx /etc/wireguard
 ```
 
 To access `wg`, `ip` and `iptables`, WGLA utilize the `sudo`, so you need to allow it:
 ```bash
-# /etc/sudoers.d/wgla
+echo "# Allow WireGuard Laravel API to access WG and network utils
+
 www-data ALL = (ALL) NOPASSWD: /usr/bin/wg
 www-data ALL = (ALL) NOPASSWD: /usr/bin/wg-quick
 www-data ALL = (ALL) NOPASSWD: /usr/bin/systemctl
 www-data ALL = (ALL) NOPASSWD: /usr/sbin/ip
-www-data ALL = (ALL) NOPASSWD: /usr/sbin/iptables
+www-data ALL = (ALL) NOPASSWD: /usr/sbin/iptables" | sudo tee /etc/sudoers.d/wgla
 ```
 
 This may be achieved by other, more restrictive methods. But for now we have what we have, sorry.
@@ -52,4 +59,4 @@ This may be achieved by other, more restrictive methods. But for now we have wha
 ### To Do.
 - Rework CLI, it's broken.
 - Tests.
-- Minimize amount of used commands.
+- Minimize amount of used CLI commands.
