@@ -6,7 +6,7 @@ Mostly, work in progress and not so actively maintained. Feel free to contribute
 ## Installation.
 
 To install WireGuard HTTP API you will need:
-- systemd
+- systemd *
 - wireguard-tools
 - iptables
 - composer
@@ -15,19 +15,47 @@ To install WireGuard HTTP API you will need:
 - http server (recommended)
 - acl (recommended)
 
-First things first, clone the repository and install Laravel:
+* Since the current app version is highly oriented to use `systemd` and `iptables`. That's not truly necessary and can be changed by a minor intervention, although this manual and current codebase are systemd-oriented. In a perfect time / universe, this app will have no other dependencies except of the `wg` itself, but this time isn't now, unfortunately. I hope this thing is a subject to improve or change in the future.
+
+Ok, get back to work! First things first, clone the repository and install Laravel:
 ```bash
 git clone git@github.com:brindleydata/wireguard-laravel-api.git wireguard
 cd wireguard
 composer install
 ```
-Generate needed keys, you will the API_KEY to communicate with this API with HTTP:
+
+Generate needed keys. You will the API_KEY to communicate with it via HTTP. You can also set custom external service to detect your IP address:
 ```bash
-./artisan key:generate
+echo IP_SERVICE="ifconfig.me/ip" >> .env
 echo API_KEY=`head -c48 /dev/urandom | base64` >> .env
 ```
-Then, you will need to start the application. Use HTTP server of your choice, e.g. Laravel's built-in `./artisan serve`.
-You can get some information about it on the [Laravel documentation](https://laravel.com/docs/10.x#creating-a-laravel-project) website.
+
+Then, you will need to start the application. Use HTTP server of your choice, this question is not covered in this manual. E.g., you can use Laravel's built-in `./artisan serve`.
+Also, you can get some more information on the [Laravel documentation](https://laravel.com/docs/10.x#creating-a-laravel-project) website.
+
+Prepare the firewall chains:
+```bash
+if [[ "`cat /proc/sys/net/ipv4/ip_forward`" != "1" ]]; then
+    echo 1 | sudo tee /proc/sys/net/ipv4/ip_forward
+    echo 'net.ipv4.ip_forward = 1' | sudo tee /usr/lib/sysctl.d/10-wgla.conf
+    sudo sysctl --system
+fi
+
+sudo iptables -N WGLA-FORWARD
+sudo iptables -A WGLA-FORWARD -j RETURN
+sudo iptables -I FORWARD -j WGLA-FORWARD
+
+sudo iptables -t nat -N WGLA-NAT
+sudo iptables -t nat -A WGLA-NAT -j RETURN
+sudo iptables -t nat -I POSTROUTING -j WGLA-NAT
+```
+
+You will need these chains after system restart, so read the manuals of your Linux distribution on how to persist this.
+
+And, the installation part done. Assuming you used port 25420 to run the application, check if it's alive by poking the `/status` endpoint:
+```bash
+PORT=25420 curl localhost:$PORT/status
+```
 
 ## Configuration.
 
@@ -47,11 +75,16 @@ To access `wg`, `ip` and `iptables`, WGLA utilize the `sudo`, so you need to all
 ```bash
 echo "# Allow WireGuard Laravel API to access WG and network utils
 
-www-data ALL = (ALL) NOPASSWD: /usr/bin/wg
-www-data ALL = (ALL) NOPASSWD: /usr/bin/wg-quick
-www-data ALL = (ALL) NOPASSWD: /usr/bin/systemctl
-www-data ALL = (ALL) NOPASSWD: /usr/sbin/ip
-www-data ALL = (ALL) NOPASSWD: /usr/sbin/iptables" | sudo tee /etc/sudoers.d/wgla
+http ALL = (ALL) NOPASSWD: /usr/bin/wg
+http ALL = (ALL) NOPASSWD: /usr/bin/wg-quick
+http ALL = (ALL) NOPASSWD: /usr/bin/systemctl stop wg-quick@*
+http ALL = (ALL) NOPASSWD: /usr/bin/systemctl start wg-quick@*
+http ALL = (ALL) NOPASSWD: /usr/sbin/iptables -L WGLA-FORWARD
+http ALL = (ALL) NOPASSWD: /usr/sbin/iptables -A WGLA-FORWARD
+http ALL = (ALL) NOPASSWD: /usr/sbin/iptables -D WGLA-FORWARD
+http ALL = (ALL) NOPASSWD: /usr/sbin/iptables -t nat -L WGLA-NAT
+http ALL = (ALL) NOPASSWD: /usr/sbin/iptables -t nat -A WGLA-NAT
+http ALL = (ALL) NOPASSWD: /usr/sbin/iptables -t nat -D WGLA-NAT" | sudo tee /etc/sudoers.d/wgla
 ```
 
 This may be achieved by other, more restrictive methods. But for now we have what we have, sorry.
