@@ -2,45 +2,30 @@
 
 namespace App\Console\Commands;
 
+use App\Services\WireGuard;
+use Illuminate\Console\Command;
+
 class WgClientDelete extends WgCommand
 {
-    /**
-     * The name and signature of the console command.
-     * @var string
-     */
-    protected $signature = 'wg:client:delete {link} {ip}';
+    protected $signature = 'wg:client:delete {interface} {ip}';
 
-    /**
-     * The console command description.
-     * @var string
-     */
-    protected $description = 'Delete Wireguard VPN Client.';
+    protected $description = 'Delete a WireGuard VPN client';
 
-    /**
-     * Execute the console command.
-     * @return mixed
-     */
-    public function handle()
+    public function handle(WireGuard $wg): int
     {
-        $link = $this->argument('link');
-        $iface = $this->readLink($link);
-
+        $interfaceName = $this->argument('interface');
         $ip = $this->argument('ip');
-        if (!filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) {
-            $this->error("Invalid IP address.");
-            die(1);
+
+        try {
+            $wg->removePeer($interfaceName, $ip);
+        } catch (\Throwable $e) {
+            $this->error($e->getMessage());
+
+            return Command::FAILURE;
         }
 
-        $found = false;
-        foreach ($iface->peers as $id => $peer) {
-            if ("{$ip}/32" == $peer['ip']) {
-                $this->system("wg set {$link} peer {$id} remove", "Could not delete Client.", true);
-                $found = true;
-            }
-        }
+        $this->info("Removed peer {$ip} from {$interfaceName}");
 
-        if (!$found) {
-            $this->warn("Client {$ip} not found in {$link}");
-        }
+        return Command::SUCCESS;
     }
 }

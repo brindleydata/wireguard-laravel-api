@@ -2,45 +2,40 @@
 
 namespace App\Console\Commands;
 
+use App\Services\WireGuard;
+use Illuminate\Console\Command;
+
 class WgShow extends WgCommand
 {
-    /**
-     * The name and signature of the console command.
-     * @var string
-     */
-    protected $signature = 'wg:show {link}';
+    protected $signature = 'wg:show {interface}';
 
-    /**
-     * The console command description.
-     * @var string
-     */
-    protected $description = 'Show Wireguard link information';
+    protected $description = 'Show WireGuard interface information';
 
-    /**
-     * Execute the console command.
-     * @return mixed
-     */
-    public function handle()
+    public function handle(WireGuard $wg): int
     {
-        $link = $this->argument('link');
-        if (!$this->verifyInterface($link)) {
-            $this->error("Interface do not exists: {$link}");
-            die();
+        $name = $this->argument('interface');
+
+        $interface = $wg->getInterface($name);
+        if ($interface === null) {
+            $this->error("Interface does not exist: {$name}");
+
+            return Command::FAILURE;
         }
 
-        $link = $this->readLink($link);
+        $this->info("Interface {$interface->name}");
+        $this->line("Public Key: {$interface->publicKey}");
+        $this->line("Private Key: {$interface->privateKey}");
+        $this->line("Listen Port: {$interface->listenPort}");
+        $this->line("VPN Address: {$interface->address}");
+        $this->line('');
 
-        $this->info("Interface {$link->iface}");
-        $this->line("Public Key: {$link->public_key}");
-        $this->line("Private Key: {$link->private_key}");
-        $this->line("Listen Port: {$link->listen_port}");
-        $this->line("VPN address: {$link->vpn_address}");
-        $this->line("");
-        foreach ($link->peers as $id => $peer) {
-            $this->info("Peer {$id}");
-            $this->line("VPN address: {$peer['ip']}");
-            $this->line("PSK: {$peer['psk']}");
-            $this->line("");
+        foreach ($interface->peers as $peer) {
+            $this->info("Peer {$peer->publicKey}");
+            $this->line("VPN Address: {$peer->allowedIps}");
+            $this->line('PSK: '.($peer->presharedKey ?? '(none)'));
+            $this->line('');
         }
+
+        return Command::SUCCESS;
     }
 }

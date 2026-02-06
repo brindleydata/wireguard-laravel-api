@@ -2,33 +2,29 @@
 
 namespace App\Console\Commands;
 
+use App\Services\WireGuard;
+use Illuminate\Console\Command;
+
 class WgDelete extends WgCommand
 {
-    /**
-     * The name and signature of the console command.
-     * @var string
-     */
-    protected $signature = 'wg:delete {link}';
+    protected $signature = 'wg:delete {interface}';
 
-    /**
-     * The console command description.
-     * @var string
-     */
-    protected $description = 'Delete Wireguard interface';
+    protected $description = 'Delete a WireGuard interface';
 
-    /**
-     * Execute the console command.
-     * @return mixed
-     */
-    public function handle()
+    public function handle(WireGuard $wg): int
     {
-        $link = $this->argument('link');
-        if (!$this->verifyInterface($link)) {
-            $this->error("Interface do not exists: {$link}");
-            die();
+        $name = $this->argument('interface');
+
+        try {
+            $wg->deleteInterface($name);
+        } catch (\Throwable $e) {
+            $this->error($e->getMessage());
+
+            return Command::FAILURE;
         }
 
-        $this->system("systemctl stop wg-quick@{$link}", "Could not stop {$link}");
-        $this->system("systemctl disable wg-quick@{$link}", "Could not disable {$link}");
+        $this->info("Deleted interface {$name}");
+
+        return Command::SUCCESS;
     }
 }

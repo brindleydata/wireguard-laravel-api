@@ -2,28 +2,34 @@
 
 namespace App\Console\Commands;
 
+use App\Services\WireGuard;
+use Illuminate\Console\Command;
+
 class WgList extends WgCommand
 {
-    /**
-     * The name and signature of the console command.
-     * @var string
-     */
     protected $signature = 'wg:list';
 
-    /**
-     * The console command description.
-     * @var string
-     */
-    protected $description = 'List available Wireguard interfaces';
+    protected $description = 'List available WireGuard interfaces';
 
-    /**
-     * Execute the console command.
-     * @return mixed
-     */
-    public function handle()
+    public function handle(WireGuard $wg): int
     {
-        $interfaces = $this->system('wg show interfaces', 'Can not retreive Wireguard interfaces list.', true);
-        $this->info('Available Wireguard interfaces:');
-        $this->line($interfaces);
+        try {
+            $interfaces = $wg->listInterfaces();
+        } catch (\Throwable $e) {
+            $this->error('Could not retrieve WireGuard interfaces: '.$e->getMessage());
+
+            return Command::FAILURE;
+        }
+
+        if (empty($interfaces)) {
+            $this->warn('No WireGuard interfaces found.');
+
+            return Command::SUCCESS;
+        }
+
+        $this->info('Available WireGuard interfaces:');
+        $this->line(implode(' ', $interfaces));
+
+        return Command::SUCCESS;
     }
 }

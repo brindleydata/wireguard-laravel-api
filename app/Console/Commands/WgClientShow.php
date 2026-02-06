@@ -2,54 +2,37 @@
 
 namespace App\Console\Commands;
 
+use App\Services\WireGuard;
+use Illuminate\Console\Command;
+
 class WgClientShow extends WgCommand
 {
-    /**
-     * The name and signature of the console command.
-     * @var string
-     */
-    protected $signature = 'wg:client:show {link} {ip}';
+    protected $signature = 'wg:client:show {interface} {ip}';
 
-    /**
-     * The console command description.
-     * @var string
-     */
-    protected $description = 'Create Wireguard VPN Client.';
+    protected $description = 'Show WireGuard VPN client configuration';
 
-    /**
-     * Execute the console command.
-     * @return mixed
-     */
-    public function handle()
+    public function handle(WireGuard $wg): int
     {
-        $link = $this->argument('link');
-        $iface = $this->readLink($link);
-
+        $interfaceName = $this->argument('interface');
         $ip = $this->argument('ip');
-        if (!filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) {
-            $this->error("Invalid IP address.");
-            die(1);
+
+        if (! filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) {
+            $this->error('Invalid IP address.');
+
+            return Command::FAILURE;
         }
 
-        $found = false;
-        foreach ($iface->peers as $id => $peer) {
-            if ("{$ip}/32" == $peer['ip']) {
-                $found = true;
-            }
+        $config = $wg->getPeerConfig($interfaceName, $ip);
+        if ($config === null) {
+            $this->error("Could not find configuration for client {$ip} on {$interfaceName}.");
+
+            return Command::FAILURE;
         }
 
-        if (!$found) {
-            $this->warn("Client {$ip} not found in running {$link} configuration!");
-        }
+        $this->info("Client {$ip} configuration:");
+        $this->line('');
+        $this->line($config);
 
-        $template = @file_get_contents("/etc/wireguard/clients/{$link}/{$ip}.conf");
-        if (empty($template)) {
-            $this->error("Could not find configuration for client {$ip} on {$link}.");
-            die(1);
-        }
-
-        $this->info("Client {$ip} template:");
-        $this->line("");
-        echo $template;
+        return Command::SUCCESS;
     }
 }
