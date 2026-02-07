@@ -101,35 +101,118 @@ class LinuxDriver implements OsDriver
         return null;
     }
 
-    public function configPath(): string
+    public function defaultOutboundInterface(): string
     {
-        return '/etc/wireguard';
+        // "default via 192.168.1.1 dev eth0 ..."
+        $output = $this->shell->run('ip route show default');
+        if (preg_match('/dev\s+(\S+)/', $output, $matches)) {
+            return $matches[1];
+        }
+
+        return 'eth0';
     }
 
-    public function interfaceTemplate(string $address, string $privkey, int $port, string $ifout): string
+    public function createInterface(string $name): string
     {
-        return implode("\n", [
-            '[Interface]',
-            "Address = {$address}",
-            'SaveConfig = true',
-            "PrivateKey = {$privkey}",
-            "ListenPort = {$port}",
-            "PostUp = iptables -A FORWARD -i %i -j ACCEPT; iptables -A FORWARD -o %i -j ACCEPT; iptables -t nat -A POSTROUTING -o {$ifout} -j MASQUERADE;",
-            "PostDown = iptables -D FORWARD -i %i -j ACCEPT; iptables -D FORWARD -o %i -j ACCEPT; iptables -t nat -D POSTROUTING -o {$ifout} -j MASQUERADE;",
-        ]);
-    }
-
-    public function startInterface(string $name): void
-    {
+        // Try kernel module first, fall back to wireguard-go
         $escaped = escapeshellarg($name);
-        $this->shell->run("sudo systemctl enable wg-quick@{$escaped}");
-        $this->shell->run("sudo systemctl start wg-quick@{$escaped}");
+        $result = $this->shell->tryRun("sudo ip link add dev {$escaped} type wireguard");
+
+        if ($result === null) {
+            $this->shell->run("sudo wireguard-go {$escaped}");
+        }
+
+        return $name;
     }
 
-    public function stopInterface(string $name): void
+    public function destroyInterface(string $ifname): void
     {
-        $escaped = escapeshellarg($name);
-        $this->shell->run("sudo systemctl stop wg-quick@{$escaped}");
-        $this->shell->run("sudo systemctl disable wg-quick@{$escaped}");
+        $escaped = escapeshellarg($ifname);
+        $this->shell->run("sudo ip link delete dev {$escaped}");
+    }
+
+    public function assignAddress(string $ifname, string $address): void
+    {
+        $escapedIf = escapeshellarg($ifname);
+        $escapedAddr = escapeshellarg($address);
+        $this->shell->run("sudo ip address add {$escapedAddr} dev {$escapedIf}");
+    }
+
+    public function bringUp(string $ifname): void
+    {
+        $escaped = escapeshellarg($ifname);
+        $this->shell->run("sudo ip link set {$escaped} up");
+    }
+
+    public function addNatRules(string $ifname, string $address, string $ifout): void
+    {
+        $escapedIf = escapeshellarg($ifname);
+        $escapedIfout = escapeshellarg($ifout);
+        $comment = escapeshellarg("wg:{$ifname}");
+
+        $this->shell->run(
+            "sudo iptables -A FORWARD -i {$escapedIf} -j ACCEPT -m comment --comment {$comment}"
+        );
+        $this->shell->run(
+            "sudo iptables -A FORWARD -o {$escapedIf} -j ACCEPT -m comment --comment {$comment}"
+        );
+        $this->shell->run(
+            "sudo iptables -t nat -A POSTROUTING -o {$escapedIfout} -j MASQUERADE -m comment --comment {$comment}"
+        );
+    }
+
+    public function removeNatRules(string $ifname): void
+    {
+        $tag = "wg:{$ifname}";
+
+        // Scan FORWARD chain
+        $this->removeTaggedRules('filter', 'FORWARD', $tag);
+
+        // Scan POSTROUTING chain in nat table
+        $this->removeTaggedRules('nat', 'POSTROUTING', $tag);
+    }
+
+    public function isForwardingEnabled(): bool
+    {
+        $value = trim($this->shell->run('cat /proc/sys/net/ipv4/ip_forward'));
+
+        return $value === '1';
+    }
+
+    public function enableForwarding(): void
+    {
+        $this->shell->run('sudo sysctl -w net.ipv4.ip_forward=1');
+    }
+
+    public function disableForwarding(): void
+    {
+        $this->shell->run('sudo sysctl -w net.ipv4.ip_forward=0');
+    }
+
+    /**
+     * Remove iptables rules matching a comment tag from a specific table/chain.
+     */
+    protected function removeTaggedRules(string $table, string $chain, string $tag): void
+    {
+        $escapedTable = escapeshellarg($table);
+        $output = $this->shell->tryRun("sudo iptables -t {$escapedTable} -S {$chain}");
+        if ($output === null) {
+            return;
+        }
+
+        foreach (explode("\n", $output) as $line) {
+            $line = trim($line);
+            if ($line === '' || ! str_contains($line, $tag)) {
+                continue;
+            }
+
+            // Convert -A to -D for deletion
+            $deleteRule = preg_replace('/^-A\s+/', '-D ', $line);
+            if ($deleteRule === $line) {
+                continue;
+            }
+
+            $this->shell->tryRun("sudo iptables -t {$escapedTable} {$deleteRule}");
+        }
     }
 }

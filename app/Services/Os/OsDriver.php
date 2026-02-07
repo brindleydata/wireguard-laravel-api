@@ -35,22 +35,52 @@ interface OsDriver
     public function interfaceAddress(string $ifname): ?string;
 
     /**
-     * Get the WireGuard config directory path.
+     * Get the default outbound network interface (from the default route).
      */
-    public function configPath(): string;
+    public function defaultOutboundInterface(): string;
 
     /**
-     * Generate the interface config file content.
+     * Create a network device and return the OS-level interface name.
      */
-    public function interfaceTemplate(string $address, string $privkey, int $port, string $ifout): string;
+    public function createInterface(string $name): string;
 
     /**
-     * Start a WireGuard interface (bring it up + enable on boot).
+     * Remove a network device.
      */
-    public function startInterface(string $name): void;
+    public function destroyInterface(string $ifname): void;
 
     /**
-     * Stop a WireGuard interface (bring it down + disable on boot).
+     * Assign an IP address with CIDR to an interface.
      */
-    public function stopInterface(string $name): void;
+    public function assignAddress(string $ifname, string $address): void;
+
+    /**
+     * Bring the interface up.
+     */
+    public function bringUp(string $ifname): void;
+
+    /**
+     * Add per-interface NAT/forwarding rules.
+     */
+    public function addNatRules(string $ifname, string $address, string $ifout): void;
+
+    /**
+     * Remove per-interface NAT/forwarding rules.
+     */
+    public function removeNatRules(string $ifname): void;
+
+    /**
+     * Check if IP forwarding is currently enabled.
+     */
+    public function isForwardingEnabled(): bool;
+
+    /**
+     * Enable IP forwarding.
+     */
+    public function enableForwarding(): void;
+
+    /**
+     * Disable IP forwarding.
+     */
+    public function disableForwarding(): void;
 }

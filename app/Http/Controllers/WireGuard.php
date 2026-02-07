@@ -48,6 +48,9 @@ class WireGuard extends Controller
             'ip' => 'required|string',
             'port' => 'nullable|integer|min:1|max:65535',
             'ifout' => 'nullable|string|max:15',
+            'dns' => 'nullable|string',
+            'keepalive' => 'nullable|integer|min:0|max:65535',
+            'allowed_ips' => 'nullable|string',
         ]);
 
         try {
@@ -56,6 +59,9 @@ class WireGuard extends Controller
                 $data['ip'],
                 $data['port'] ?? null,
                 $data['ifout'] ?? null,
+                $data['dns'] ?? null,
+                $data['keepalive'] ?? null,
+                $data['allowed_ips'] ?? null,
             );
 
             return response()->json($interface->toArray(), 201);

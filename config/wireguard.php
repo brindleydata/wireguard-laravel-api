@@ -7,16 +7,9 @@ return [
     'default_dns' => env('WIREGUARD_DNS', '8.8.8.8'),
     'default_keepalive' => (int) env('WIREGUARD_KEEPALIVE', 25),
     'allowed_ips' => env('WIREGUARD_ALLOWED_IPS', '0.0.0.0/0'),
+    'socket_dir' => env('WIREGUARD_SOCKET_DIR', '/var/run/wireguard'),
 
     'templates' => [
-        // Single peer template (appended to server config)
-        'peer' => <<<'CONF'
-[Peer]
-PublicKey = {pubkey}
-PresharedKey = {psk}
-AllowedIPs = {ip}
-CONF,
-
         // Client-side configuration template
         'client' => <<<'CONF'
 [Interface]

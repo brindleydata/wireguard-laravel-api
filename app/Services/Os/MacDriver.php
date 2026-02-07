@@ -3,6 +3,7 @@
 namespace App\Services\Os;
 
 use App\Services\Shell;
+use RuntimeException;
 
 class MacDriver implements OsDriver
 {
@@ -93,53 +94,131 @@ class MacDriver implements OsDriver
         return null;
     }
 
-    public function configPath(): string
+    public function defaultOutboundInterface(): string
     {
-        // Homebrew on Apple Silicon vs Intel
-        if (is_dir('/opt/homebrew/etc/wireguard')) {
-            return '/opt/homebrew/etc/wireguard';
+        // "  interface: en0"
+        $output = $this->shell->tryRun('route -n get default 2>/dev/null');
+        if ($output !== null && preg_match('/interface:\s*(\S+)/', $output, $matches)) {
+            return $matches[1];
         }
 
-        if (is_dir('/usr/local/etc/wireguard')) {
-            return '/usr/local/etc/wireguard';
+        return 'en0';
+    }
+
+    public function createInterface(string $name): string
+    {
+        // wireguard-go on macOS creates a utun device, prints the name to stderr
+        $output = $this->shell->run('sudo wireguard-go utun 2>&1');
+
+        // Output is like: "INFO: (utun4) 2024/01/01 ..."
+        if (preg_match('/\((utun\d+)\)/', $output, $matches)) {
+            return $matches[1];
         }
 
-        // Default: create in homebrew location
-        return PHP_OS_FAMILY === 'Darwin' && php_uname('m') === 'arm64'
-            ? '/opt/homebrew/etc/wireguard'
-            : '/usr/local/etc/wireguard';
+        throw new RuntimeException("Failed to parse utun name from wireguard-go output: {$output}");
     }
 
-    public function interfaceTemplate(string $address, string $privkey, int $port, string $ifout): string
+    public function destroyInterface(string $ifname): void
     {
-        return implode("\n", [
-            '[Interface]',
-            "Address = {$address}",
-            'SaveConfig = true',
-            "PrivateKey = {$privkey}",
-            "ListenPort = {$port}",
-            "PostUp = sysctl -w net.inet.ip.forwarding=1; pfctl -e; echo \"nat on {$ifout} from {$address} to any -> ({$ifout})\" | pfctl -f -",
-            'PostDown = pfctl -d',
-        ]);
+        // Remove the socket file — wireguard-go watches it and exits automatically
+        $socketPath = "/var/run/wireguard/{$ifname}.sock";
+        if (file_exists($socketPath)) {
+            $this->shell->tryRun('sudo rm '.escapeshellarg($socketPath));
+            // Give wireguard-go a moment to notice and exit
+            usleep(200_000);
+        }
+
+        // Fallback: if the process is still running, kill it
+        $escaped = escapeshellarg($ifname);
+        $pid = $this->shell->tryRun('pgrep -f '.escapeshellarg("wireguard-go.*{$ifname}"));
+        if ($pid !== null && $pid !== '') {
+            $this->shell->tryRun('sudo kill '.escapeshellarg(trim($pid)));
+        }
     }
 
-    public function startInterface(string $name): void
+    public function assignAddress(string $ifname, string $address): void
     {
-        $escaped = escapeshellarg($name);
-        $this->shell->run("sudo wg-quick up {$escaped}");
+        // Parse IP and CIDR
+        if (! str_contains($address, '/')) {
+            $address .= '/24';
+        }
+
+        [$ip, $cidr] = explode('/', $address, 2);
+        $netmask = $this->cidrToNetmask((int) $cidr);
+
+        $escapedIf = escapeshellarg($ifname);
+        $escapedIp = escapeshellarg($ip);
+        $escapedMask = escapeshellarg($netmask);
+
+        // On macOS, ifconfig for utun requires: ifconfig <utun> inet <ip> <ip> netmask <mask>
+        $this->shell->run("sudo ifconfig {$escapedIf} inet {$escapedIp} {$escapedIp} netmask {$escapedMask}");
+
+        // Add route for the subnet
+        $network = long2ip(ip2long($ip) & ip2long($netmask));
+        $escapedNet = escapeshellarg("{$network}/{$cidr}");
+        $this->shell->tryRun("sudo route add -net {$escapedNet} -interface {$escapedIf}");
     }
 
-    public function stopInterface(string $name): void
+    public function bringUp(string $ifname): void
     {
-        $escaped = escapeshellarg($name);
-        $this->shell->run("sudo wg-quick down {$escaped}");
+        // utun interfaces are auto-up on macOS — no-op
     }
 
-    private function hexMaskToCidr(string $hex): int
+    public function addNatRules(string $ifname, string $address, string $ifout): void
+    {
+        $anchor = "wg/{$ifname}";
+        $escapedAnchor = escapeshellarg($anchor);
+
+        // Build the NAT rule for this interface's anchor
+        $natRule = "nat on {$ifout} from {$address} to any -> ({$ifout})";
+
+        // Load the rule into the anchor
+        $this->shell->run(
+            'echo '.escapeshellarg($natRule)." | sudo pfctl -a {$escapedAnchor} -f -"
+        );
+
+        // Ensure pfctl is enabled (idempotent — already-enabled returns exit 0 from tryRun)
+        $this->shell->tryRun('sudo pfctl -e 2>/dev/null');
+    }
+
+    public function removeNatRules(string $ifname): void
+    {
+        $anchor = "wg/{$ifname}";
+        $escapedAnchor = escapeshellarg($anchor);
+
+        // Flush only this interface's anchor — never disables pf globally
+        $this->shell->tryRun("sudo pfctl -a {$escapedAnchor} -F all");
+    }
+
+    public function isForwardingEnabled(): bool
+    {
+        $value = trim($this->shell->run('sysctl -n net.inet.ip.forwarding'));
+
+        return $value === '1';
+    }
+
+    public function enableForwarding(): void
+    {
+        $this->shell->run('sudo sysctl -w net.inet.ip.forwarding=1');
+    }
+
+    public function disableForwarding(): void
+    {
+        $this->shell->run('sudo sysctl -w net.inet.ip.forwarding=0');
+    }
+
+    protected function hexMaskToCidr(string $hex): int
     {
         $decimal = hexdec(ltrim($hex, '0x'));
         $binary = decbin($decimal);
 
         return substr_count($binary, '1');
+    }
+
+    protected function cidrToNetmask(int $cidr): string
+    {
+        $mask = $cidr > 0 ? (~0 << (32 - $cidr)) & 0xFFFFFFFF : 0;
+
+        return long2ip($mask);
     }
 }

@@ -7,7 +7,7 @@ use Illuminate\Console\Command;
 
 class WgCreate extends WgCommand
 {
-    protected $signature = 'wg:create {interface} {ip} {port?} {ifout?}';
+    protected $signature = 'wg:create {interface} {ip} {port?} {ifout?} {--dns=} {--keepalive=} {--allowed-ips=}';
 
     protected $description = 'Create a WireGuard interface';
 
@@ -17,9 +17,12 @@ class WgCreate extends WgCommand
         $ip = $this->argument('ip');
         $port = $this->argument('port') ? (int) $this->argument('port') : null;
         $ifout = $this->argument('ifout');
+        $dns = $this->option('dns');
+        $keepalive = $this->option('keepalive') !== null ? (int) $this->option('keepalive') : null;
+        $allowedIps = $this->option('allowed-ips');
 
         try {
-            $interface = $wg->createInterface($name, $ip, $port, $ifout);
+            $interface = $wg->createInterface($name, $ip, $port, $ifout, $dns, $keepalive, $allowedIps);
         } catch (\Throwable $e) {
             $this->error($e->getMessage());
 
