@@ -13,7 +13,7 @@ class WgClientShow extends WgCommand
 
     public function handle(WireGuard $wg): int
     {
-        $interfaceName = $this->argument('interface');
+        $interface_name = $this->argument('interface');
         $ip = $this->argument('ip');
 
         if (! filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) {
@@ -22,9 +22,9 @@ class WgClientShow extends WgCommand
             return Command::FAILURE;
         }
 
-        $config = $wg->getPeerConfig($interfaceName, $ip);
+        $config = $wg->getPeerConfig($interface_name, $ip);
         if ($config === null) {
-            $this->error("Could not find configuration for client {$ip} on {$interfaceName}.");
+            $this->error("Could not find configuration for client {$ip} on {$interface_name}.");
 
             return Command::FAILURE;
         }

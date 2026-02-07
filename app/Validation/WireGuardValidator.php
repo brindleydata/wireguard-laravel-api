@@ -6,9 +6,6 @@ use InvalidArgumentException;
 
 class WireGuardValidator
 {
-    /**
-     * Check if an IP is within a CIDR range.
-     */
     public function ipInRange(string $ip, string $range): bool
     {
         if (! str_contains($range, '/')) {
@@ -17,17 +14,14 @@ class WireGuardValidator
 
         [$network, $netmask] = explode('/', $range, 2);
         $netmask = (int) $netmask;
-        $rangeDec = ip2long($network);
-        $ipDec = ip2long($ip);
-        $wildcardDec = pow(2, 32 - $netmask) - 1;
-        $netmaskDec = ~$wildcardDec;
+        $range_dec = ip2long($network);
+        $ip_dec = ip2long($ip);
+        $wildcard_dec = pow(2, 32 - $netmask) - 1;
+        $netmask_dec = ~$wildcard_dec;
 
-        return ($ipDec & $netmaskDec) === ($rangeDec & $netmaskDec);
+        return ($ip_dec & $netmask_dec) === ($range_dec & $netmask_dec);
     }
 
-    /**
-     * Validate an interface name (alphanumeric + hyphens, max 15 chars).
-     */
     public function validateInterfaceName(string $name): void
     {
         if (! preg_match('/^[a-zA-Z][a-zA-Z0-9_-]{0,14}$/', $name)) {
@@ -37,9 +31,6 @@ class WireGuardValidator
         }
     }
 
-    /**
-     * Validate an IPv4 address.
-     */
     public function validateIpAddress(string $ip): void
     {
         if (! filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) {
@@ -47,9 +38,6 @@ class WireGuardValidator
         }
     }
 
-    /**
-     * Validate an IPv4 address with CIDR notation.
-     */
     public function validateCidr(string $cidr): void
     {
         if (! preg_match('#^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$#', $cidr)) {
@@ -64,9 +52,6 @@ class WireGuardValidator
         }
     }
 
-    /**
-     * Validate a port number.
-     */
     public function validatePort(int $port): void
     {
         if ($port < 1 || $port > 65535) {
@@ -75,23 +60,21 @@ class WireGuardValidator
     }
 
     /**
-     * Ensure a peer IP is within the interface's address range and is not a duplicate.
-     *
-     * @param  array  $existingIps  List of existing peer IPs (with or without /32 suffix)
+     * @param  array  $existing_ips  List of existing peer IPs (with or without /32 suffix)
      */
-    public function validateNewPeerIp(string $ip, string $interfaceAddress, array $existingIps): void
+    public function validateNewPeerIp(string $ip, string $interface_address, array $existing_ips): void
     {
         $this->validateIpAddress($ip);
 
-        if (! $this->ipInRange($ip, $interfaceAddress)) {
+        if (! $this->ipInRange($ip, $interface_address)) {
             throw new InvalidArgumentException(
-                "Peer IP {$ip} is not within the interface's network range ({$interfaceAddress})."
+                "Peer IP {$ip} is not within the interface's network range ({$interface_address})."
             );
         }
 
-        foreach ($existingIps as $existing) {
-            $existingClean = str_replace('/32', '', $existing);
-            if ($existingClean === $ip) {
+        foreach ($existing_ips as $existing) {
+            $existing_clean = str_replace('/32', '', $existing);
+            if ($existing_clean === $ip) {
                 throw new InvalidArgumentException("Peer with IP {$ip} already exists.");
             }
         }

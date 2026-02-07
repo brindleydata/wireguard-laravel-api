@@ -89,13 +89,13 @@ class WireGuard extends Controller
 
     public function peers(string $interface): JsonResponse
     {
-        $interfaceInfo = $this->wg->getInterface($interface);
-        if ($interfaceInfo === null) {
+        $info = $this->wg->getInterface($interface);
+        if ($info === null) {
             return response()->json(['error' => "Interface not found: {$interface}"], 404);
         }
 
         return response()->json(
-            array_map(fn ($p) => $p->toArray(), $interfaceInfo->peers)
+            array_map(fn ($p) => $p->toArray(), $info->peers)
         );
     }
 

@@ -66,9 +66,9 @@ class LinuxDriver implements OsDriver
         ];
     }
 
-    public function publicIp(string $ipService): string
+    public function publicIp(string $ip_service): string
     {
-        $escaped = escapeshellarg($ipService);
+        $escaped = escapeshellarg($ip_service);
 
         return $this->shell->run("curl -s --max-time 5 {$escaped}");
     }
@@ -114,7 +114,6 @@ class LinuxDriver implements OsDriver
 
     public function createInterface(string $name): string
     {
-        // Try kernel module first, fall back to wireguard-go
         $escaped = escapeshellarg($name);
         $result = $this->shell->tryRun("sudo ip link add dev {$escaped} type wireguard");
 
@@ -133,9 +132,9 @@ class LinuxDriver implements OsDriver
 
     public function assignAddress(string $ifname, string $address): void
     {
-        $escapedIf = escapeshellarg($ifname);
-        $escapedAddr = escapeshellarg($address);
-        $this->shell->run("sudo ip address add {$escapedAddr} dev {$escapedIf}");
+        $escaped_if = escapeshellarg($ifname);
+        $escaped_addr = escapeshellarg($address);
+        $this->shell->run("sudo ip address add {$escaped_addr} dev {$escaped_if}");
     }
 
     public function bringUp(string $ifname): void
@@ -146,18 +145,18 @@ class LinuxDriver implements OsDriver
 
     public function addNatRules(string $ifname, string $address, string $ifout): void
     {
-        $escapedIf = escapeshellarg($ifname);
-        $escapedIfout = escapeshellarg($ifout);
+        $escaped_if = escapeshellarg($ifname);
+        $escaped_ifout = escapeshellarg($ifout);
         $comment = escapeshellarg("wg:{$ifname}");
 
         $this->shell->run(
-            "sudo iptables -A FORWARD -i {$escapedIf} -j ACCEPT -m comment --comment {$comment}"
+            "sudo iptables -A FORWARD -i {$escaped_if} -j ACCEPT -m comment --comment {$comment}"
         );
         $this->shell->run(
-            "sudo iptables -A FORWARD -o {$escapedIf} -j ACCEPT -m comment --comment {$comment}"
+            "sudo iptables -A FORWARD -o {$escaped_if} -j ACCEPT -m comment --comment {$comment}"
         );
         $this->shell->run(
-            "sudo iptables -t nat -A POSTROUTING -o {$escapedIfout} -j MASQUERADE -m comment --comment {$comment}"
+            "sudo iptables -t nat -A POSTROUTING -o {$escaped_ifout} -j MASQUERADE -m comment --comment {$comment}"
         );
     }
 
@@ -165,10 +164,7 @@ class LinuxDriver implements OsDriver
     {
         $tag = "wg:{$ifname}";
 
-        // Scan FORWARD chain
         $this->removeTaggedRules('filter', 'FORWARD', $tag);
-
-        // Scan POSTROUTING chain in nat table
         $this->removeTaggedRules('nat', 'POSTROUTING', $tag);
     }
 
@@ -189,13 +185,10 @@ class LinuxDriver implements OsDriver
         $this->shell->run('sudo sysctl -w net.ipv4.ip_forward=0');
     }
 
-    /**
-     * Remove iptables rules matching a comment tag from a specific table/chain.
-     */
     protected function removeTaggedRules(string $table, string $chain, string $tag): void
     {
-        $escapedTable = escapeshellarg($table);
-        $output = $this->shell->tryRun("sudo iptables -t {$escapedTable} -S {$chain}");
+        $escaped_table = escapeshellarg($table);
+        $output = $this->shell->tryRun("sudo iptables -t {$escaped_table} -S {$chain}");
         if ($output === null) {
             return;
         }
@@ -206,13 +199,12 @@ class LinuxDriver implements OsDriver
                 continue;
             }
 
-            // Convert -A to -D for deletion
-            $deleteRule = preg_replace('/^-A\s+/', '-D ', $line);
-            if ($deleteRule === $line) {
+            $delete_rule = preg_replace('/^-A\s+/', '-D ', $line);
+            if ($delete_rule === $line) {
                 continue;
             }
 
-            $this->shell->tryRun("sudo iptables -t {$escapedTable} {$deleteRule}");
+            $this->shell->tryRun("sudo iptables -t {$escaped_table} {$delete_rule}");
         }
     }
 }

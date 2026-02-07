@@ -9,9 +9,9 @@ class InterfaceInfo
      */
     public function __construct(
         public readonly string $name,
-        public readonly string $publicKey,
-        public readonly string $privateKey,
-        public readonly int $listenPort,
+        public readonly string $public_key,
+        public readonly string $private_key,
+        public readonly int $listen_port,
         public readonly string $address,
         public readonly string $ifout,
         public readonly array $peers = [],
@@ -21,9 +21,9 @@ class InterfaceInfo
     {
         return [
             'name' => $this->name,
-            'public_key' => $this->publicKey,
-            'private_key' => $this->privateKey,
-            'listen_port' => $this->listenPort,
+            'public_key' => $this->public_key,
+            'private_key' => $this->private_key,
+            'listen_port' => $this->listen_port,
             'address' => $this->address,
             'ifout' => $this->ifout,
             'peers' => array_map(fn (PeerInfo $p) => $p->toArray(), $this->peers),

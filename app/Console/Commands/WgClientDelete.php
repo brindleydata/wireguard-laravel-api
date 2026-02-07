@@ -13,18 +13,18 @@ class WgClientDelete extends WgCommand
 
     public function handle(WireGuard $wg): int
     {
-        $interfaceName = $this->argument('interface');
+        $interface_name = $this->argument('interface');
         $ip = $this->argument('ip');
 
         try {
-            $wg->removePeer($interfaceName, $ip);
+            $wg->removePeer($interface_name, $ip);
         } catch (\Throwable $e) {
             $this->error($e->getMessage());
 
             return Command::FAILURE;
         }
 
-        $this->info("Removed peer {$ip} from {$interfaceName}");
+        $this->info("Removed peer {$ip} from {$interface_name}");
 
         return Command::SUCCESS;
     }

@@ -7,7 +7,7 @@ use RuntimeException;
 class WireGuardSocket
 {
     public function __construct(
-        protected string $socketDir = '/var/run/wireguard',
+        protected string $socket_dir = '/var/run/wireguard',
     ) {}
 
     /**
@@ -15,7 +15,7 @@ class WireGuardSocket
      */
     public function listInterfaces(): array
     {
-        $pattern = rtrim($this->socketDir, '/').'/*.sock';
+        $pattern = rtrim($this->socket_dir, '/').'/*.sock';
         $files = glob($pattern);
 
         if ($files === false || $files === []) {
@@ -38,14 +38,6 @@ class WireGuardSocket
 
     /**
      * GET the current configuration and status of a WireGuard interface via UAPI.
-     *
-     * Returns: [
-     *   'private_key' => hex, 'listen_port' => int, 'fwmark' => int,
-     *   'public_key' => hex,
-     *   'peers' => [ [ 'public_key' => hex, 'preshared_key' => hex|null,
-     *                   'allowed_ips' => [...], 'endpoint' => str,
-     *                   'last_handshake_time_sec' => int, 'rx_bytes' => int, 'tx_bytes' => int ], ... ]
-     * ]
      */
     public function get(string $interface): array
     {
@@ -134,7 +126,7 @@ class WireGuardSocket
      */
     protected function socketPath(string $interface): string
     {
-        return rtrim($this->socketDir, '/')."/{$interface}.sock";
+        return rtrim($this->socket_dir, '/')."/{$interface}.sock";
     }
 
     /**
@@ -142,21 +134,21 @@ class WireGuardSocket
      */
     protected function request(string $interface, string $message): array
     {
-        $socketPath = $this->socketPath($interface);
+        $path = $this->socketPath($interface);
 
-        if (! file_exists($socketPath)) {
-            throw new RuntimeException("WireGuard socket not found: {$socketPath}");
+        if (! file_exists($path)) {
+            throw new RuntimeException("WireGuard socket not found: {$path}");
         }
 
         $socket = @stream_socket_client(
-            "unix://{$socketPath}",
+            "unix://{$path}",
             $errno,
             $errstr,
             5,
         );
 
         if ($socket === false) {
-            throw new RuntimeException("Failed to connect to WireGuard socket {$socketPath}: [{$errno}] {$errstr}");
+            throw new RuntimeException("Failed to connect to WireGuard socket {$path}: [{$errno}] {$errstr}");
         }
 
         try {
@@ -189,7 +181,7 @@ class WireGuardSocket
             'fwmark' => 0,
             'peers' => [],
         ];
-        $currentPeer = null;
+        $current_peer = null;
 
         foreach ($lines as $line) {
             $line = trim($line);
@@ -213,11 +205,10 @@ class WireGuardSocket
             [$key, $value] = explode('=', $line, 2);
 
             if ($key === 'public_key') {
-                // A new peer section begins
-                if ($currentPeer !== null) {
-                    $result['peers'][] = $currentPeer;
+                if ($current_peer !== null) {
+                    $result['peers'][] = $current_peer;
                 }
-                $currentPeer = [
+                $current_peer = [
                     'public_key' => $value,
                     'preshared_key' => null,
                     'allowed_ips' => [],
@@ -231,20 +222,18 @@ class WireGuardSocket
                 continue;
             }
 
-            if ($currentPeer !== null) {
-                // We're inside a peer section
+            if ($current_peer !== null) {
                 match ($key) {
-                    'preshared_key' => $currentPeer['preshared_key'] = $this->isZeroKey($value) ? null : $value,
-                    'allowed_ip' => $currentPeer['allowed_ips'][] = $value,
-                    'endpoint' => $currentPeer['endpoint'] = $value,
-                    'last_handshake_time_sec' => $currentPeer['last_handshake_time_sec'] = (int) $value,
-                    'rx_bytes' => $currentPeer['rx_bytes'] = (int) $value,
-                    'tx_bytes' => $currentPeer['tx_bytes'] = (int) $value,
-                    'persistent_keepalive_interval' => $currentPeer['persistent_keepalive_interval'] = (int) $value,
+                    'preshared_key' => $current_peer['preshared_key'] = $this->isZeroKey($value) ? null : $value,
+                    'allowed_ip' => $current_peer['allowed_ips'][] = $value,
+                    'endpoint' => $current_peer['endpoint'] = $value,
+                    'last_handshake_time_sec' => $current_peer['last_handshake_time_sec'] = (int) $value,
+                    'rx_bytes' => $current_peer['rx_bytes'] = (int) $value,
+                    'tx_bytes' => $current_peer['tx_bytes'] = (int) $value,
+                    'persistent_keepalive_interval' => $current_peer['persistent_keepalive_interval'] = (int) $value,
                     default => null,
                 };
             } else {
-                // Interface-level fields
                 match ($key) {
                     'private_key' => $result['private_key'] = $this->isZeroKey($value) ? null : $value,
                     'listen_port' => $result['listen_port'] = (int) $value,
@@ -254,9 +243,8 @@ class WireGuardSocket
             }
         }
 
-        // Don't forget the last peer
-        if ($currentPeer !== null) {
-            $result['peers'][] = $currentPeer;
+        if ($current_peer !== null) {
+            $result['peers'][] = $current_peer;
         }
 
         return $result;

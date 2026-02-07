@@ -30,34 +30,33 @@ class WireGuardServiceProvider extends ServiceProvider
         $this->app->singleton(WireGuardValidator::class, fn () => new WireGuardValidator);
 
         $this->app->singleton(WireGuardSocket::class, fn () => new WireGuardSocket(
-            socketDir: config('wireguard.socket_dir', '/var/run/wireguard'),
+            socket_dir: config('wireguard.socket_dir', '/var/run/wireguard'),
         ));
 
         $this->app->singleton(InterfaceMap::class, function () {
-            $storagePath = storage_path('wireguard');
-            if (! is_dir($storagePath)) {
-                mkdir($storagePath, 0755, true);
+            $storage_path = storage_path('wireguard');
+            if (! is_dir($storage_path)) {
+                mkdir($storage_path, 0755, true);
             }
 
             return new InterfaceMap(
-                mapFile: "{$storagePath}/interface-map.json",
+                map_file: "{$storage_path}/interface-map.json",
             );
         });
 
         $this->app->singleton(WireGuard::class, function ($app) {
-            $storagePath = storage_path('wireguard');
-            if (! is_dir($storagePath)) {
-                mkdir($storagePath, 0755, true);
+            $storage_path = storage_path('wireguard');
+            if (! is_dir($storage_path)) {
+                mkdir($storage_path, 0755, true);
             }
 
             return new WireGuard(
                 config: config('wireguard'),
-                shell: $app->make(Shell::class),
                 os: $app->make(OsDriver::class),
                 validator: $app->make(WireGuardValidator::class),
                 socket: $app->make(WireGuardSocket::class),
-                interfaceMap: $app->make(InterfaceMap::class),
-                storagePath: $storagePath,
+                interface_map: $app->make(InterfaceMap::class),
+                storage_path: $storage_path,
             );
         });
     }

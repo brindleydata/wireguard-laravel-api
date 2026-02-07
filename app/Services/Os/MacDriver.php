@@ -15,7 +15,6 @@ class MacDriver implements OsDriver
     {
         $cores = (int) $this->shell->run('sysctl -n hw.ncpu');
         $loadavg = $this->shell->run('sysctl -n vm.loadavg');
-        // vm.loadavg returns "{ 1.23 4.56 7.89 }"
         preg_match('/\{\s*([\d.]+)/', $loadavg, $matches);
         $load = (float) ($matches[1] ?? 0);
         $usage = $cores > 0 ? (int) round($load / $cores * 100) : 0;
@@ -25,16 +24,13 @@ class MacDriver implements OsDriver
 
     public function ram(): array
     {
-        // Total RAM via sysctl (in bytes)
-        $totalBytes = (int) $this->shell->run('sysctl -n hw.memsize');
-        $total = (int) ($totalBytes / 1024); // convert to kB
+        $total_bytes = (int) $this->shell->run('sysctl -n hw.memsize');
+        $total = (int) ($total_bytes / 1024);
 
-        // Free pages via vm_stat
         $vmstat = $this->shell->run('vm_stat');
         $free = 0;
         if (preg_match('/Pages free:\s+(\d+)/', $vmstat, $matches)) {
-            // vm_stat pages are 4096 bytes each
-            $free = (int) ($matches[1] * 4096 / 1024); // convert to kB
+            $free = (int) ($matches[1] * 4096 / 1024);
         }
 
         $usage = $total > 0 ? (int) round($free / $total * 100) : 0;
@@ -61,9 +57,9 @@ class MacDriver implements OsDriver
         ];
     }
 
-    public function publicIp(string $ipService): string
+    public function publicIp(string $ip_service): string
     {
-        $escaped = escapeshellarg($ipService);
+        $escaped = escapeshellarg($ip_service);
 
         return $this->shell->run("curl -s --max-time 5 {$escaped}");
     }
@@ -83,7 +79,6 @@ class MacDriver implements OsDriver
             return null;
         }
 
-        // ifconfig on macOS shows: inet 10.0.0.1 netmask 0xffffff00
         if (preg_match('/inet (\d+\.\d+\.\d+\.\d+).*netmask (0x[0-9a-f]+)/', $output, $matches)) {
             $ip = $matches[1];
             $mask = $this->hexMaskToCidr($matches[2]);
@@ -96,7 +91,6 @@ class MacDriver implements OsDriver
 
     public function defaultOutboundInterface(): string
     {
-        // "  interface: en0"
         $output = $this->shell->tryRun('route -n get default 2>/dev/null');
         if ($output !== null && preg_match('/interface:\s*(\S+)/', $output, $matches)) {
             return $matches[1];
@@ -107,10 +101,8 @@ class MacDriver implements OsDriver
 
     public function createInterface(string $name): string
     {
-        // wireguard-go on macOS creates a utun device, prints the name to stderr
         $output = $this->shell->run('sudo wireguard-go utun 2>&1');
 
-        // Output is like: "INFO: (utun4) 2024/01/01 ..."
         if (preg_match('/\((utun\d+)\)/', $output, $matches)) {
             return $matches[1];
         }
@@ -120,16 +112,12 @@ class MacDriver implements OsDriver
 
     public function destroyInterface(string $ifname): void
     {
-        // Remove the socket file — wireguard-go watches it and exits automatically
-        $socketPath = "/var/run/wireguard/{$ifname}.sock";
-        if (file_exists($socketPath)) {
-            $this->shell->tryRun('sudo rm '.escapeshellarg($socketPath));
-            // Give wireguard-go a moment to notice and exit
+        $socket_path = "/var/run/wireguard/{$ifname}.sock";
+        if (file_exists($socket_path)) {
+            $this->shell->tryRun('sudo rm '.escapeshellarg($socket_path));
             usleep(200_000);
         }
 
-        // Fallback: if the process is still running, kill it
-        $escaped = escapeshellarg($ifname);
         $pid = $this->shell->tryRun('pgrep -f '.escapeshellarg("wireguard-go.*{$ifname}"));
         if ($pid !== null && $pid !== '') {
             $this->shell->tryRun('sudo kill '.escapeshellarg(trim($pid)));
@@ -138,7 +126,6 @@ class MacDriver implements OsDriver
 
     public function assignAddress(string $ifname, string $address): void
     {
-        // Parse IP and CIDR
         if (! str_contains($address, '/')) {
             $address .= '/24';
         }
@@ -146,17 +133,15 @@ class MacDriver implements OsDriver
         [$ip, $cidr] = explode('/', $address, 2);
         $netmask = $this->cidrToNetmask((int) $cidr);
 
-        $escapedIf = escapeshellarg($ifname);
-        $escapedIp = escapeshellarg($ip);
-        $escapedMask = escapeshellarg($netmask);
+        $escaped_if = escapeshellarg($ifname);
+        $escaped_ip = escapeshellarg($ip);
+        $escaped_mask = escapeshellarg($netmask);
 
-        // On macOS, ifconfig for utun requires: ifconfig <utun> inet <ip> <ip> netmask <mask>
-        $this->shell->run("sudo ifconfig {$escapedIf} inet {$escapedIp} {$escapedIp} netmask {$escapedMask}");
+        $this->shell->run("sudo ifconfig {$escaped_if} inet {$escaped_ip} {$escaped_ip} netmask {$escaped_mask}");
 
-        // Add route for the subnet
         $network = long2ip(ip2long($ip) & ip2long($netmask));
-        $escapedNet = escapeshellarg("{$network}/{$cidr}");
-        $this->shell->tryRun("sudo route add -net {$escapedNet} -interface {$escapedIf}");
+        $escaped_net = escapeshellarg("{$network}/{$cidr}");
+        $this->shell->tryRun("sudo route add -net {$escaped_net} -interface {$escaped_if}");
     }
 
     public function bringUp(string $ifname): void
@@ -167,27 +152,23 @@ class MacDriver implements OsDriver
     public function addNatRules(string $ifname, string $address, string $ifout): void
     {
         $anchor = "wg/{$ifname}";
-        $escapedAnchor = escapeshellarg($anchor);
+        $escaped_anchor = escapeshellarg($anchor);
 
-        // Build the NAT rule for this interface's anchor
-        $natRule = "nat on {$ifout} from {$address} to any -> ({$ifout})";
+        $nat_rule = "nat on {$ifout} from {$address} to any -> ({$ifout})";
 
-        // Load the rule into the anchor
         $this->shell->run(
-            'echo '.escapeshellarg($natRule)." | sudo pfctl -a {$escapedAnchor} -f -"
+            'echo '.escapeshellarg($nat_rule)." | sudo pfctl -a {$escaped_anchor} -f -"
         );
 
-        // Ensure pfctl is enabled (idempotent — already-enabled returns exit 0 from tryRun)
         $this->shell->tryRun('sudo pfctl -e 2>/dev/null');
     }
 
     public function removeNatRules(string $ifname): void
     {
         $anchor = "wg/{$ifname}";
-        $escapedAnchor = escapeshellarg($anchor);
+        $escaped_anchor = escapeshellarg($anchor);
 
-        // Flush only this interface's anchor — never disables pf globally
-        $this->shell->tryRun("sudo pfctl -a {$escapedAnchor} -F all");
+        $this->shell->tryRun("sudo pfctl -a {$escaped_anchor} -F all");
     }
 
     public function isForwardingEnabled(): bool

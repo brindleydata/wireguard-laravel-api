@@ -13,25 +13,25 @@ class WgClientAdd extends WgCommand
 
     public function handle(WireGuard $wg): int
     {
-        $interfaceName = $this->argument('interface');
+        $interface_name = $this->argument('interface');
         $ip = $this->argument('ip');
 
         try {
-            $peer = $wg->addPeer($interfaceName, $ip);
+            $peer = $wg->addPeer($interface_name, $ip);
         } catch (\Throwable $e) {
             $this->error($e->getMessage());
 
             return Command::FAILURE;
         }
 
-        $this->info("Added peer {$peer->publicKey}");
-        $this->line("Allowed IPs: {$peer->allowedIps}");
+        $this->info("Added peer {$peer->public_key}");
+        $this->line("Allowed IPs: {$peer->allowed_ips}");
         $this->line('');
 
-        if ($peer->clientConfig !== null) {
+        if ($peer->client_config !== null) {
             $this->info('Client configuration:');
             $this->line('');
-            $this->line($peer->clientConfig);
+            $this->line($peer->client_config);
         }
 
         return Command::SUCCESS;

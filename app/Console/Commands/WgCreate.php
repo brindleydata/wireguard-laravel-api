@@ -19,10 +19,10 @@ class WgCreate extends WgCommand
         $ifout = $this->argument('ifout');
         $dns = $this->option('dns');
         $keepalive = $this->option('keepalive') !== null ? (int) $this->option('keepalive') : null;
-        $allowedIps = $this->option('allowed-ips');
+        $allowed_ips = $this->option('allowed-ips');
 
         try {
-            $interface = $wg->createInterface($name, $ip, $port, $ifout, $dns, $keepalive, $allowedIps);
+            $interface = $wg->createInterface($name, $ip, $port, $ifout, $dns, $keepalive, $allowed_ips);
         } catch (\Throwable $e) {
             $this->error($e->getMessage());
 
@@ -30,8 +30,8 @@ class WgCreate extends WgCommand
         }
 
         $this->info("Created interface {$interface->name}");
-        $this->line("Public Key: {$interface->publicKey}");
-        $this->line("Listen Port: {$interface->listenPort}");
+        $this->line("Public Key: {$interface->public_key}");
+        $this->line("Listen Port: {$interface->listen_port}");
         $this->line("Address: {$interface->address}");
 
         return Command::SUCCESS;

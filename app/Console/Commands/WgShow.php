@@ -23,16 +23,16 @@ class WgShow extends WgCommand
         }
 
         $this->info("Interface {$interface->name}");
-        $this->line("Public Key: {$interface->publicKey}");
-        $this->line("Private Key: {$interface->privateKey}");
-        $this->line("Listen Port: {$interface->listenPort}");
+        $this->line("Public Key: {$interface->public_key}");
+        $this->line("Private Key: {$interface->private_key}");
+        $this->line("Listen Port: {$interface->listen_port}");
         $this->line("VPN Address: {$interface->address}");
         $this->line('');
 
         foreach ($interface->peers as $peer) {
-            $this->info("Peer {$peer->publicKey}");
-            $this->line("VPN Address: {$peer->allowedIps}");
-            $this->line('PSK: '.($peer->presharedKey ?? '(none)'));
+            $this->info("Peer {$peer->public_key}");
+            $this->line("VPN Address: {$peer->allowed_ips}");
+            $this->line('PSK: '.($peer->preshared_key ?? '(none)'));
             $this->line('');
         }
 

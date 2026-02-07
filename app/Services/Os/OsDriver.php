@@ -22,7 +22,7 @@ interface OsDriver
     /**
      * Get the public IP address via an external service.
      */
-    public function publicIp(string $ipService): string;
+    public function publicIp(string $ip_service): string;
 
     /**
      * Get list of network interface names.
