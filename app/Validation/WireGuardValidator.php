@@ -73,7 +73,7 @@ class WireGuardValidator
         }
 
         foreach ($existing_ips as $existing) {
-            $existing_clean = str_replace('/32', '', $existing);
+            $existing_clean = explode('/', $existing, 2)[0];
             if ($existing_clean === $ip) {
                 throw new InvalidArgumentException("Peer with IP {$ip} already exists.");
             }

@@ -7,7 +7,7 @@ use Illuminate\Console\Command;
 
 class WgLinkPeers extends WgCommand
 {
-    protected $signature = 'wg:link:peers {link}';
+    protected $signature = 'wg:link:peers {link : Interface name}';
 
     protected $description = 'List peers for a WireGuard link';
 

@@ -7,29 +7,23 @@ use Illuminate\Console\Command;
 
 class WgPeerShow extends WgCommand
 {
-    protected $signature = 'wg:peer:show {link} {ip}';
+    protected $signature = 'wg:peer {link : Interface name} {pubkey : Peer public key}';
 
     protected $description = 'Show WireGuard peer configuration';
 
     public function handle(WireGuard $wg): int
     {
         $link = $this->argument('link');
-        $ip = $this->argument('ip');
+        $pubkey = $this->argument('pubkey');
 
-        if (! filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) {
-            $this->error('Invalid IP address.');
-
-            return Command::FAILURE;
-        }
-
-        $config = $wg->getPeerConfig($link, $ip);
+        $config = $wg->getPeerConfig($link, $pubkey);
         if ($config === null) {
-            $this->error("Could not find configuration for peer {$ip} on {$link}.");
+            $this->error("Could not find configuration for peer {$pubkey} on {$link}.");
 
             return Command::FAILURE;
         }
 
-        $this->info("Peer {$ip} configuration:");
+        $this->info("Peer {$pubkey} configuration:");
         $this->line('');
         $this->line($config);
 

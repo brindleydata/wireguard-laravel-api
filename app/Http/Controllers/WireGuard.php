@@ -51,6 +51,9 @@ class WireGuard extends Controller
             'dns' => 'nullable|string',
             'keepalive' => 'nullable|integer|min:0|max:65535',
             'allowed_ips' => 'nullable|string',
+            'forward' => 'nullable|boolean',
+            'nat' => 'nullable|boolean',
+            'up' => 'nullable|boolean',
         ]);
 
         $link = $this->wg->createLink(
@@ -61,6 +64,9 @@ class WireGuard extends Controller
             $data['dns'] ?? null,
             $data['keepalive'] ?? null,
             $data['allowed_ips'] ?? null,
+            $data['forward'] ?? false,
+            $data['nat'] ?? false,
+            $data['up'] ?? true,
         );
 
         return response()->json($link->toArray(), 201);
@@ -73,18 +79,26 @@ class WireGuard extends Controller
         return ['message' => "Deleted link: {$name}"];
     }
 
-    public function linkUp(string $name): array
+    public function linkUpdate(Request $request, string $name): array
     {
-        $this->wg->linkUp($name);
+        $data = $request->validate([
+            'address' => 'nullable|string',
+            'port' => 'nullable|integer|min:1|max:65535',
+            'ifout' => 'nullable|string|max:15',
+            'dns' => 'nullable|string',
+            'keepalive' => 'nullable|integer|min:0|max:65535',
+            'allowed_ips' => 'nullable|string',
+            'forward' => 'nullable|boolean',
+            'nat' => 'nullable|boolean',
+            'up' => 'nullable|boolean',
+        ]);
 
-        return ['message' => "Link is up: {$name}"];
-    }
+        // Filter out null values so only explicitly provided fields are passed
+        $params = array_filter($data, fn ($v) => $v !== null);
 
-    public function linkDown(string $name): array
-    {
-        $this->wg->linkDown($name);
+        $link = $this->wg->updateLink($name, $params);
 
-        return ['message' => "Link is down: {$name}"];
+        return $link->toArray();
     }
 
     public function peers(string $link): array
@@ -101,27 +115,44 @@ class WireGuard extends Controller
     public function peerCreate(Request $request, string $link): JsonResponse
     {
         $data = $request->validate([
-            'ip' => 'required|string',
+            'ip' => 'nullable|string',
         ]);
 
-        $peer = $this->wg->addPeer($link, $data['ip']);
+        $peer = $this->wg->addPeer($link, $data['ip'] ?? null);
 
         return response()->json($peer->toArray(), 201);
     }
 
-    public function peerDelete(string $link, string $ip): array
+    public function peerDelete(string $link, string $pubkey): array
     {
-        $this->wg->removePeer($link, $ip);
+        $decoded = WireGuardService::safeToPubkey($pubkey);
+        $this->wg->removePeer($link, $decoded);
 
-        return ['message' => "Removed peer {$ip} from {$link}"];
+        return ['message' => "Removed peer from {$link}"];
     }
 
-    public function peerConfig(string $link, string $ip): array
+    public function peerUpdate(Request $request, string $link, string $pubkey): array
     {
-        $config = $this->wg->getPeerConfig($link, $ip);
+        $data = $request->validate([
+            'allowed_ips' => 'nullable|string',
+            'dns' => 'nullable|string',
+        ]);
+
+        $params = array_filter($data, fn ($v) => $v !== null);
+        $decoded = WireGuardService::safeToPubkey($pubkey);
+
+        $peer = $this->wg->updatePeer($link, $decoded, $params);
+
+        return $peer->toArray();
+    }
+
+    public function peerConfig(string $link, string $pubkey): array
+    {
+        $decoded = WireGuardService::safeToPubkey($pubkey);
+        $config = $this->wg->getPeerConfig($link, $decoded);
 
         if ($config === null) {
-            abort(404, "Configuration not found for peer {$ip} on {$link}");
+            abort(404, "Configuration not found for peer on {$link}");
         }
 
         return ['config' => $config];

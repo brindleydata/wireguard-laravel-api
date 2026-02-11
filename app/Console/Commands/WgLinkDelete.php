@@ -7,7 +7,7 @@ use Illuminate\Console\Command;
 
 class WgLinkDelete extends WgCommand
 {
-    protected $signature = 'wg:link:delete {link}';
+    protected $signature = 'wg:link:delete {link : Interface name}';
 
     protected $description = 'Delete a WireGuard link';
 

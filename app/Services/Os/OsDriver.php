@@ -50,9 +50,29 @@ interface OsDriver
     public function configPath(): string;
 
     /**
-     * Generate the [Interface] section for a wg-quick config, including PostUp/PostDown NAT hooks.
+     * Generate the [Interface] section for a wg-quick config, with optional PostUp/PostDown for forwarding and NAT.
      */
-    public function interfaceSection(string $address, string $privkey, int $port, string $ifout): string;
+    public function interfaceSection(string $address, string $privkey, int $port, string $ifout, bool $forward = false, bool $nat = false): string;
+
+    /**
+     * Add nft FORWARD / pfctl pass rules for a WireGuard interface.
+     */
+    public function enableForward(string $name): void;
+
+    /**
+     * Remove nft FORWARD / pfctl pass rules for a WireGuard interface.
+     */
+    public function disableForward(string $name): void;
+
+    /**
+     * Add nft masquerade / pfctl nat rule for a WireGuard interface.
+     */
+    public function enableNat(string $name, string $ifout): void;
+
+    /**
+     * Remove nft masquerade / pfctl nat rule for a WireGuard interface.
+     */
+    public function disableNat(string $name, string $ifout): void;
 
     /**
      * Write a wg-quick .conf file securely (chmod 0600).
@@ -75,6 +95,11 @@ interface OsDriver
     public function configExists(string $name): bool;
 
     /**
+     * List all interface names that have .conf files on disk.
+     */
+    public function listConfigNames(): array;
+
+    /**
      * Parse metadata from comment headers in a wg-quick .conf file.
      * Returns array with keys: address, ifout, and optionally dns, keepalive, allowed_ips.
      * Returns null if the config file doesn't exist.
@@ -94,17 +119,17 @@ interface OsDriver
     /**
      * Write a client (peer) config file.
      */
-    public function writeClientConfig(string $link, string $ip, string $content): void;
+    public function writeClientConfig(string $link, string $key, string $content): void;
 
     /**
      * Read a client (peer) config file, or null if it doesn't exist.
      */
-    public function readClientConfig(string $link, string $ip): ?string;
+    public function readClientConfig(string $link, string $key): ?string;
 
     /**
      * Delete a client (peer) config file.
      */
-    public function deleteClientConfig(string $link, string $ip): void;
+    public function deleteClientConfig(string $link, string $key): void;
 
     /**
      * Delete the entire client config directory for a link.

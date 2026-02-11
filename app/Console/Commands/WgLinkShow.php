@@ -7,7 +7,7 @@ use Illuminate\Console\Command;
 
 class WgLinkShow extends WgCommand
 {
-    protected $signature = 'wg:link:show {link}';
+    protected $signature = 'wg:link {link : Interface name}';
 
     protected $description = 'Show WireGuard link details';
 
@@ -27,11 +27,13 @@ class WgLinkShow extends WgCommand
         $this->line("Private Key: {$link->private_key}");
         $this->line("Listen Port: {$link->listen_port}");
         $this->line("VPN Address: {$link->address}");
+        $this->line('Forward: '.($link->forward ? 'enabled' : 'disabled'));
+        $this->line('NAT: '.($link->nat ? 'enabled' : 'disabled'));
         $this->line('');
 
         foreach ($link->peers as $peer) {
             $this->info("Peer {$peer->public_key}");
-            $this->line("VPN Address: {$peer->allowed_ips}");
+            $this->line("Allowed IPs: {$peer->allowed_ips}");
             $this->line('PSK: '.($peer->preshared_key ?? '(none)'));
             $this->line('');
         }

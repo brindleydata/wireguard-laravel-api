@@ -7,24 +7,24 @@ use Illuminate\Console\Command;
 
 class WgPeerDelete extends WgCommand
 {
-    protected $signature = 'wg:peer:delete {link} {ip}';
+    protected $signature = 'wg:peer:delete {link : Interface name} {pubkey : Peer public key}';
 
     protected $description = 'Delete a WireGuard peer';
 
     public function handle(WireGuard $wg): int
     {
         $link = $this->argument('link');
-        $ip = $this->argument('ip');
+        $pubkey = $this->argument('pubkey');
 
         try {
-            $wg->removePeer($link, $ip);
+            $wg->removePeer($link, $pubkey);
         } catch (\Throwable $e) {
             $this->error($e->getMessage());
 
             return Command::FAILURE;
         }
 
-        $this->info("Removed peer {$ip} from {$link}");
+        $this->info("Removed peer {$pubkey} from {$link}");
 
         return Command::SUCCESS;
     }

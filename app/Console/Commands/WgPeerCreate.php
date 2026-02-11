@@ -7,14 +7,14 @@ use Illuminate\Console\Command;
 
 class WgPeerCreate extends WgCommand
 {
-    protected $signature = 'wg:peer:create {link} {ip}';
+    protected $signature = 'wg:peer:create {link : Interface name} {--ip= : Peer IP address within the link subnet (auto-assigned if omitted)}';
 
     protected $description = 'Create a WireGuard peer';
 
     public function handle(WireGuard $wg): int
     {
         $link = $this->argument('link');
-        $ip = $this->argument('ip');
+        $ip = $this->option('ip');
 
         try {
             $peer = $wg->addPeer($link, $ip);

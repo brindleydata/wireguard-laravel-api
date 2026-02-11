@@ -12,13 +12,13 @@ Route::middleware(AuthenticateByApiKey::class)->group(function () {
     Route::get('/links', [WireGuard::class, 'links']);
     Route::get('/link/{name}', [WireGuard::class, 'link']);
     Route::post('/link', [WireGuard::class, 'linkCreate']);
+    Route::patch('/link/{name}', [WireGuard::class, 'linkUpdate']);
     Route::delete('/link/{name}', [WireGuard::class, 'linkDelete']);
-    Route::post('/link/{name}/up', [WireGuard::class, 'linkUp']);
-    Route::post('/link/{name}/down', [WireGuard::class, 'linkDown']);
 
     // Peer routes
     Route::get('/link/{link}/peers', [WireGuard::class, 'peers']);
     Route::post('/link/{link}/peers', [WireGuard::class, 'peerCreate']);
-    Route::delete('/link/{link}/peer/{ip}', [WireGuard::class, 'peerDelete']);
-    Route::get('/link/{link}/peer/{ip}/config', [WireGuard::class, 'peerConfig']);
+    Route::patch('/link/{link}/peer/{pubkey}', [WireGuard::class, 'peerUpdate'])->where('pubkey', '[A-Za-z0-9_-]+');
+    Route::delete('/link/{link}/peer/{pubkey}', [WireGuard::class, 'peerDelete'])->where('pubkey', '[A-Za-z0-9_-]+');
+    Route::get('/link/{link}/peer/{pubkey}/config', [WireGuard::class, 'peerConfig'])->where('pubkey', '[A-Za-z0-9_-]+');
 });

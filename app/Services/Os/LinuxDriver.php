@@ -118,32 +118,91 @@ class LinuxDriver implements OsDriver
         return '/etc/wireguard';
     }
 
-    public function interfaceSection(string $address, string $privkey, int $port, string $ifout): string
+    public function interfaceSection(string $address, string $privkey, int $port, string $ifout, bool $forward = false, bool $nat = false): string
     {
-        $comment = 'wg:%i';
-
-        $post_up = implode('; ', [
-            "iptables -A FORWARD -i %i -j ACCEPT -m comment --comment \"{$comment}\"",
-            "iptables -A FORWARD -o %i -j ACCEPT -m comment --comment \"{$comment}\"",
-            "iptables -t nat -A POSTROUTING -o {$ifout} -j MASQUERADE -m comment --comment \"{$comment}\"",
-        ]);
-
-        $post_down = implode('; ', [
-            "iptables -D FORWARD -i %i -j ACCEPT -m comment --comment \"{$comment}\"",
-            "iptables -D FORWARD -o %i -j ACCEPT -m comment --comment \"{$comment}\"",
-            "iptables -t nat -D POSTROUTING -o {$ifout} -j MASQUERADE -m comment --comment \"{$comment}\"",
-        ]);
-
         $lines = [
             '[Interface]',
             "Address = {$address}",
             "PrivateKey = {$privkey}",
             "ListenPort = {$port}",
-            "PostUp = {$post_up}",
-            "PostDown = {$post_down}",
         ];
 
+        if ($forward || $nat) {
+            $up = ['nft add table inet wg_%i'];
+            $down = [];
+
+            if ($forward) {
+                $up[] = "nft add chain inet wg_%i forward '{ type filter hook forward priority 0; }'";
+                $up[] = 'nft add rule inet wg_%i forward iifname "%i" accept';
+                $up[] = 'nft add rule inet wg_%i forward oifname "%i" accept';
+                $down[] = 'nft flush chain inet wg_%i forward 2>/dev/null';
+                $down[] = 'nft delete chain inet wg_%i forward 2>/dev/null';
+            }
+
+            if ($nat) {
+                $up[] = "nft add chain inet wg_%i postrouting '{ type nat hook postrouting priority 100; }'";
+                $up[] = "nft add rule inet wg_%i postrouting oifname \"{$ifout}\" masquerade";
+                $down[] = 'nft flush chain inet wg_%i postrouting 2>/dev/null';
+                $down[] = 'nft delete chain inet wg_%i postrouting 2>/dev/null';
+            }
+
+            $down[] = 'nft delete table inet wg_%i 2>/dev/null';
+
+            $lines[] = 'PostUp = '.implode('; ', $up);
+            $lines[] = 'PostDown = '.implode('; ', $down);
+        }
+
         return implode("\n", $lines);
+    }
+
+    public function enableForward(string $name): void
+    {
+        $table = "wg_{$name}";
+        $this->shell->run('sudo nft add table inet :table', ['table' => $table]);
+        $this->shell->run(
+            "sudo nft add chain inet :table forward '{ type filter hook forward priority 0; }'",
+            ['table' => $table],
+        );
+        $this->shell->run(
+            'sudo nft add rule inet :table forward iifname :name accept',
+            ['table' => $table, 'name' => $name],
+        );
+        $this->shell->run(
+            'sudo nft add rule inet :table forward oifname :name accept',
+            ['table' => $table, 'name' => $name],
+        );
+    }
+
+    public function disableForward(string $name): void
+    {
+        $table = "wg_{$name}";
+        $this->shell->tryRun('sudo nft flush chain inet :table forward', ['table' => $table]);
+        $this->shell->tryRun('sudo nft delete chain inet :table forward', ['table' => $table]);
+        // Delete table if no chains remain
+        $this->shell->tryRun('sudo nft delete table inet :table', ['table' => $table]);
+    }
+
+    public function enableNat(string $name, string $ifout): void
+    {
+        $table = "wg_{$name}";
+        $this->shell->run('sudo nft add table inet :table', ['table' => $table]);
+        $this->shell->run(
+            "sudo nft add chain inet :table postrouting '{ type nat hook postrouting priority 100; }'",
+            ['table' => $table],
+        );
+        $this->shell->run(
+            'sudo nft add rule inet :table postrouting oifname :ifout masquerade',
+            ['table' => $table, 'ifout' => $ifout],
+        );
+    }
+
+    public function disableNat(string $name, string $ifout): void
+    {
+        $table = "wg_{$name}";
+        $this->shell->tryRun('sudo nft flush chain inet :table postrouting', ['table' => $table]);
+        $this->shell->tryRun('sudo nft delete chain inet :table postrouting', ['table' => $table]);
+        // Delete table if no chains remain
+        $this->shell->tryRun('sudo nft delete table inet :table', ['table' => $table]);
     }
 
     public function writeConfig(string $name, string $content): void
@@ -185,6 +244,23 @@ class LinuxDriver implements OsDriver
         return file_exists($path);
     }
 
+    public function listConfigNames(): array
+    {
+        $output = $this->shell->tryRun('sudo ls :path', ['path' => $this->configPath()]);
+        if ($output === null || $output === '') {
+            return [];
+        }
+
+        $names = [];
+        foreach (explode("\n", trim($output)) as $file) {
+            if (str_ends_with($file, '.conf')) {
+                $names[] = basename($file, '.conf');
+            }
+        }
+
+        return $names;
+    }
+
     public function parseConfig(string $name): ?array
     {
         $content = $this->readConfig($name);
@@ -205,10 +281,10 @@ class LinuxDriver implements OsDriver
         $this->shell->run('sudo systemctl stop :unit && sudo systemctl disable :unit', ['unit' => "wg-quick@{$name}"]);
     }
 
-    public function writeClientConfig(string $link, string $ip, string $content): void
+    public function writeClientConfig(string $link, string $key, string $content): void
     {
         $dir = $this->configPath()."/clients/{$link}";
-        $path = "{$dir}/{$ip}.conf";
+        $path = "{$dir}/{$key}.conf";
 
         $tmp = tempnam(sys_get_temp_dir(), 'wg_client_');
         file_put_contents($tmp, $content."\n");
@@ -222,9 +298,9 @@ class LinuxDriver implements OsDriver
         @unlink($tmp);
     }
 
-    public function readClientConfig(string $link, string $ip): ?string
+    public function readClientConfig(string $link, string $key): ?string
     {
-        $path = $this->configPath()."/clients/{$link}/{$ip}.conf";
+        $path = $this->configPath()."/clients/{$link}/{$key}.conf";
 
         if (is_readable($path)) {
             return file_get_contents($path);
@@ -233,9 +309,9 @@ class LinuxDriver implements OsDriver
         return $this->shell->tryRun('sudo cat :path', ['path' => $path]);
     }
 
-    public function deleteClientConfig(string $link, string $ip): void
+    public function deleteClientConfig(string $link, string $key): void
     {
-        $path = $this->configPath()."/clients/{$link}/{$ip}.conf";
+        $path = $this->configPath()."/clients/{$link}/{$key}.conf";
         $this->shell->tryRun('sudo rm -f :path', ['path' => $path]);
     }
 

@@ -123,27 +123,109 @@ class MacDriver implements OsDriver
         return php_uname('m') === 'arm64' ? $arm_path : $intel_path;
     }
 
-    public function interfaceSection(string $address, string $privkey, int $port, string $ifout): string
+    public function interfaceSection(string $address, string $privkey, int $port, string $ifout, bool $forward = false, bool $nat = false): string
     {
         $anchor = 'wg/%i';
-
-        $post_up = implode('; ', [
-            "echo \"nat on {$ifout} from {$address} to any -> ({$ifout})\" | pfctl -a \"{$anchor}\" -f -",
-            'pfctl -e 2>/dev/null || true',
-        ]);
-
-        $post_down = "pfctl -a \"{$anchor}\" -F all 2>/dev/null || true";
 
         $lines = [
             '[Interface]',
             "Address = {$address}",
             "PrivateKey = {$privkey}",
             "ListenPort = {$port}",
-            "PostUp = {$post_up}",
-            "PostDown = {$post_down}",
         ];
 
+        if ($forward || $nat) {
+            $rules = [];
+            if ($forward) {
+                $rules[] = 'pass in on %i all';
+                $rules[] = 'pass out on %i all';
+            }
+            if ($nat) {
+                $rules[] = "nat on {$ifout} from {$address} to any -> ({$ifout})";
+            }
+
+            $post_up = 'echo "'.implode("\n", $rules)."\" | pfctl -a \"{$anchor}\" -f -; pfctl -e 2>/dev/null || true";
+            $post_down = "pfctl -a \"{$anchor}\" -F all 2>/dev/null || true";
+
+            $lines[] = "PostUp = {$post_up}";
+            $lines[] = "PostDown = {$post_down}";
+        }
+
         return implode("\n", $lines);
+    }
+
+    public function enableForward(string $name): void
+    {
+        $anchor = "wg/{$name}";
+        $rules = $this->getCurrentAnchorRules($anchor);
+        $rules[] = "pass in on {$name} all";
+        $rules[] = "pass out on {$name} all";
+        $this->loadAnchorRules($anchor, $rules);
+    }
+
+    public function disableForward(string $name): void
+    {
+        $anchor = "wg/{$name}";
+        $rules = $this->getCurrentAnchorRules($anchor);
+        $rules = array_values(array_filter($rules, fn (string $r) => ! str_starts_with($r, 'pass ')));
+        $this->loadAnchorRules($anchor, $rules);
+    }
+
+    public function enableNat(string $name, string $ifout): void
+    {
+        $anchor = "wg/{$name}";
+        $address = $this->interfaceAddress($name) ?? '0.0.0.0/0';
+        $rules = $this->getCurrentAnchorRules($anchor);
+        $rules[] = "nat on {$ifout} from {$address} to any -> ({$ifout})";
+        $this->loadAnchorRules($anchor, $rules);
+    }
+
+    public function disableNat(string $name, string $ifout): void
+    {
+        $anchor = "wg/{$name}";
+        $rules = $this->getCurrentAnchorRules($anchor);
+        $rules = array_values(array_filter($rules, fn (string $r) => ! str_starts_with($r, 'nat ')));
+        $this->loadAnchorRules($anchor, $rules);
+    }
+
+    protected function getCurrentAnchorRules(string $anchor): array
+    {
+        $output = $this->shell->tryRun('sudo pfctl -a :anchor -s rules 2>/dev/null', ['anchor' => $anchor]);
+        $nat = $this->shell->tryRun('sudo pfctl -a :anchor -s nat 2>/dev/null', ['anchor' => $anchor]);
+
+        $rules = [];
+        foreach ([$nat, $output] as $block) {
+            if ($block !== null && trim($block) !== '') {
+                foreach (explode("\n", trim($block)) as $line) {
+                    $line = trim($line);
+                    if ($line !== '') {
+                        $rules[] = $line;
+                    }
+                }
+            }
+        }
+
+        return $rules;
+    }
+
+    protected function loadAnchorRules(string $anchor, array $rules): void
+    {
+        if ($rules === []) {
+            $this->shell->tryRun('sudo pfctl -a :anchor -F all 2>/dev/null', ['anchor' => $anchor]);
+
+            return;
+        }
+
+        $content = implode("\n", $rules);
+        $tmp = tempnam(sys_get_temp_dir(), 'pfctl_');
+        file_put_contents($tmp, $content."\n");
+
+        try {
+            $this->shell->run('sudo pfctl -a :anchor -f :tmp', ['anchor' => $anchor, 'tmp' => $tmp]);
+            $this->shell->tryRun('sudo pfctl -e 2>/dev/null');
+        } finally {
+            @unlink($tmp);
+        }
     }
 
     public function writeConfig(string $name, string $content): void
@@ -181,6 +263,16 @@ class MacDriver implements OsDriver
         return file_exists($this->configPath()."/{$name}.conf");
     }
 
+    public function listConfigNames(): array
+    {
+        $files = glob($this->configPath().'/*.conf');
+        if ($files === false || $files === []) {
+            return [];
+        }
+
+        return array_map(fn (string $f) => basename($f, '.conf'), $files);
+    }
+
     public function parseConfig(string $name): ?array
     {
         $content = $this->readConfig($name);
@@ -201,21 +293,21 @@ class MacDriver implements OsDriver
         $this->shell->run('sudo wg-quick down :name', ['name' => $name]);
     }
 
-    public function writeClientConfig(string $link, string $ip, string $content): void
+    public function writeClientConfig(string $link, string $key, string $content): void
     {
         $dir = $this->configPath()."/clients/{$link}";
         if (! is_dir($dir)) {
             mkdir($dir, 0755, true);
         }
 
-        $path = "{$dir}/{$ip}.conf";
+        $path = "{$dir}/{$key}.conf";
         file_put_contents($path, $content."\n");
         chmod($path, 0600);
     }
 
-    public function readClientConfig(string $link, string $ip): ?string
+    public function readClientConfig(string $link, string $key): ?string
     {
-        $path = $this->configPath()."/clients/{$link}/{$ip}.conf";
+        $path = $this->configPath()."/clients/{$link}/{$key}.conf";
         if (! file_exists($path)) {
             return null;
         }
@@ -223,9 +315,9 @@ class MacDriver implements OsDriver
         return file_get_contents($path);
     }
 
-    public function deleteClientConfig(string $link, string $ip): void
+    public function deleteClientConfig(string $link, string $key): void
     {
-        $path = $this->configPath()."/clients/{$link}/{$ip}.conf";
+        $path = $this->configPath()."/clients/{$link}/{$key}.conf";
         if (file_exists($path)) {
             unlink($path);
         }

@@ -14,6 +14,9 @@ class InterfaceInfo
         public readonly int $listen_port,
         public readonly string $address,
         public readonly string $ifout,
+        public readonly bool $forward = false,
+        public readonly bool $nat = false,
+        public readonly bool $up = true,
         public readonly array $peers = [],
     ) {}
 
@@ -26,6 +29,9 @@ class InterfaceInfo
             'listen_port' => $this->listen_port,
             'address' => $this->address,
             'ifout' => $this->ifout,
+            'forward' => $this->forward,
+            'nat' => $this->nat,
+            'up' => $this->up,
             'peers' => array_map(fn (PeerInfo $p) => $p->toArray(), $this->peers),
         ];
     }

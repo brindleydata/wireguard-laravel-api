@@ -30,8 +30,8 @@ class WgCommand extends Command
         $this->info('Linux prerequisites:');
         $this->line('');
 
-        $this->comment('1. Install wireguard-tools');
-        $this->line('   apt install wireguard-tools iptables curl');
+        $this->comment('1. Install wireguard-tools and PHP sodium extension');
+        $this->line('   apt install wireguard-tools nftables curl php-sodium');
         $this->line('');
 
         $this->comment('2. Enable IP forwarding');
@@ -48,6 +48,7 @@ class WgCommand extends Command
    www-data ALL=(root) NOPASSWD: \
        /usr/bin/wg, \
        /usr/bin/wg-quick, \
+       /usr/sbin/nft, \
        /bin/systemctl enable wg-quick@*, \
        /bin/systemctl disable wg-quick@*, \
        /bin/systemctl start wg-quick@*, \
@@ -75,8 +76,8 @@ SNIPPET);
         $this->info("macOS prerequisites ({$arch}):");
         $this->line('');
 
-        $this->comment('1. Install wireguard-tools, wireguard-go, and bash 4+');
-        $this->line('   brew install wireguard-tools wireguard-go bash');
+        $this->comment('1. Install wireguard-tools, wireguard-go, bash 4+, and PHP sodium extension');
+        $this->line('   brew install wireguard-tools wireguard-go bash php-sodium');
         $this->line('');
 
         $this->comment('2. Fix wg-quick shebang (macOS ships bash 3, wg-quick needs 4+)');
