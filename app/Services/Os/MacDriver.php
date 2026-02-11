@@ -2,6 +2,7 @@
 
 namespace App\Services\Os;
 
+use App\Services\ConfigBuilder;
 use App\Services\Shell;
 
 class MacDriver implements OsDriver
@@ -280,7 +281,7 @@ class MacDriver implements OsDriver
             return null;
         }
 
-        return $this->parseMetadataComments($content);
+        return ConfigBuilder::parseMetadata($content);
     }
 
     public function startInterface(string $name): void
@@ -343,21 +344,5 @@ class MacDriver implements OsDriver
         $binary = decbin($decimal);
 
         return substr_count($binary, '1');
-    }
-
-    protected function parseMetadataComments(string $content): array
-    {
-        $metadata = [];
-        foreach (explode("\n", $content) as $line) {
-            $line = trim($line);
-            if ($line === '' || $line[0] !== '#') {
-                break;
-            }
-            if (preg_match('/^#\s*(\w+)\s*=\s*(.+)$/', $line, $matches)) {
-                $metadata[trim($matches[1])] = trim($matches[2]);
-            }
-        }
-
-        return $metadata;
     }
 }

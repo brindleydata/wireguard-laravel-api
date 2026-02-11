@@ -2,6 +2,7 @@
 
 namespace App\Services\Os;
 
+use App\Services\ConfigBuilder;
 use App\Services\Shell;
 
 class LinuxDriver implements OsDriver
@@ -178,8 +179,7 @@ class LinuxDriver implements OsDriver
         $table = "wg_{$name}";
         $this->shell->tryRun('sudo nft flush chain inet :table forward', ['table' => $table]);
         $this->shell->tryRun('sudo nft delete chain inet :table forward', ['table' => $table]);
-        // Delete table if no chains remain
-        $this->shell->tryRun('sudo nft delete table inet :table', ['table' => $table]);
+        $this->deleteTableIfEmpty($table);
     }
 
     public function enableNat(string $name, string $ifout): void
@@ -201,8 +201,7 @@ class LinuxDriver implements OsDriver
         $table = "wg_{$name}";
         $this->shell->tryRun('sudo nft flush chain inet :table postrouting', ['table' => $table]);
         $this->shell->tryRun('sudo nft delete chain inet :table postrouting', ['table' => $table]);
-        // Delete table if no chains remain
-        $this->shell->tryRun('sudo nft delete table inet :table', ['table' => $table]);
+        $this->deleteTableIfEmpty($table);
     }
 
     public function writeConfig(string $name, string $content): void
@@ -240,8 +239,11 @@ class LinuxDriver implements OsDriver
     public function configExists(string $name): bool
     {
         $path = $this->configPath()."/{$name}.conf";
+        if (file_exists($path)) {
+            return true;
+        }
 
-        return file_exists($path);
+        return $this->shell->tryRun('sudo test -f :path && echo 1', ['path' => $path]) === '1';
     }
 
     public function listConfigNames(): array
@@ -268,7 +270,7 @@ class LinuxDriver implements OsDriver
             return null;
         }
 
-        return $this->parseMetadataComments($content);
+        return ConfigBuilder::parseMetadata($content);
     }
 
     public function startInterface(string $name): void
@@ -321,19 +323,15 @@ class LinuxDriver implements OsDriver
         $this->shell->tryRun('sudo rm -rf :dir', ['dir' => $dir]);
     }
 
-    protected function parseMetadataComments(string $content): array
+    protected function deleteTableIfEmpty(string $table): void
     {
-        $metadata = [];
-        foreach (explode("\n", $content) as $line) {
-            $line = trim($line);
-            if ($line === '' || $line[0] !== '#') {
-                break;
-            }
-            if (preg_match('/^#\s*(\w+)\s*=\s*(.+)$/', $line, $matches)) {
-                $metadata[trim($matches[1])] = trim($matches[2]);
-            }
+        $output = $this->shell->tryRun('sudo nft list table inet :table', ['table' => $table]);
+        if ($output === null) {
+            return;
         }
 
-        return $metadata;
+        if (! str_contains($output, 'chain ')) {
+            $this->shell->tryRun('sudo nft delete table inet :table', ['table' => $table]);
+        }
     }
 }
