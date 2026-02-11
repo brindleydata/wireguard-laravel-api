@@ -3,11 +3,10 @@
 return [
     'api_key' => env('API_KEY'),
     'ip_service' => env('IP_SERVICE', 'http://ifconfig.me/ip'),
-    'endpoint_ip' => env('WIREGUARD_ENDPOINT_IP'),
+    'hostname' => env('WIREGUARD_HOSTNAME'),
     'default_dns' => env('WIREGUARD_DNS', '8.8.8.8'),
     'default_keepalive' => (int) env('WIREGUARD_KEEPALIVE', 25),
     'allowed_ips' => env('WIREGUARD_ALLOWED_IPS', '0.0.0.0/0'),
-    'socket_dir' => env('WIREGUARD_SOCKET_DIR', '/var/run/wireguard'),
 
     'templates' => [
         // Client-side configuration template

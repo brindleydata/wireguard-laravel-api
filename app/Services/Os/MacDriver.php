@@ -3,7 +3,6 @@
 namespace App\Services\Os;
 
 use App\Services\Shell;
-use RuntimeException;
 
 class MacDriver implements OsDriver
 {
@@ -28,20 +27,25 @@ class MacDriver implements OsDriver
         $total = (int) ($total_bytes / 1024);
 
         $vmstat = $this->shell->run('vm_stat');
-        $free = 0;
-        if (preg_match('/Pages free:\s+(\d+)/', $vmstat, $matches)) {
-            $free = (int) ($matches[1] * 4096 / 1024);
+        $active = 0;
+        $wired = 0;
+        if (preg_match('/Pages active:\s+(\d+)/', $vmstat, $matches)) {
+            $active = (int) $matches[1];
+        }
+        if (preg_match('/Pages wired down:\s+(\d+)/', $vmstat, $matches)) {
+            $wired = (int) $matches[1];
         }
 
-        $usage = $total > 0 ? (int) round($free / $total * 100) : 0;
+        $used = (int) (($active + $wired) * 4096 / 1024);
+        $free = $total - $used;
+        $usage = $total > 0 ? (int) round($used / $total * 100) : 0;
 
         return compact('total', 'free', 'usage');
     }
 
     public function disk(string $partition = '/'): array
     {
-        $escaped = escapeshellarg($partition);
-        $output = $this->shell->run("df -k {$escaped}");
+        $output = $this->shell->run('df -k :partition', ['partition' => $partition]);
         $lines = explode("\n", $output);
         if (count($lines) < 2) {
             return ['partition' => $partition, 'size' => 0, 'free' => 0, 'usage' => 0];
@@ -57,11 +61,14 @@ class MacDriver implements OsDriver
         ];
     }
 
-    public function publicIp(string $ip_service): string
+    public function publicIpv4(string $ip_service): ?string
     {
-        $escaped = escapeshellarg($ip_service);
+        return $this->shell->tryRun('curl -4 -s --max-time 5 :url', ['url' => $ip_service]);
+    }
 
-        return $this->shell->run("curl -s --max-time 5 {$escaped}");
+    public function publicIpv6(string $ip_service): ?string
+    {
+        return $this->shell->tryRun('curl -6 -s --max-time 5 :url', ['url' => $ip_service]);
     }
 
     public function networkInterfaces(): array
@@ -73,8 +80,7 @@ class MacDriver implements OsDriver
 
     public function interfaceAddress(string $ifname): ?string
     {
-        $escaped = escapeshellarg($ifname);
-        $output = $this->shell->tryRun("ifconfig {$escaped}");
+        $output = $this->shell->tryRun('ifconfig :ifname', ['ifname' => $ifname]);
         if ($output === null) {
             return null;
         }
@@ -99,93 +105,144 @@ class MacDriver implements OsDriver
         return 'en0';
     }
 
-    public function createInterface(string $name): string
+    public function configPath(): string
     {
-        $output = $this->shell->run('sudo wireguard-go utun 2>&1');
+        // Apple Silicon uses /opt/homebrew, Intel uses /usr/local
+        $arm_path = '/opt/homebrew/etc/wireguard';
+        $intel_path = '/usr/local/etc/wireguard';
 
-        if (preg_match('/\((utun\d+)\)/', $output, $matches)) {
-            return $matches[1];
+        if (is_dir($arm_path)) {
+            return $arm_path;
         }
 
-        throw new RuntimeException("Failed to parse utun name from wireguard-go output: {$output}");
-    }
-
-    public function destroyInterface(string $ifname): void
-    {
-        $socket_path = "/var/run/wireguard/{$ifname}.sock";
-        if (file_exists($socket_path)) {
-            $this->shell->tryRun('sudo rm '.escapeshellarg($socket_path));
-            usleep(200_000);
+        if (is_dir($intel_path)) {
+            return $intel_path;
         }
 
-        $pid = $this->shell->tryRun('pgrep -f '.escapeshellarg("wireguard-go.*{$ifname}"));
-        if ($pid !== null && $pid !== '') {
-            $this->shell->tryRun('sudo kill '.escapeshellarg(trim($pid)));
+        // Fallback based on architecture
+        return php_uname('m') === 'arm64' ? $arm_path : $intel_path;
+    }
+
+    public function interfaceSection(string $address, string $privkey, int $port, string $ifout): string
+    {
+        $anchor = 'wg/%i';
+
+        $post_up = implode('; ', [
+            "echo \"nat on {$ifout} from {$address} to any -> ({$ifout})\" | pfctl -a \"{$anchor}\" -f -",
+            'pfctl -e 2>/dev/null || true',
+        ]);
+
+        $post_down = "pfctl -a \"{$anchor}\" -F all 2>/dev/null || true";
+
+        $lines = [
+            '[Interface]',
+            "Address = {$address}",
+            "PrivateKey = {$privkey}",
+            "ListenPort = {$port}",
+            "PostUp = {$post_up}",
+            "PostDown = {$post_down}",
+        ];
+
+        return implode("\n", $lines);
+    }
+
+    public function writeConfig(string $name, string $content): void
+    {
+        $dir = $this->configPath();
+        if (! is_dir($dir)) {
+            mkdir($dir, 0755, true);
+        }
+
+        $path = "{$dir}/{$name}.conf";
+        file_put_contents($path, $content."\n");
+        chmod($path, 0600);
+    }
+
+    public function deleteConfig(string $name): void
+    {
+        $path = $this->configPath()."/{$name}.conf";
+        if (file_exists($path)) {
+            unlink($path);
         }
     }
 
-    public function assignAddress(string $ifname, string $address): void
+    public function readConfig(string $name): ?string
     {
-        if (! str_contains($address, '/')) {
-            $address .= '/24';
+        $path = $this->configPath()."/{$name}.conf";
+        if (! file_exists($path)) {
+            return null;
         }
 
-        [$ip, $cidr] = explode('/', $address, 2);
-        $netmask = $this->cidrToNetmask((int) $cidr);
-
-        $escaped_if = escapeshellarg($ifname);
-        $escaped_ip = escapeshellarg($ip);
-        $escaped_mask = escapeshellarg($netmask);
-
-        $this->shell->run("sudo ifconfig {$escaped_if} inet {$escaped_ip} {$escaped_ip} netmask {$escaped_mask}");
-
-        $network = long2ip(ip2long($ip) & ip2long($netmask));
-        $escaped_net = escapeshellarg("{$network}/{$cidr}");
-        $this->shell->tryRun("sudo route add -net {$escaped_net} -interface {$escaped_if}");
+        return file_get_contents($path);
     }
 
-    public function bringUp(string $ifname): void
+    public function configExists(string $name): bool
     {
-        // utun interfaces are auto-up on macOS — no-op
+        return file_exists($this->configPath()."/{$name}.conf");
     }
 
-    public function addNatRules(string $ifname, string $address, string $ifout): void
+    public function parseConfig(string $name): ?array
     {
-        $anchor = "wg/{$ifname}";
-        $escaped_anchor = escapeshellarg($anchor);
+        $content = $this->readConfig($name);
+        if ($content === null) {
+            return null;
+        }
 
-        $nat_rule = "nat on {$ifout} from {$address} to any -> ({$ifout})";
-
-        $this->shell->run(
-            'echo '.escapeshellarg($nat_rule)." | sudo pfctl -a {$escaped_anchor} -f -"
-        );
-
-        $this->shell->tryRun('sudo pfctl -e 2>/dev/null');
+        return $this->parseMetadataComments($content);
     }
 
-    public function removeNatRules(string $ifname): void
+    public function startInterface(string $name): void
     {
-        $anchor = "wg/{$ifname}";
-        $escaped_anchor = escapeshellarg($anchor);
-
-        $this->shell->tryRun("sudo pfctl -a {$escaped_anchor} -F all");
+        $this->shell->run('sudo wg-quick up :name', ['name' => $name]);
     }
 
-    public function isForwardingEnabled(): bool
+    public function stopInterface(string $name): void
     {
-        $value = trim($this->shell->run('sysctl -n net.inet.ip.forwarding'));
-
-        return $value === '1';
+        $this->shell->run('sudo wg-quick down :name', ['name' => $name]);
     }
 
-    public function enableForwarding(): void
+    public function writeClientConfig(string $link, string $ip, string $content): void
     {
-        $this->shell->run('sudo sysctl -w net.inet.ip.forwarding=1');
+        $dir = $this->configPath()."/clients/{$link}";
+        if (! is_dir($dir)) {
+            mkdir($dir, 0755, true);
+        }
+
+        $path = "{$dir}/{$ip}.conf";
+        file_put_contents($path, $content."\n");
+        chmod($path, 0600);
     }
 
-    public function disableForwarding(): void
+    public function readClientConfig(string $link, string $ip): ?string
     {
-        $this->shell->run('sudo sysctl -w net.inet.ip.forwarding=0');
+        $path = $this->configPath()."/clients/{$link}/{$ip}.conf";
+        if (! file_exists($path)) {
+            return null;
+        }
+
+        return file_get_contents($path);
+    }
+
+    public function deleteClientConfig(string $link, string $ip): void
+    {
+        $path = $this->configPath()."/clients/{$link}/{$ip}.conf";
+        if (file_exists($path)) {
+            unlink($path);
+        }
+    }
+
+    public function deleteClientConfigDir(string $link): void
+    {
+        $dir = $this->configPath()."/clients/{$link}";
+        if (! is_dir($dir)) {
+            return;
+        }
+
+        $files = glob("{$dir}/*");
+        foreach ($files as $file) {
+            @unlink($file);
+        }
+        @rmdir($dir);
     }
 
     protected function hexMaskToCidr(string $hex): int
@@ -196,10 +253,19 @@ class MacDriver implements OsDriver
         return substr_count($binary, '1');
     }
 
-    protected function cidrToNetmask(int $cidr): string
+    protected function parseMetadataComments(string $content): array
     {
-        $mask = $cidr > 0 ? (~0 << (32 - $cidr)) & 0xFFFFFFFF : 0;
+        $metadata = [];
+        foreach (explode("\n", $content) as $line) {
+            $line = trim($line);
+            if ($line === '' || $line[0] !== '#') {
+                break;
+            }
+            if (preg_match('/^#\s*(\w+)\s*=\s*(.+)$/', $line, $matches)) {
+                $metadata[trim($matches[1])] = trim($matches[2]);
+            }
+        }
 
-        return long2ip($mask);
+        return $metadata;
     }
 }

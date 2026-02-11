@@ -5,15 +5,15 @@ namespace App\Console\Commands;
 use App\Services\WireGuard;
 use Illuminate\Console\Command;
 
-class WgClientShow extends WgCommand
+class WgPeerShow extends WgCommand
 {
-    protected $signature = 'wg:client:show {interface} {ip}';
+    protected $signature = 'wg:peer:show {link} {ip}';
 
-    protected $description = 'Show WireGuard VPN client configuration';
+    protected $description = 'Show WireGuard peer configuration';
 
     public function handle(WireGuard $wg): int
     {
-        $interface_name = $this->argument('interface');
+        $link = $this->argument('link');
         $ip = $this->argument('ip');
 
         if (! filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) {
@@ -22,14 +22,14 @@ class WgClientShow extends WgCommand
             return Command::FAILURE;
         }
 
-        $config = $wg->getPeerConfig($interface_name, $ip);
+        $config = $wg->getPeerConfig($link, $ip);
         if ($config === null) {
-            $this->error("Could not find configuration for client {$ip} on {$interface_name}.");
+            $this->error("Could not find configuration for peer {$ip} on {$link}.");
 
             return Command::FAILURE;
         }
 
-        $this->info("Client {$ip} configuration:");
+        $this->info("Peer {$ip} configuration:");
         $this->line('');
         $this->line($config);
 

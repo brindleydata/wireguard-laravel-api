@@ -5,17 +5,20 @@ use App\Http\Middleware\AuthenticateByApiKey;
 use Illuminate\Support\Facades\Route;
 
 Route::get('/status', [WireGuard::class, 'status']);
+Route::get('/ip', [WireGuard::class, 'ip']);
 
 Route::middleware(AuthenticateByApiKey::class)->group(function () {
-    // Interface routes
-    Route::get('/interfaces', [WireGuard::class, 'interfaces']);
-    Route::get('/interface/{name}', [WireGuard::class, 'interface']);
-    Route::post('/interface', [WireGuard::class, 'interfaceAdd']);
-    Route::delete('/interface/{name}', [WireGuard::class, 'interfaceDelete']);
+    // Link routes
+    Route::get('/links', [WireGuard::class, 'links']);
+    Route::get('/link/{name}', [WireGuard::class, 'link']);
+    Route::post('/link', [WireGuard::class, 'linkCreate']);
+    Route::delete('/link/{name}', [WireGuard::class, 'linkDelete']);
+    Route::post('/link/{name}/up', [WireGuard::class, 'linkUp']);
+    Route::post('/link/{name}/down', [WireGuard::class, 'linkDown']);
 
     // Peer routes
-    Route::get('/interface/{interface}/peers', [WireGuard::class, 'peers']);
-    Route::post('/interface/{interface}/peers', [WireGuard::class, 'peerAdd']);
-    Route::delete('/interface/{interface}/peer/{peer}', [WireGuard::class, 'peerDelete']);
-    Route::get('/interface/{interface}/peer/{ip}/config', [WireGuard::class, 'peerConfig']);
+    Route::get('/link/{link}/peers', [WireGuard::class, 'peers']);
+    Route::post('/link/{link}/peers', [WireGuard::class, 'peerCreate']);
+    Route::delete('/link/{link}/peer/{ip}', [WireGuard::class, 'peerDelete']);
+    Route::get('/link/{link}/peer/{ip}/config', [WireGuard::class, 'peerConfig']);
 });

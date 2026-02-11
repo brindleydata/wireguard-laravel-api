@@ -5,26 +5,26 @@ namespace App\Console\Commands;
 use App\Services\WireGuard;
 use Illuminate\Console\Command;
 
-class WgClientDelete extends WgCommand
+class WgPeerDelete extends WgCommand
 {
-    protected $signature = 'wg:client:delete {interface} {ip}';
+    protected $signature = 'wg:peer:delete {link} {ip}';
 
-    protected $description = 'Delete a WireGuard VPN client';
+    protected $description = 'Delete a WireGuard peer';
 
     public function handle(WireGuard $wg): int
     {
-        $interface_name = $this->argument('interface');
+        $link = $this->argument('link');
         $ip = $this->argument('ip');
 
         try {
-            $wg->removePeer($interface_name, $ip);
+            $wg->removePeer($link, $ip);
         } catch (\Throwable $e) {
             $this->error($e->getMessage());
 
             return Command::FAILURE;
         }
 
-        $this->info("Removed peer {$ip} from {$interface_name}");
+        $this->info("Removed peer {$ip} from {$link}");
 
         return Command::SUCCESS;
     }

@@ -5,25 +5,25 @@ namespace App\Console\Commands;
 use App\Services\WireGuard;
 use Illuminate\Console\Command;
 
-class WgDelete extends WgCommand
+class WgLinkDown extends WgCommand
 {
-    protected $signature = 'wg:delete {interface}';
+    protected $signature = 'wg:link:down {link}';
 
-    protected $description = 'Delete a WireGuard interface';
+    protected $description = 'Bring down a WireGuard link';
 
     public function handle(WireGuard $wg): int
     {
-        $name = $this->argument('interface');
+        $name = $this->argument('link');
 
         try {
-            $wg->deleteInterface($name);
+            $wg->linkDown($name);
         } catch (\Throwable $e) {
             $this->error($e->getMessage());
 
             return Command::FAILURE;
         }
 
-        $this->info("Deleted interface {$name}");
+        $this->info("Link {$name} is down.");
 
         return Command::SUCCESS;
     }

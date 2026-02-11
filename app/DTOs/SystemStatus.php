@@ -9,7 +9,7 @@ class SystemStatus
         public readonly array $cpu,
         public readonly array $ram,
         public readonly array $disk,
-        public readonly string $endpoint,
+        public readonly string $hostname,
     ) {}
 
     public function toArray(): array
@@ -19,7 +19,7 @@ class SystemStatus
             'cpu' => $this->cpu,
             'ram' => $this->ram,
             'disk' => $this->disk,
-            'endpoint' => $this->endpoint,
+            'hostname' => $this->hostname,
         ];
     }
 }

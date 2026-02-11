@@ -2,6 +2,7 @@
 
 namespace App\Http\Controllers;
 
+use App\Services\Server;
 use App\Services\WireGuard as WireGuardService;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
@@ -11,37 +12,36 @@ class WireGuard extends Controller
 {
     public function __construct(
         protected WireGuardService $wg,
+        protected Server $server,
     ) {}
 
-    public function status(): JsonResponse
+    public function status(): array
     {
-        try {
-            return response()->json($this->wg->systemStatus()->toArray());
-        } catch (\Throwable $e) {
-            return response()->json(['error' => $e->getMessage()], 500);
-        }
+        return $this->server->status()->toArray();
     }
 
-    public function interfaces(): JsonResponse
+    public function ip(): array
     {
-        try {
-            return response()->json($this->wg->listInterfaces());
-        } catch (\Throwable $e) {
-            return response()->json(['error' => $e->getMessage()], 500);
-        }
+        return $this->server->ip();
     }
 
-    public function interface(string $name): JsonResponse
+    public function links(): array
     {
-        $interface = $this->wg->getInterface($name);
-        if ($interface === null) {
-            return response()->json(['error' => "Interface not found: {$name}"], 404);
-        }
-
-        return response()->json($interface->toArray());
+        return $this->wg->listLinks();
     }
 
-    public function interfaceAdd(Request $request): JsonResponse
+    public function link(string $name): array
+    {
+        $link = $this->wg->getLink($name);
+
+        if ($link === null) {
+            abort(404, "Link not found: {$name}");
+        }
+
+        return $link->toArray();
+    }
+
+    public function linkCreate(Request $request): JsonResponse
     {
         $data = $request->validate([
             'name' => 'required|string|max:15',
@@ -53,91 +53,77 @@ class WireGuard extends Controller
             'allowed_ips' => 'nullable|string',
         ]);
 
-        try {
-            $interface = $this->wg->createInterface(
-                $data['name'],
-                $data['ip'],
-                $data['port'] ?? null,
-                $data['ifout'] ?? null,
-                $data['dns'] ?? null,
-                $data['keepalive'] ?? null,
-                $data['allowed_ips'] ?? null,
-            );
-
-            return response()->json($interface->toArray(), 201);
-        } catch (\InvalidArgumentException $e) {
-            return response()->json(['error' => $e->getMessage()], 422);
-        } catch (\Throwable $e) {
-            return response()->json(['error' => $e->getMessage()], 500);
-        }
-    }
-
-    public function interfaceDelete(string $name): JsonResponse
-    {
-        try {
-            $this->wg->deleteInterface($name);
-
-            return response()->json(['message' => "Deleted interface: {$name}"]);
-        } catch (\InvalidArgumentException $e) {
-            return response()->json(['error' => $e->getMessage()], 422);
-        } catch (\RuntimeException $e) {
-            return response()->json(['error' => $e->getMessage()], 404);
-        } catch (\Throwable $e) {
-            return response()->json(['error' => $e->getMessage()], 500);
-        }
-    }
-
-    public function peers(string $interface): JsonResponse
-    {
-        $info = $this->wg->getInterface($interface);
-        if ($info === null) {
-            return response()->json(['error' => "Interface not found: {$interface}"], 404);
-        }
-
-        return response()->json(
-            array_map(fn ($p) => $p->toArray(), $info->peers)
+        $link = $this->wg->createLink(
+            $data['name'],
+            $data['ip'],
+            $data['port'] ?? null,
+            $data['ifout'] ?? null,
+            $data['dns'] ?? null,
+            $data['keepalive'] ?? null,
+            $data['allowed_ips'] ?? null,
         );
+
+        return response()->json($link->toArray(), 201);
     }
 
-    public function peerAdd(Request $request, string $interface): JsonResponse
+    public function linkDelete(string $name): array
+    {
+        $this->wg->deleteLink($name);
+
+        return ['message' => "Deleted link: {$name}"];
+    }
+
+    public function linkUp(string $name): array
+    {
+        $this->wg->linkUp($name);
+
+        return ['message' => "Link is up: {$name}"];
+    }
+
+    public function linkDown(string $name): array
+    {
+        $this->wg->linkDown($name);
+
+        return ['message' => "Link is down: {$name}"];
+    }
+
+    public function peers(string $link): array
+    {
+        $info = $this->wg->getLink($link);
+
+        if ($info === null) {
+            abort(404, "Link not found: {$link}");
+        }
+
+        return array_map(fn ($p) => $p->toArray(), $info->peers);
+    }
+
+    public function peerCreate(Request $request, string $link): JsonResponse
     {
         $data = $request->validate([
             'ip' => 'required|string',
         ]);
 
-        try {
-            $peer = $this->wg->addPeer($interface, $data['ip']);
+        $peer = $this->wg->addPeer($link, $data['ip']);
 
-            return response()->json($peer->toArray(), 201);
-        } catch (\InvalidArgumentException $e) {
-            return response()->json(['error' => $e->getMessage()], 422);
-        } catch (\RuntimeException $e) {
-            return response()->json(['error' => $e->getMessage()], 404);
-        } catch (\Throwable $e) {
-            return response()->json(['error' => $e->getMessage()], 500);
-        }
+        return response()->json($peer->toArray(), 201);
     }
 
-    public function peerDelete(string $interface, string $peer): JsonResponse
+    public function peerDelete(string $link, string $ip): array
     {
-        try {
-            $this->wg->removePeer($interface, $peer);
+        $this->wg->removePeer($link, $ip);
 
-            return response()->json(['message' => "Removed peer {$peer} from {$interface}"]);
-        } catch (\RuntimeException $e) {
-            return response()->json(['error' => $e->getMessage()], 404);
-        } catch (\Throwable $e) {
-            return response()->json(['error' => $e->getMessage()], 500);
-        }
+        return ['message' => "Removed peer {$ip} from {$link}"];
     }
 
-    public function peerConfig(string $interface, string $ip): JsonResponse
+    public function peerConfig(string $link, string $ip): array
     {
-        $config = $this->wg->getPeerConfig($interface, $ip);
+        $config = $this->wg->getPeerConfig($link, $ip);
+
         if ($config === null) {
-            return response()->json(['error' => "Configuration not found for peer {$ip} on {$interface}"], 404);
+            abort(404, "Configuration not found for peer {$ip} on {$link}");
         }
 
-        return response()->json(['config' => $config]);
+        return ['config' => $config];
     }
 }

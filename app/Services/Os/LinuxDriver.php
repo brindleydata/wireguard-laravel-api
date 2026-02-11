@@ -23,7 +23,7 @@ class LinuxDriver implements OsDriver
     public function ram(): array
     {
         $total = 0;
-        $free = 0;
+        $available = 0;
 
         $meminfo = $this->shell->run('cat /proc/meminfo');
         foreach (explode("\n", $meminfo) as $line) {
@@ -33,24 +33,24 @@ class LinuxDriver implements OsDriver
             [$name, $value] = preg_split('/:\s+/', $line);
             if ($name === 'MemTotal') {
                 $total = (int) $value;
-            } elseif ($name === 'MemFree') {
-                $free = (int) $value;
+            } elseif ($name === 'MemAvailable') {
+                $available = (int) $value;
             }
 
-            if ($total && $free) {
+            if ($total && $available) {
                 break;
             }
         }
 
-        $usage = $total > 0 ? (int) round($free / $total * 100) : 0;
+        $free = $available;
+        $usage = $total > 0 ? (int) round(($total - $free) / $total * 100) : 0;
 
         return compact('total', 'free', 'usage');
     }
 
     public function disk(string $partition = '/'): array
     {
-        $escaped = escapeshellarg($partition);
-        $output = $this->shell->run("df {$escaped}");
+        $output = $this->shell->run('df :partition', ['partition' => $partition]);
         $lines = explode("\n", $output);
         if (count($lines) < 2) {
             return ['partition' => $partition, 'size' => 0, 'free' => 0, 'usage' => 0];
@@ -66,11 +66,14 @@ class LinuxDriver implements OsDriver
         ];
     }
 
-    public function publicIp(string $ip_service): string
+    public function publicIpv4(string $ip_service): ?string
     {
-        $escaped = escapeshellarg($ip_service);
+        return $this->shell->tryRun('curl -4 -s --max-time 5 :url', ['url' => $ip_service]);
+    }
 
-        return $this->shell->run("curl -s --max-time 5 {$escaped}");
+    public function publicIpv6(string $ip_service): ?string
+    {
+        return $this->shell->tryRun('curl -6 -s --max-time 5 :url', ['url' => $ip_service]);
     }
 
     public function networkInterfaces(): array
@@ -88,8 +91,7 @@ class LinuxDriver implements OsDriver
 
     public function interfaceAddress(string $ifname): ?string
     {
-        $escaped = escapeshellarg($ifname);
-        $output = $this->shell->tryRun("ip address show dev {$escaped}");
+        $output = $this->shell->tryRun('ip address show dev :ifname', ['ifname' => $ifname]);
         if ($output === null) {
             return null;
         }
@@ -103,7 +105,6 @@ class LinuxDriver implements OsDriver
 
     public function defaultOutboundInterface(): string
     {
-        // "default via 192.168.1.1 dev eth0 ..."
         $output = $this->shell->run('ip route show default');
         if (preg_match('/dev\s+(\S+)/', $output, $matches)) {
             return $matches[1];
@@ -112,99 +113,151 @@ class LinuxDriver implements OsDriver
         return 'eth0';
     }
 
-    public function createInterface(string $name): string
+    public function configPath(): string
     {
-        $escaped = escapeshellarg($name);
-        $result = $this->shell->tryRun("sudo ip link add dev {$escaped} type wireguard");
+        return '/etc/wireguard';
+    }
 
-        if ($result === null) {
-            $this->shell->run("sudo wireguard-go {$escaped}");
+    public function interfaceSection(string $address, string $privkey, int $port, string $ifout): string
+    {
+        $comment = 'wg:%i';
+
+        $post_up = implode('; ', [
+            "iptables -A FORWARD -i %i -j ACCEPT -m comment --comment \"{$comment}\"",
+            "iptables -A FORWARD -o %i -j ACCEPT -m comment --comment \"{$comment}\"",
+            "iptables -t nat -A POSTROUTING -o {$ifout} -j MASQUERADE -m comment --comment \"{$comment}\"",
+        ]);
+
+        $post_down = implode('; ', [
+            "iptables -D FORWARD -i %i -j ACCEPT -m comment --comment \"{$comment}\"",
+            "iptables -D FORWARD -o %i -j ACCEPT -m comment --comment \"{$comment}\"",
+            "iptables -t nat -D POSTROUTING -o {$ifout} -j MASQUERADE -m comment --comment \"{$comment}\"",
+        ]);
+
+        $lines = [
+            '[Interface]',
+            "Address = {$address}",
+            "PrivateKey = {$privkey}",
+            "ListenPort = {$port}",
+            "PostUp = {$post_up}",
+            "PostDown = {$post_down}",
+        ];
+
+        return implode("\n", $lines);
+    }
+
+    public function writeConfig(string $name, string $content): void
+    {
+        $dir = $this->configPath();
+        $path = "{$dir}/{$name}.conf";
+
+        // /etc/wireguard requires sudo — write to temp then copy
+        $tmp = tempnam(sys_get_temp_dir(), 'wg_');
+        file_put_contents($tmp, $content."\n");
+        chmod($tmp, 0600);
+
+        $this->shell->run('sudo cp :tmp :path && sudo chmod 600 :path', ['tmp' => $tmp, 'path' => $path]);
+        @unlink($tmp);
+    }
+
+    public function deleteConfig(string $name): void
+    {
+        $path = $this->configPath()."/{$name}.conf";
+        $this->shell->tryRun('sudo rm -f :path', ['path' => $path]);
+    }
+
+    public function readConfig(string $name): ?string
+    {
+        $path = $this->configPath()."/{$name}.conf";
+
+        // Try direct read first (may work if running as root)
+        if (is_readable($path)) {
+            return file_get_contents($path);
         }
 
-        return $name;
+        return $this->shell->tryRun('sudo cat :path', ['path' => $path]);
     }
 
-    public function destroyInterface(string $ifname): void
+    public function configExists(string $name): bool
     {
-        $escaped = escapeshellarg($ifname);
-        $this->shell->run("sudo ip link delete dev {$escaped}");
+        $path = $this->configPath()."/{$name}.conf";
+
+        return file_exists($path);
     }
 
-    public function assignAddress(string $ifname, string $address): void
+    public function parseConfig(string $name): ?array
     {
-        $escaped_if = escapeshellarg($ifname);
-        $escaped_addr = escapeshellarg($address);
-        $this->shell->run("sudo ip address add {$escaped_addr} dev {$escaped_if}");
-    }
-
-    public function bringUp(string $ifname): void
-    {
-        $escaped = escapeshellarg($ifname);
-        $this->shell->run("sudo ip link set {$escaped} up");
-    }
-
-    public function addNatRules(string $ifname, string $address, string $ifout): void
-    {
-        $escaped_if = escapeshellarg($ifname);
-        $escaped_ifout = escapeshellarg($ifout);
-        $comment = escapeshellarg("wg:{$ifname}");
-
-        $this->shell->run(
-            "sudo iptables -A FORWARD -i {$escaped_if} -j ACCEPT -m comment --comment {$comment}"
-        );
-        $this->shell->run(
-            "sudo iptables -A FORWARD -o {$escaped_if} -j ACCEPT -m comment --comment {$comment}"
-        );
-        $this->shell->run(
-            "sudo iptables -t nat -A POSTROUTING -o {$escaped_ifout} -j MASQUERADE -m comment --comment {$comment}"
-        );
-    }
-
-    public function removeNatRules(string $ifname): void
-    {
-        $tag = "wg:{$ifname}";
-
-        $this->removeTaggedRules('filter', 'FORWARD', $tag);
-        $this->removeTaggedRules('nat', 'POSTROUTING', $tag);
-    }
-
-    public function isForwardingEnabled(): bool
-    {
-        $value = trim($this->shell->run('cat /proc/sys/net/ipv4/ip_forward'));
-
-        return $value === '1';
-    }
-
-    public function enableForwarding(): void
-    {
-        $this->shell->run('sudo sysctl -w net.ipv4.ip_forward=1');
-    }
-
-    public function disableForwarding(): void
-    {
-        $this->shell->run('sudo sysctl -w net.ipv4.ip_forward=0');
-    }
-
-    protected function removeTaggedRules(string $table, string $chain, string $tag): void
-    {
-        $escaped_table = escapeshellarg($table);
-        $output = $this->shell->tryRun("sudo iptables -t {$escaped_table} -S {$chain}");
-        if ($output === null) {
-            return;
+        $content = $this->readConfig($name);
+        if ($content === null) {
+            return null;
         }
 
-        foreach (explode("\n", $output) as $line) {
+        return $this->parseMetadataComments($content);
+    }
+
+    public function startInterface(string $name): void
+    {
+        $this->shell->run('sudo systemctl enable :unit && sudo systemctl start :unit', ['unit' => "wg-quick@{$name}"]);
+    }
+
+    public function stopInterface(string $name): void
+    {
+        $this->shell->run('sudo systemctl stop :unit && sudo systemctl disable :unit', ['unit' => "wg-quick@{$name}"]);
+    }
+
+    public function writeClientConfig(string $link, string $ip, string $content): void
+    {
+        $dir = $this->configPath()."/clients/{$link}";
+        $path = "{$dir}/{$ip}.conf";
+
+        $tmp = tempnam(sys_get_temp_dir(), 'wg_client_');
+        file_put_contents($tmp, $content."\n");
+        chmod($tmp, 0600);
+
+        $this->shell->run('sudo mkdir -p :dir && sudo cp :tmp :path && sudo chmod 600 :path', [
+            'dir' => $dir,
+            'tmp' => $tmp,
+            'path' => $path,
+        ]);
+        @unlink($tmp);
+    }
+
+    public function readClientConfig(string $link, string $ip): ?string
+    {
+        $path = $this->configPath()."/clients/{$link}/{$ip}.conf";
+
+        if (is_readable($path)) {
+            return file_get_contents($path);
+        }
+
+        return $this->shell->tryRun('sudo cat :path', ['path' => $path]);
+    }
+
+    public function deleteClientConfig(string $link, string $ip): void
+    {
+        $path = $this->configPath()."/clients/{$link}/{$ip}.conf";
+        $this->shell->tryRun('sudo rm -f :path', ['path' => $path]);
+    }
+
+    public function deleteClientConfigDir(string $link): void
+    {
+        $dir = $this->configPath()."/clients/{$link}";
+        $this->shell->tryRun('sudo rm -rf :dir', ['dir' => $dir]);
+    }
+
+    protected function parseMetadataComments(string $content): array
+    {
+        $metadata = [];
+        foreach (explode("\n", $content) as $line) {
             $line = trim($line);
-            if ($line === '' || ! str_contains($line, $tag)) {
-                continue;
+            if ($line === '' || $line[0] !== '#') {
+                break;
             }
-
-            $delete_rule = preg_replace('/^-A\s+/', '-D ', $line);
-            if ($delete_rule === $line) {
-                continue;
+            if (preg_match('/^#\s*(\w+)\s*=\s*(.+)$/', $line, $matches)) {
+                $metadata[trim($matches[1])] = trim($matches[2]);
             }
-
-            $this->shell->tryRun("sudo iptables -t {$escaped_table} {$delete_rule}");
         }
+
+        return $metadata;
     }
 }

@@ -5,19 +5,19 @@ namespace App\Console\Commands;
 use App\Services\WireGuard;
 use Illuminate\Console\Command;
 
-class WgClientAdd extends WgCommand
+class WgPeerCreate extends WgCommand
 {
-    protected $signature = 'wg:client:add {interface} {ip}';
+    protected $signature = 'wg:peer:create {link} {ip}';
 
-    protected $description = 'Create a WireGuard VPN client';
+    protected $description = 'Create a WireGuard peer';
 
     public function handle(WireGuard $wg): int
     {
-        $interface_name = $this->argument('interface');
+        $link = $this->argument('link');
         $ip = $this->argument('ip');
 
         try {
-            $peer = $wg->addPeer($interface_name, $ip);
+            $peer = $wg->addPeer($link, $ip);
         } catch (\Throwable $e) {
             $this->error($e->getMessage());
 
@@ -29,7 +29,7 @@ class WgClientAdd extends WgCommand
         $this->line('');
 
         if ($peer->client_config !== null) {
-            $this->info('Client configuration:');
+            $this->info('Peer configuration:');
             $this->line('');
             $this->line($peer->client_config);
         }

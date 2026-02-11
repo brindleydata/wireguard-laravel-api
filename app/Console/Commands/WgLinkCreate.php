@@ -5,15 +5,15 @@ namespace App\Console\Commands;
 use App\Services\WireGuard;
 use Illuminate\Console\Command;
 
-class WgCreate extends WgCommand
+class WgLinkCreate extends WgCommand
 {
-    protected $signature = 'wg:create {interface} {ip} {port?} {ifout?} {--dns=} {--keepalive=} {--allowed-ips=}';
+    protected $signature = 'wg:link:create {link} {ip} {port?} {ifout?} {--dns=} {--keepalive=} {--allowed-ips=}';
 
-    protected $description = 'Create a WireGuard interface';
+    protected $description = 'Create a WireGuard link';
 
     public function handle(WireGuard $wg): int
     {
-        $name = $this->argument('interface');
+        $name = $this->argument('link');
         $ip = $this->argument('ip');
         $port = $this->argument('port') ? (int) $this->argument('port') : null;
         $ifout = $this->argument('ifout');
@@ -22,17 +22,17 @@ class WgCreate extends WgCommand
         $allowed_ips = $this->option('allowed-ips');
 
         try {
-            $interface = $wg->createInterface($name, $ip, $port, $ifout, $dns, $keepalive, $allowed_ips);
+            $link = $wg->createLink($name, $ip, $port, $ifout, $dns, $keepalive, $allowed_ips);
         } catch (\Throwable $e) {
             $this->error($e->getMessage());
 
             return Command::FAILURE;
         }
 
-        $this->info("Created interface {$interface->name}");
-        $this->line("Public Key: {$interface->public_key}");
-        $this->line("Listen Port: {$interface->listen_port}");
-        $this->line("Address: {$interface->address}");
+        $this->info("Created link {$link->name}");
+        $this->line("Public Key: {$link->public_key}");
+        $this->line("Listen Port: {$link->listen_port}");
+        $this->line("Address: {$link->address}");
 
         return Command::SUCCESS;
     }

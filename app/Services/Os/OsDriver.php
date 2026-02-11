@@ -20,9 +20,14 @@ interface OsDriver
     public function disk(string $partition = '/'): array;
 
     /**
-     * Get the public IP address via an external service.
+     * Get the public IPv4 address via an external service.
      */
-    public function publicIp(string $ip_service): string;
+    public function publicIpv4(string $ip_service): ?string;
+
+    /**
+     * Get the public IPv6 address via an external service.
+     */
+    public function publicIpv6(string $ip_service): ?string;
 
     /**
      * Get list of network interface names.
@@ -40,47 +45,69 @@ interface OsDriver
     public function defaultOutboundInterface(): string;
 
     /**
-     * Create a network device and return the OS-level interface name.
+     * Get the OS-specific wg-quick config directory path.
      */
-    public function createInterface(string $name): string;
+    public function configPath(): string;
 
     /**
-     * Remove a network device.
+     * Generate the [Interface] section for a wg-quick config, including PostUp/PostDown NAT hooks.
      */
-    public function destroyInterface(string $ifname): void;
+    public function interfaceSection(string $address, string $privkey, int $port, string $ifout): string;
 
     /**
-     * Assign an IP address with CIDR to an interface.
+     * Write a wg-quick .conf file securely (chmod 0600).
      */
-    public function assignAddress(string $ifname, string $address): void;
+    public function writeConfig(string $name, string $content): void;
 
     /**
-     * Bring the interface up.
+     * Delete a wg-quick .conf file.
      */
-    public function bringUp(string $ifname): void;
+    public function deleteConfig(string $name): void;
 
     /**
-     * Add per-interface NAT/forwarding rules.
+     * Read a wg-quick .conf file, or null if it doesn't exist.
      */
-    public function addNatRules(string $ifname, string $address, string $ifout): void;
+    public function readConfig(string $name): ?string;
 
     /**
-     * Remove per-interface NAT/forwarding rules.
+     * Check if a wg-quick .conf file exists.
      */
-    public function removeNatRules(string $ifname): void;
+    public function configExists(string $name): bool;
 
     /**
-     * Check if IP forwarding is currently enabled.
+     * Parse metadata from comment headers in a wg-quick .conf file.
+     * Returns array with keys: address, ifout, and optionally dns, keepalive, allowed_ips.
+     * Returns null if the config file doesn't exist.
      */
-    public function isForwardingEnabled(): bool;
+    public function parseConfig(string $name): ?array;
 
     /**
-     * Enable IP forwarding.
+     * Bring up a WireGuard interface via wg-quick or systemctl.
      */
-    public function enableForwarding(): void;
+    public function startInterface(string $name): void;
 
     /**
-     * Disable IP forwarding.
+     * Bring down a WireGuard interface via wg-quick or systemctl.
      */
-    public function disableForwarding(): void;
+    public function stopInterface(string $name): void;
+
+    /**
+     * Write a client (peer) config file.
+     */
+    public function writeClientConfig(string $link, string $ip, string $content): void;
+
+    /**
+     * Read a client (peer) config file, or null if it doesn't exist.
+     */
+    public function readClientConfig(string $link, string $ip): ?string;
+
+    /**
+     * Delete a client (peer) config file.
+     */
+    public function deleteClientConfig(string $link, string $ip): void;
+
+    /**
+     * Delete the entire client config directory for a link.
+     */
+    public function deleteClientConfigDir(string $link): void;
 }

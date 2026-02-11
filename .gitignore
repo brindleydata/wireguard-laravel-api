@@ -5,6 +5,7 @@
 /storage/*.key
 /vendor
 /.sublime*
+/.ssl
 .env
 .env.backup
 .phpunit.result.cache
