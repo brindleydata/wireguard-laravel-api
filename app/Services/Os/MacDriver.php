@@ -232,46 +232,55 @@ class MacDriver implements OsDriver
     public function writeConfig(string $name, string $content): void
     {
         $dir = $this->configPath();
-        if (! is_dir($dir)) {
-            mkdir($dir, 0755, true);
-        }
-
         $path = "{$dir}/{$name}.conf";
-        file_put_contents($path, $content."\n");
-        chmod($path, 0600);
+
+        $tmp = tempnam(sys_get_temp_dir(), 'wg_');
+        file_put_contents($tmp, $content."\n");
+        chmod($tmp, 0600);
+
+        $this->shell->run('sudo mkdir -p :dir && sudo cp :tmp :path && sudo chmod 600 :path', [
+            'dir' => $dir,
+            'tmp' => $tmp,
+            'path' => $path,
+        ]);
+        @unlink($tmp);
     }
 
     public function deleteConfig(string $name): void
     {
         $path = $this->configPath()."/{$name}.conf";
-        if (file_exists($path)) {
-            unlink($path);
-        }
+        $this->shell->tryRun('sudo rm -f :path', ['path' => $path]);
     }
 
     public function readConfig(string $name): ?string
     {
         $path = $this->configPath()."/{$name}.conf";
-        if (! file_exists($path)) {
-            return null;
-        }
 
-        return file_get_contents($path);
+        return $this->shell->tryRun('sudo cat :path', ['path' => $path]);
     }
 
     public function configExists(string $name): bool
     {
-        return file_exists($this->configPath()."/{$name}.conf");
+        $path = $this->configPath()."/{$name}.conf";
+
+        return $this->shell->tryRun('sudo test -f :path && echo 1', ['path' => $path]) === '1';
     }
 
     public function listConfigNames(): array
     {
-        $files = glob($this->configPath().'/*.conf');
-        if ($files === false || $files === []) {
+        $output = $this->shell->tryRun('sudo ls :path', ['path' => $this->configPath()]);
+        if ($output === null || $output === '') {
             return [];
         }
 
-        return array_map(fn (string $f) => basename($f, '.conf'), $files);
+        $names = [];
+        foreach (explode("\n", trim($output)) as $file) {
+            if (str_ends_with($file, '.conf')) {
+                $names[] = basename($file, '.conf');
+            }
+        }
+
+        return $names;
     }
 
     public function parseConfig(string $name): ?array
@@ -297,45 +306,37 @@ class MacDriver implements OsDriver
     public function writeClientConfig(string $link, string $key, string $content): void
     {
         $dir = $this->configPath()."/clients/{$link}";
-        if (! is_dir($dir)) {
-            mkdir($dir, 0755, true);
-        }
-
         $path = "{$dir}/{$key}.conf";
-        file_put_contents($path, $content."\n");
-        chmod($path, 0600);
+
+        $tmp = tempnam(sys_get_temp_dir(), 'wg_client_');
+        file_put_contents($tmp, $content."\n");
+        chmod($tmp, 0600);
+
+        $this->shell->run('sudo mkdir -p :dir && sudo cp :tmp :path && sudo chmod 600 :path', [
+            'dir' => $dir,
+            'tmp' => $tmp,
+            'path' => $path,
+        ]);
+        @unlink($tmp);
     }
 
     public function readClientConfig(string $link, string $key): ?string
     {
         $path = $this->configPath()."/clients/{$link}/{$key}.conf";
-        if (! file_exists($path)) {
-            return null;
-        }
 
-        return file_get_contents($path);
+        return $this->shell->tryRun('sudo cat :path', ['path' => $path]);
     }
 
     public function deleteClientConfig(string $link, string $key): void
     {
         $path = $this->configPath()."/clients/{$link}/{$key}.conf";
-        if (file_exists($path)) {
-            unlink($path);
-        }
+        $this->shell->tryRun('sudo rm -f :path', ['path' => $path]);
     }
 
     public function deleteClientConfigDir(string $link): void
     {
         $dir = $this->configPath()."/clients/{$link}";
-        if (! is_dir($dir)) {
-            return;
-        }
-
-        $files = glob("{$dir}/*");
-        foreach ($files as $file) {
-            @unlink($file);
-        }
-        @rmdir($dir);
+        $this->shell->tryRun('sudo rm -rf :dir', ['dir' => $dir]);
     }
 
     protected function hexMaskToCidr(string $hex): int

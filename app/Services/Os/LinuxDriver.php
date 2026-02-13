@@ -209,12 +209,15 @@ class LinuxDriver implements OsDriver
         $dir = $this->configPath();
         $path = "{$dir}/{$name}.conf";
 
-        // /etc/wireguard requires sudo — write to temp then copy
         $tmp = tempnam(sys_get_temp_dir(), 'wg_');
         file_put_contents($tmp, $content."\n");
         chmod($tmp, 0600);
 
-        $this->shell->run('sudo cp :tmp :path && sudo chmod 600 :path', ['tmp' => $tmp, 'path' => $path]);
+        $this->shell->run('sudo mkdir -p :dir && sudo cp :tmp :path && sudo chmod 600 :path', [
+            'dir' => $dir,
+            'tmp' => $tmp,
+            'path' => $path,
+        ]);
         @unlink($tmp);
     }
 
@@ -228,20 +231,12 @@ class LinuxDriver implements OsDriver
     {
         $path = $this->configPath()."/{$name}.conf";
 
-        // Try direct read first (may work if running as root)
-        if (is_readable($path)) {
-            return file_get_contents($path);
-        }
-
         return $this->shell->tryRun('sudo cat :path', ['path' => $path]);
     }
 
     public function configExists(string $name): bool
     {
         $path = $this->configPath()."/{$name}.conf";
-        if (file_exists($path)) {
-            return true;
-        }
 
         return $this->shell->tryRun('sudo test -f :path && echo 1', ['path' => $path]) === '1';
     }
@@ -303,10 +298,6 @@ class LinuxDriver implements OsDriver
     public function readClientConfig(string $link, string $key): ?string
     {
         $path = $this->configPath()."/clients/{$link}/{$key}.conf";
-
-        if (is_readable($path)) {
-            return file_get_contents($path);
-        }
 
         return $this->shell->tryRun('sudo cat :path', ['path' => $path]);
     }

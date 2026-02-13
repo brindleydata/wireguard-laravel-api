@@ -49,15 +49,19 @@ class WgCommand extends Command
        /usr/bin/wg, \
        /usr/bin/wg-quick, \
        /usr/sbin/nft, \
-       /bin/systemctl enable wg-quick@*, \
-       /bin/systemctl disable wg-quick@*, \
-       /bin/systemctl start wg-quick@*, \
-       /bin/systemctl stop wg-quick@*, \
-       /bin/cp, \
-       /bin/rm, \
-       /bin/cat, \
-       /bin/chmod, \
-       /bin/mkdir
+       /usr/bin/systemctl enable wg-quick@*, \
+       /usr/bin/systemctl disable wg-quick@*, \
+       /usr/bin/systemctl start wg-quick@*, \
+       /usr/bin/systemctl stop wg-quick@*, \
+       /usr/bin/cat /etc/wireguard/*, \
+       /usr/bin/test -f /etc/wireguard/*, \
+       /usr/bin/ls /etc/wireguard, \
+       /usr/bin/mkdir -p /etc/wireguard, \
+       /usr/bin/mkdir -p /etc/wireguard/clients/*, \
+       /usr/bin/cp /tmp/* /etc/wireguard/*, \
+       /usr/bin/chmod 600 /etc/wireguard/*, \
+       /usr/bin/rm -f /etc/wireguard/*, \
+       /usr/bin/rm -rf /etc/wireguard/clients/*
    EOF
    sudo chmod 440 /etc/sudoers.d/wireguard
 SNIPPET);
@@ -100,13 +104,24 @@ SNIPPET);
 SNIPPET);
         $this->line('');
 
+        $configPath = "{$prefix}/etc/wireguard";
+
         $this->comment('5. Create sudoers file (replace _www with your web server user)');
         $this->line(<<<SNIPPET
    sudo tee /etc/sudoers.d/wireguard > /dev/null <<'EOF'
    _www ALL=(root) NOPASSWD: \\
        {$prefix}/bin/wg, \\
        {$prefix}/bin/wg-quick, \\
-       /usr/sbin/sysctl -w net.inet.ip.forwarding=*
+       /sbin/pfctl, \\
+       /bin/cat {$configPath}/*, \\
+       /usr/bin/test -f {$configPath}/*, \\
+       /bin/ls {$configPath}, \\
+       /bin/mkdir -p {$configPath}, \\
+       /bin/mkdir -p {$configPath}/clients/*, \\
+       /bin/cp /tmp/* {$configPath}/*, \\
+       /bin/chmod 600 {$configPath}/*, \\
+       /bin/rm -f {$configPath}/*, \\
+       /bin/rm -rf {$configPath}/clients/*
    EOF
    sudo chmod 440 /etc/sudoers.d/wireguard
 SNIPPET);
