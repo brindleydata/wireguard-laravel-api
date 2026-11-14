@@ -1,8 +1,10 @@
 <?php
 
+use App\Exceptions\HelperException;
 use App\Services\Os\LinuxDriver;
 use Tests\Fakes\CommandFailed;
 use Tests\Fakes\FakeShell;
+use Tests\Support\HelperSandbox;
 
 /*
  * The privileged half of both drivers: everything goes through the root helper.
@@ -68,3 +70,56 @@ it('passes helper failures on with their message', function () {
 
     expect(fn () => helperDriver($shell)->startInterface('wg0'))->toThrow(CommandFailed::class, 'sudo: a password is required');
 });
+
+// ─── Helper drift ───────────────────────────────────────────────────
+
+/**
+ * A driver whose "installed" helper is a temp file with the given content (null: missing),
+ * compared against the real bundled bin/wgla-helper.
+ */
+function driftDriver(FakeShell $shell, ?string $installed): LinuxDriver
+{
+    $path = sys_get_temp_dir().'/wgla_installed_'.bin2hex(random_bytes(4));
+    if ($installed !== null) {
+        file_put_contents($path, $installed);
+        register_shutdown_function(fn () => @unlink($path));
+    }
+
+    return new LinuxDriver($shell, $path, HelperSandbox::path());
+}
+
+it('uses an installed helper identical to the bundled one', function () {
+    $shell = (new FakeShell)->otherwise(fn () => '');
+
+    driftDriver($shell, file_get_contents(HelperSandbox::path()))->startInterface('wg0');
+
+    expect($shell->calls)->toHaveCount(1);
+});
+
+it('refuses a missing or different helper before running anything', function (?string $installed, string $message) {
+    $shell = (new FakeShell)->otherwise(fn () => '');
+    $driver = driftDriver($shell, $installed);
+
+    expect(fn () => $driver->startInterface('wg0'))->toThrow(HelperException::class, $message)
+        // Reads too: a stale helper must not look like "link not found"
+        ->and(fn () => $driver->readConfig('wg0'))->toThrow(HelperException::class)
+        ->and($shell->calls)->toBe([]);
+})->with([
+    'missing' => [null, 'The root helper is not installed at'],
+    'an older version' => [str_replace('VERSION=1', 'VERSION=0', file_get_contents(__DIR__.'/../../../bin/wgla-helper')), 'differs from the one this app ships (installed: v0, app: v1)'],
+    'edited, same version' => [file_get_contents(__DIR__.'/../../../bin/wgla-helper')."\n# local edit\n", '(installed: v1, app: v1)'],
+]);
+
+it('reports the helper state', function (?string $installed, bool $sudoAllowed, string $state) {
+    $shell = (new FakeShell)->on('sudo -n :helper version', fn () => $sudoAllowed ? '1' : throw new CommandFailed('sudo: a password is required'));
+
+    $status = driftDriver($shell, $installed)->helperStatus();
+
+    expect($status['state'])->toBe($state)
+        ->and($status['bundled'])->toBe('1');
+})->with([
+    'ok' => [file_get_contents(__DIR__.'/../../../bin/wgla-helper'), true, 'ok'],
+    'sudoers missing' => [file_get_contents(__DIR__.'/../../../bin/wgla-helper'), false, 'not-allowed'],
+    'missing' => [null, true, 'missing'],
+    'outdated' => ["#!/bin/bash\nVERSION=0\n", true, 'outdated'],
+]);

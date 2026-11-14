@@ -1,0 +1,127 @@
+<?php
+
+namespace App\Setup;
+
+use App\Services\Shell;
+use App\Setup\Steps\Environment;
+use App\Setup\Steps\Forwarding;
+use App\Setup\Steps\Health;
+use App\Setup\Steps\Helper;
+use App\Setup\Steps\Packages;
+use App\Setup\Steps\Permissions;
+use App\Setup\Steps\PfAnchors;
+use App\Setup\Steps\Server;
+use App\Setup\Steps\Sudoers;
+use App\Setup\Steps\WebUser;
+
+/**
+ * The steps of `wg:install`, in order, and what they share: the context and its saved answers.
+ */
+class Installer
+{
+    /** Answers saved in .env, so re-runs and `wg:update` know how this server was set up. */
+    public const SAVED = [
+        'web_user' => 'WGLA_WEB_USER',
+        'forward' => 'WGLA_FORWARD',
+        'tls' => 'WGLA_SERVER_TLS',
+        'port' => 'WGLA_SERVER_PORT',
+        'domain' => 'WGLA_SERVER_DOMAIN',
+        'cert' => 'WGLA_SERVER_CERT',
+        'key' => 'WGLA_SERVER_KEY',
+        'bind' => 'WGLA_SERVER_BIND',
+        'hostname' => 'WIREGUARD_HOSTNAME',
+    ];
+
+    /**
+     * @param  string|null  $helperPath  where the root helper is installed (default: config('wireguard.helper'))
+     */
+    public function __construct(protected Shell $shell, protected ?string $helperPath = null) {}
+
+    /** @return list<Step> */
+    public function steps(): array
+    {
+        $server = new Server($this->shell);
+
+        return [
+            new Packages($this->shell),
+            new WebUser($this->shell),
+            new Permissions($this->shell),
+            new Environment($this->shell),
+            new Forwarding($this->shell),
+            new PfAnchors($this->shell),
+            new Helper($this->shell),
+            new Sudoers($this->shell),
+            $server,
+            new Health($this->shell, $server),
+        ];
+    }
+
+    /**
+     * @param  array<string, mixed>  $given  answers from command-line options; they win over saved ones
+     */
+    public function context(array $given = [], ?string $appPath = null, string $root = ''): Context
+    {
+        $appPath ??= base_path();
+        $user = $this->shell->tryRun('id -un') ?: get_current_user();
+
+        $ctx = new Context(
+            os: PHP_OS_FAMILY === 'Darwin' ? 'mac' : 'linux',
+            appPath: $appPath,
+            deployUser: $user,
+            deployGroup: $this->shell->tryRun('id -gn') ?: $user,
+            php: PHP_BINARY,
+            helperPath: $this->helperPath ?? (string) config('wireguard.helper'),
+            bundledHelper: "{$appPath}/bin/wgla-helper",
+            root: $root,
+        );
+
+        $env = new EnvFile($ctx->app('.env'));
+        foreach (self::SAVED as $answer => $key) {
+            if (($value = $env->get($key)) !== null && $value !== '') {
+                $ctx->answers[$answer] = $value;
+            }
+        }
+        foreach ($given as $answer => $value) {
+            if ($value !== null) {
+                $ctx->answers[$answer] = $value;
+            }
+        }
+
+        return $ctx;
+    }
+
+    /** Save the answers into .env once it exists (the environment step sets WIREGUARD_HOSTNAME). */
+    public function save(Context $ctx): void
+    {
+        $env = new EnvFile($ctx->app('.env'));
+        if (! $env->exists()) {
+            return;
+        }
+
+        foreach (self::SAVED as $answer => $key) {
+            $value = $ctx->answer($answer);
+            if ($answer !== 'hostname' && $value !== null) {
+                $env->set($key, is_bool($value) ? ($value ? 'true' : 'false') : (string) $value);
+            }
+        }
+    }
+
+    /** Make sure sudo works for the checks and fixes: ask for the password once, or require it to be passwordless. */
+    public function sudoReady(bool $interactive): bool
+    {
+        return $interactive
+            ? $this->shell->interactive('sudo -v') === 0
+            : $this->shell->tryRun('sudo -n true') !== null;
+    }
+
+    public function run(Action $action, Context $ctx): bool
+    {
+        if ($action->callback !== null) {
+            ($action->callback)($ctx);
+
+            return true;
+        }
+
+        return $this->shell->interactive((string) $action->command) === 0;
+    }
+}

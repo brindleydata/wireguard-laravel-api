@@ -63,6 +63,27 @@ class FakeShell extends Shell
         }
     }
 
+    /** @var list<string> commands run through interactive() */
+    public array $interactive = [];
+
+    /** @var (callable(string): int)|null */
+    protected $interactiveHandler = null;
+
+    /** Decide the exit code of interactive() commands (default: 0). */
+    public function onInteractive(callable $handler): static
+    {
+        $this->interactiveHandler = $handler;
+
+        return $this;
+    }
+
+    public function interactive(string $command): int
+    {
+        $this->interactive[] = $command;
+
+        return $this->interactiveHandler === null ? 0 : ($this->interactiveHandler)($command);
+    }
+
     /**
      * @return list<array{command: string, bindings: array, input: ?string, bound: string}>
      */

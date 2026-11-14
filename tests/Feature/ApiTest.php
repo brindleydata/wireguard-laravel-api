@@ -10,7 +10,12 @@ use Tests\Fakes\FakeShell;
  */
 
 beforeEach(function () {
-    config(['wireguard.api_key' => 'test-key', 'wireguard.hostname' => 'vpn.example.test']);
+    config([
+        'wireguard.api_key' => 'test-key',
+        'wireguard.hostname' => 'vpn.example.test',
+        // "Installed" helper = the bundled one, so the drift check passes
+        'wireguard.helper' => base_path('bin/wgla-helper'),
+    ]);
 
     $shell = new FakeShell;
     $this->app->instance(Shell::class, $shell);
@@ -44,6 +49,14 @@ it('runs a link and peer through their lifecycle', function () {
 
     $this->getJson('/link/wg0', $this->auth)->assertNotFound();
     expect($this->host->files())->toBe([]);
+});
+
+it('reports a missing root helper as a 500 that says how to fix it', function () {
+    config(['wireguard.helper' => '/nonexistent/wgla-helper']);
+
+    $this->getJson('/links', $this->auth)
+        ->assertInternalServerError()
+        ->assertJsonPath('error', 'The root helper is not installed at /nonexistent/wgla-helper. Install it with: php artisan wg:install');
 });
 
 it('rejects requests without the right API key', function () {

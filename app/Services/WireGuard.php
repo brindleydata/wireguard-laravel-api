@@ -202,6 +202,9 @@ class WireGuard
                     $this->otherLinks($name),
                 );
             }
+            if (isset($params['address'])) {
+                $this->assertPeersFit($name, $params['address']);
+            }
 
             $iface = $this->runtimeInterface($name);
             $running = $iface !== null;
@@ -607,6 +610,25 @@ class WireGuard
             }
             if ($address !== null && $settings['address'] !== '' && IpAllocator::overlaps($address, $settings['address'])) {
                 throw new ConflictException("Subnet {$address} overlaps link {$other} ({$settings['address']})");
+            }
+        }
+    }
+
+    /**
+     * A link's address can only move to a subnet its peers' tunnel addresses still fit in.
+     */
+    protected function assertPeersFit(string $name, string $address): void
+    {
+        [$link_ip] = explode('/', $address, 2);
+
+        foreach ($this->getLink($name)?->peers ?? [] as $peer) {
+            // The first allowed IP is the peer's tunnel address
+            $ip = explode('/', trim(explode(',', (string) $peer->allowed_ips)[0]), 2)[0];
+            if (! filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) {
+                continue;
+            }
+            if ($ip === $link_ip || ! $this->validator->ipInRange($ip, $address)) {
+                throw new InvalidArgumentException("Peer {$ip} would not fit the new address {$address}. Move the peer first (its `ip`).");
             }
         }
     }

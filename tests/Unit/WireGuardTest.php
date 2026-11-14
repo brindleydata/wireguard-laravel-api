@@ -296,6 +296,19 @@ it('refuses to move a link onto another link\'s port or subnet', function () {
         ->and($rig->wg->updateLink('wg1', ['port' => 51822])->listen_port)->toBe(51822);
 });
 
+it('refuses a new link address its peers would not fit in', function (string $os) {
+    $rig = new Rig($os);
+    $rig->wg->createLink('wg0', '10.0.0.1/24', 51820);
+    $rig->wg->addPeer('wg0'); // 10.0.0.2
+    $rig->wg->addPeer('wg0', '10.0.0.200');
+
+    expect(fn () => $rig->wg->updateLink('wg0', ['address' => '10.0.0.1/25']))
+        ->toThrow(InvalidArgumentException::class, 'Peer 10.0.0.200 would not fit the new address 10.0.0.1/25')
+        ->and(fn () => $rig->wg->updateLink('wg0', ['address' => '10.0.0.2/24']))
+        ->toThrow(InvalidArgumentException::class, 'Peer 10.0.0.2 would not fit')
+        ->and($rig->wg->updateLink('wg0', ['address' => '10.0.0.1/16'])->address)->toBe('10.0.0.1/16');
+})->with('os');
+
 it('picks a free random port', function () {
     $rig = new Rig('linux');
 

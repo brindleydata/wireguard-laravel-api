@@ -10,6 +10,7 @@
         "php": "^8.5",
         "ext-sodium": "*",
         "laravel/framework": "^13.42",
+        "laravel/octane": "^2.24",
         "laravel/tinker": "^3.1"
     },
     "require-dev": {

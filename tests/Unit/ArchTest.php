@@ -12,6 +12,8 @@ arch('frontends only use the WireGuard and Server services')
         'App\Services\Server',
         'App\DTOs',
         'App\Console\Commands', // the WgCommand base class
+        'App\Setup', // wg:install / wg:update: setting up the host is their job
+        'Laravel\Prompts',
         'Illuminate',
         'abort', 'app', 'response', 'config', 'base_path', // Laravel helper functions
     ]);

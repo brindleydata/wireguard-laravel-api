@@ -34,6 +34,16 @@ class WgStatus extends WgCommand
         $this->line("CPU: {$status->cpu['cores']} cores, load {$status->cpu['load']}, {$status->cpu['usage']}%");
         $this->line("RAM: {$status->ram['usage']}% used ({$status->ram['free']} kB free / {$status->ram['total']} kB)");
         $this->line("Disk: {$status->disk['usage']}% used ({$status->disk['free']} free / {$status->disk['size']})");
+        $this->line('');
+
+        $helper = $status->helper;
+        $versions = "installed v{$helper['installed']}, app ships v{$helper['bundled']}";
+        match ($helper['state']) {
+            'ok' => $this->line("Root helper: ok (v{$helper['installed']})"),
+            'missing' => $this->error('Root helper: not installed. Run: php artisan wg:install'),
+            'outdated' => $this->error("Root helper: outdated ({$versions}). Run: php artisan wg:install"),
+            default => $this->error('Root helper: installed, but sudoers does not allow running it. Run: php artisan wg:install'),
+        };
 
         return Command::SUCCESS;
     }

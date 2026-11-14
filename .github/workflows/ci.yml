@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    name: Tests, Pint, shellcheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.5'
+          extensions: sodium, mbstring, dom
+          coverage: none
+
+      - run: composer install --no-interaction --no-progress
+
+      - run: ./vendor/bin/pest
+
+      - run: ./vendor/bin/pint --test
+
+      - run: shellcheck -s bash bin/wgla-helper tests/e2e/linux.sh
+
+  e2e:
+    name: Install on a fresh Ubuntu and test for real
+    runs-on: ubuntu-latest
+    needs: tests
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.5'
+          extensions: sodium, mbstring, dom
+          coverage: none
+
+      # Like a server: the code lives outside the home directory, owned by the deploy user
+      # (the runner), and the API runs as www-data.
+      - name: Put the app in /srv/wgla
+        run: |
+          sudo install -d -o "$USER" -g "$(id -gn)" /srv/wgla
+          cp -a "$GITHUB_WORKSPACE/." /srv/wgla/
+          cd /srv/wgla && composer install --no-dev --optimize-autoloader --no-interaction --no-progress
+
+      - name: php artisan wg:install --yes
+        working-directory: /srv/wgla
+        run: >-
+          php artisan wg:install --yes --user=www-data --hostname=127.0.0.1 --forward=true
+          --tls=http --bind=127.0.0.1 --port=8080
+
+      - name: A second run only checks
+        working-directory: /srv/wgla
+        run: php artisan wg:install --no-interaction
+
+      - name: End-to-end checks
+        run: sudo WGLA_E2E=1 /srv/wgla/tests/e2e/linux.sh /srv/wgla
+
+      - name: Service log on failure
+        if: failure()
+        run: sudo journalctl -u wgla -n 100 --no-pager

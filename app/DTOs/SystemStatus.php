@@ -10,6 +10,7 @@ class SystemStatus
         public readonly array $ram,
         public readonly array $disk,
         public readonly string $hostname,
+        public readonly array $helper = [],
     ) {}
 
     public function toArray(): array
@@ -20,6 +21,7 @@ class SystemStatus
             'ram' => $this->ram,
             'disk' => $this->disk,
             'hostname' => $this->hostname,
+            'helper' => $this->helper,
         ];
     }
 }

@@ -24,10 +24,11 @@ class WireGuardServiceProvider extends ServiceProvider
             $shell = $app->make(Shell::class);
 
             $helper = config('wireguard.helper');
+            $bundled = base_path('bin/wgla-helper');
 
             return match (PHP_OS_FAMILY) {
-                'Darwin' => new MacDriver($shell, $helper),
-                default => new LinuxDriver($shell, $helper),
+                'Darwin' => new MacDriver($shell, $helper, $bundled),
+                default => new LinuxDriver($shell, $helper, $bundled),
             };
         });
 

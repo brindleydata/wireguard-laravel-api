@@ -48,6 +48,27 @@ class Shell
         }
     }
 
+    /**
+     * Run a command attached to the terminal (so sudo can ask for a password and output streams
+     * live), returning its exit code. For the installer, never for request handling.
+     */
+    public function interactive(string $command): int
+    {
+        $process = Process::fromShellCommandline($command);
+        $process->setTimeout(null);
+        $process->setEnv(['PATH' => self::PATH]);
+
+        if (Process::isTtySupported()) {
+            $process->setTty(true);
+
+            return $process->run();
+        }
+
+        return $process->run(function (string $type, string $output) {
+            fwrite($type === Process::ERR ? STDERR : STDOUT, $output);
+        });
+    }
+
     protected function bind(string $command, array $bindings): string
     {
         // Sort by key length descending so :name_long isn't partially matched by :name

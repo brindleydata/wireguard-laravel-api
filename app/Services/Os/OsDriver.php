@@ -50,6 +50,17 @@ interface OsDriver
      */
     public function defaultOutboundInterface(): string;
 
+    // ─── Root helper ────────────────────────────────────────────────
+
+    /**
+     * Whether the installed root helper is usable: `ok`, `missing`, `outdated` (it differs from
+     * the bin/wgla-helper this app ships) or `not-allowed` (sudoers doesn't let us run it).
+     * Never throws.
+     *
+     * @return array{state: string, installed: ?string, bundled: ?string} versions of both copies
+     */
+    public function helperStatus(): array;
+
     // ─── WireGuard runtime state ────────────────────────────────────
 
     /**

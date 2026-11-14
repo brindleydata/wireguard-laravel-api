@@ -2,6 +2,7 @@
 
 namespace App\Services\Os;
 
+use App\Exceptions\HelperException;
 use App\Services\ConfigBuilder;
 use App\Services\Shell;
 
@@ -12,9 +13,14 @@ use App\Services\Shell;
  */
 abstract class BaseDriver implements OsDriver
 {
+    /**
+     * @param  string|null  $bundledHelperPath  The bin/wgla-helper this app ships. When given, the
+     *                                          installed helper must be identical before it is used.
+     */
     public function __construct(
         protected Shell $shell,
         protected string $helperPath = '/usr/local/sbin/wgla-helper',
+        protected ?string $bundledHelperPath = null,
     ) {}
 
     /**
@@ -170,17 +176,81 @@ abstract class BaseDriver implements OsDriver
 
     // ─── Helper ─────────────────────────────────────────────────────
 
+    public function helperStatus(): array
+    {
+        $state = $this->helperDrift()
+            ?? ($this->shell->tryRun('sudo -n :helper version', ['helper' => $this->helperPath]) === null ? 'not-allowed' : 'ok');
+
+        return [
+            'state' => $state,
+            'installed' => $this->helperVersion($this->helperPath),
+            'bundled' => $this->bundledHelperPath === null ? null : $this->helperVersion($this->bundledHelperPath),
+        ];
+    }
+
     /**
      * Run a helper command as root. `sudo -n` fails at once when sudoers isn't set up, instead
      * of waiting for a password.
      */
     protected function helper(string $command, array $bindings = [], ?string $input = null): string
     {
+        $this->assertHelperCurrent();
+
         return $this->shell->run("sudo -n :helper {$command}", ['helper' => $this->helperPath, ...$bindings], $input);
     }
 
     protected function tryHelper(string $command, array $bindings = [], ?string $input = null): ?string
     {
+        // Throws rather than returning null: a stale helper must not look like "not found"
+        $this->assertHelperCurrent();
+
         return $this->shell->tryRun("sudo -n :helper {$command}", ['helper' => $this->helperPath, ...$bindings], $input);
+    }
+
+    /**
+     * Refuse to use a helper that isn't the one this app ships: after an app update without a
+     * helper reinstall, it could reject the new app's configs or lack commands. Checked on every
+     * call (hashing a small file) because Octane workers outlive updates.
+     */
+    protected function assertHelperCurrent(): void
+    {
+        $drift = $this->helperDrift();
+        if ($drift === null) {
+            return;
+        }
+
+        $fix = 'Install it with: php artisan wg:install';
+        throw new HelperException($drift === 'missing'
+            ? "The root helper is not installed at {$this->helperPath}. {$fix}"
+            : sprintf(
+                'The root helper at %s differs from the one this app ships (installed: v%s, app: v%s). %s',
+                $this->helperPath,
+                $this->helperVersion($this->helperPath) ?? '?',
+                $this->helperVersion((string) $this->bundledHelperPath) ?? '?',
+                $fix,
+            ));
+    }
+
+    /**
+     * `missing` or `outdated`, or null when the installed helper is the bundled one (or there is
+     * no bundled copy to compare with). The installed helper is world-readable: no sudo needed.
+     */
+    protected function helperDrift(): ?string
+    {
+        if ($this->bundledHelperPath === null) {
+            return null;
+        }
+        if (! is_file($this->helperPath)) {
+            return 'missing';
+        }
+
+        return hash_file('sha256', $this->helperPath) === hash_file('sha256', $this->bundledHelperPath) ? null : 'outdated';
+    }
+
+    protected function helperVersion(string $path): ?string
+    {
+        $content = is_file($path) ? (string) file_get_contents($path) : '';
+
+        return preg_match('/^VERSION=(\S+)$/m', $content, $m) ? $m[1] : null;
     }
 }

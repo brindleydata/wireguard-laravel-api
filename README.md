@@ -4,85 +4,85 @@ Stateless REST API and CLI for managing WireGuard VPN interfaces and peers. Buil
 
 ## Requirements
 
-- PHP 8.5+ with the `sodium` extension
-- `wireguard-tools` (`wg`, `wg-quick`)
-- Linux: systemd and `nftables` (`iptables` too if Docker or ufw manage the firewall). macOS: Homebrew's `wireguard-go` and bash, and `pfctl`
-- `curl`
-- The root helper `bin/wgla-helper`, installed root-owned and allowed in sudoers (see [Setup](#setup))
+- Linux with systemd (production; the installer automates Debian/Ubuntu via apt) or macOS with Homebrew (development)
+- PHP 8.5+ with the `sodium`, `mbstring` and `dom` extensions, Composer and git
+- `wireguard-tools`; on Linux `nftables` (`iptables` too if Docker or ufw manage the firewall); on macOS `wireguard-go`, Homebrew's bash and `pfctl`
 - IP forwarding enabled (if using forward/NAT features)
 
-## Quick Start
-
-```bash
-composer install
-cp .env.example .env
-php artisan key:generate
-
-# Set your API key (the API refuses every protected request without one)
-echo "API_KEY=$(openssl rand -hex 32)" >> .env
-
-# Show platform-specific setup instructions
-php artisan wg:help
-
-# Start the API
-php artisan serve --port=25420
-```
+`php artisan wg:install` checks all of these and installs what's missing.
 
 ## Setup
 
-The app runs as an unprivileged web server user. Everything that needs root goes through one small script, `bin/wgla-helper`, which is the only command that user may run with `sudo`:
+Clone the app as the **deploy user**: the account that owns the code and runs installs and updates. Put it outside home directories so the web server user can reach it, e.g. `/srv/wgla`. Then run the installer as that user, not as root:
+
+```bash
+sudo install -d -o "$USER" /srv/wgla
+git clone https://github.com/brindleydata/wireguard-laravel-api.git /srv/wgla
+cd /srv/wgla
+composer install --no-dev --optimize-autoloader
+php artisan wg:install
+```
+
+`wg:install` goes through the setup step by step. For each step it checks the machine, shows the exact commands that would fix what's missing, and then runs them (using `sudo` where needed), lets you run them yourself, or skips the step. The steps:
+
+1. **Packages:** WireGuard tools, nftables, PHP extensions, git, Composer.
+2. **Web server user:** default `www-data`. The API runs as this user, never as root.
+3. **File ownership:** the code stays owned by the deploy user and read-only for the web user, and only `storage/` is writable by it. A compromised web process can't change the code it runs.
+4. **`.env`:** generates `APP_KEY` and `API_KEY`, and sets the hostname clients connect to. `.env` is readable only by the web user's group.
+5. **IP forwarding.**
+6. **pf anchors** (macOS only).
+7. **The root helper** (see below).
+8. **The sudo rule:** one line, checked with `visudo` before it's installed.
+9. **The API server:** Octane + FrankenPHP as a systemd service, which serves HTTPS itself. You choose how:
+   - a Let's Encrypt certificate for a domain;
+   - your own certificate files;
+   - plain HTTP on a local port behind your own reverse proxy.
+
+   You also choose the port. The installer explains the downsides of anything other than 443.
+10. **Health check:** the web user can use the helper, and the API answers.
+
+Run it again any time: finished steps just show ✓, so it doubles as a health check. Other ways to run it:
+
+```bash
+php artisan wg:install --print     # the same commands as a shell script, to review or run yourself
+php artisan wg:install --yes --user=www-data --hostname=vpn.example.com --forward=true \
+    --tls=letsencrypt --domain=api.example.com --port=443      # unattended (needs passwordless sudo)
+php artisan wg:install --step=helper --step=health             # only some steps
+```
+
+On **macOS** (development) the API runs as you, and there's no service. Start it with `php artisan octane:start --server=frankenphp --port=8000` (or `php artisan serve`).
+
+### The root helper
+
+Everything that needs root goes through one small script, `bin/wgla-helper`, installed root-owned at `/usr/local/sbin/wgla-helper`. It's the only command the web server user may run with `sudo`:
+
+```
+www-data ALL=(root) NOPASSWD: /usr/local/sbin/wgla-helper
+```
 
 - **Strict arguments.** It accepts a fixed set of commands (`conf-write wg0`, `up wg0`, `peer-remove wg0 <key>`, …) and validates every argument.
 - **Strict configs.** It only writes wg-quick configs that contain what the app generates. The only hooks allowed are calls back into the helper's own firewall commands. So the web user can manage links, but it can't run other commands, read other files or plant `PostUp` hooks as root.
-- **Plain sudoers line.** One line with no argument wildcards, so it works with classic `sudo` and with `sudo-rs`, which is the default on Ubuntu 25.10 and later and rejects the wildcard-based rules this app used to need.
+- **Plain sudoers line.** It has no argument wildcards, so it works with classic `sudo` and with `sudo-rs`, which is the default on Ubuntu 25.10 and later.
 
-`php artisan wg:help` prints these steps with the paths for your checkout. Replace `www-data` (Linux) or `_www` (macOS) with your web server user.
+The app refuses to use an installed helper that differs from the bundled one. That can happen after an update without a reinstall. `/status` and `wg:status` report the helper's state, and `wg:install` fixes it.
 
-### Linux
-
-```bash
-sudo apt install wireguard-tools nftables curl php-cli php-mbstring php-xml php-curl
-
-# IP forwarding (for forward/NAT)
-echo "net.ipv4.ip_forward=1" | sudo tee /etc/sysctl.d/99-wireguard.conf
-sudo sysctl --system
-
-# The root helper: install again after every update of this app
-sudo mkdir -p /usr/local/sbin
-sudo install -o root -g root -m 755 bin/wgla-helper /usr/local/sbin/wgla-helper
-
-echo 'www-data ALL=(root) NOPASSWD: /usr/local/sbin/wgla-helper' | sudo tee /etc/sudoers.d/wgla > /dev/null
-sudo chmod 440 /etc/sudoers.d/wgla
-sudo visudo -cf /etc/sudoers.d/wgla
-```
-
-### macOS
+## Updating
 
 ```bash
-brew install wireguard-tools wireguard-go bash
-
-# IP forwarding (for forward/NAT)
-sudo sysctl -w net.inet.ip.forwarding=1
-
-# pf anchors for the forward/NAT rules (one-time)
-sudo bash -c 'cat >> /etc/pf.conf <<EOF
-
-# WireGuard NAT anchors
-nat-anchor "wg/*"
-anchor "wg/*"
-EOF'
-sudo pfctl -f /etc/pf.conf
-
-# The root helper: install again after every update of this app
-sudo mkdir -p /usr/local/sbin
-sudo install -o root -g wheel -m 755 bin/wgla-helper /usr/local/sbin/wgla-helper
-
-echo '_www ALL=(root) NOPASSWD: /usr/local/sbin/wgla-helper' | sudo tee /etc/sudoers.d/wgla > /dev/null
-sudo chmod 440 /etc/sudoers.d/wgla
-sudo visudo -cf /etc/sudoers.d/wgla
+cd /srv/wgla
+php artisan wg:update                  # to the latest release (tags vX.Y.Z)
+php artisan wg:update --to=v1.4.0      # to a specific release, also an older one
+php artisan wg:update --branch=master  # follow a branch (for testing)
 ```
 
-### Firewall notes
+Run it as the deploy user. It refuses to overwrite local changes to the code. Before changing anything it shows the version change, the changelog and any change to the root helper, which runs as root, so review it. It then:
+
+1. checks out the release and runs `composer install --no-dev`;
+2. in a fresh process with the new code, reinstalls the helper if it changed, updates the sudo rule and the service, reloads the API without dropping connections, and runs the health check.
+
+If any of that fails, it goes back to the previous version by itself. Updates are never unattended: an update installs code that runs as root.
+
+## Firewall notes
 
 - **Rules per link.** `forward` and `nat` are per-link rules. Linux uses an nftables table `inet wg_<link>`, and NAT only masquerades the link's own subnet. macOS uses a pf anchor `wg/<link>`.
 - **Docker and ufw.** These drop forwarded traffic in iptables' `FORWARD` chain, which an nftables accept can't override. When that chain drops anything, the helper also adds two `ACCEPT` rules there, tagged `wgla:<link>`.
@@ -141,7 +141,9 @@ Errors are JSON `{"error": "..."}`: `403` for a missing or wrong API key (also w
 ## CLI
 
 ```bash
-php artisan wg:help              # Setup instructions
+php artisan wg:help              # How to set up and update
+php artisan wg:install           # Set up / check this server (as the deploy user)
+php artisan wg:update            # Update to the latest release (as the deploy user)
 php artisan wg:status            # System status
 php artisan wg:links             # List interfaces
 php artisan wg:link {name}       # Show interface details

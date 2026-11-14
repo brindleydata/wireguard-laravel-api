@@ -24,6 +24,7 @@ class Server
             ram: $this->os->ram(),
             disk: $this->os->disk(),
             hostname: $hostname,
+            helper: $this->os->helperStatus(),
         );
     }
 

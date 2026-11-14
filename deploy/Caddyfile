@@ -1,0 +1,42 @@
+#
+# FrankenPHP config for `octane:start --caddyfile=deploy/Caddyfile` (see `php artisan wg:install`).
+#
+# Octane's own Caddyfile serves https://<host>:<port> only and has no place for certificate files,
+# so the site address and TLS come from the systemd unit's environment instead:
+#   WGLA_SITE_ADDRESS   https://api.example.com (Let's Encrypt), :443 (own certificate),
+#                       http://127.0.0.1:8080 (behind a proxy)
+#   WGLA_TLS_DIRECTIVE  "tls /path/cert.pem /path/key.pem" or empty
+#
+{
+	{$CADDY_GLOBAL_OPTIONS}
+
+	admin {$CADDY_SERVER_ADMIN_HOST}:{$CADDY_SERVER_ADMIN_PORT}
+
+	frankenphp {
+		worker {
+			file "{$APP_PUBLIC_PATH}/frankenphp-worker.php"
+			{$CADDY_SERVER_WORKER_DIRECTIVE}
+			{$CADDY_SERVER_WATCH_DIRECTIVES}
+		}
+	}
+}
+
+{$WGLA_SITE_ADDRESS} {
+	{$WGLA_TLS_DIRECTIVE}
+
+	log {
+		level {$CADDY_SERVER_LOG_LEVEL}
+		format {$CADDY_SERVER_LOGGER}
+	}
+
+	route {
+		root * "{$APP_PUBLIC_PATH}"
+		encode zstd br gzip
+
+		php_server {
+			index frankenphp-worker.php
+			try_files {path} frankenphp-worker.php
+			resolve_root_symlink
+		}
+	}
+}
