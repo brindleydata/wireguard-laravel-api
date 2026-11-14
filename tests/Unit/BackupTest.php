@@ -2,7 +2,9 @@
 
 use App\DTOs\PeerInfo;
 use App\Exceptions\ConflictException;
+use App\Exceptions\SystemException;
 use App\Services\KeyManager;
+use Tests\Fakes\CommandFailed;
 use Tests\Support\Rig;
 
 /*
@@ -111,7 +113,7 @@ it('restores a dual-stack link with its IPv6 prefix and peer addresses', functio
     // A server whose link already uses an overlapping prefix can't take it
     $taken = new Rig($to);
     $taken->wg->createLink('wg5', '10.5.0.1/24', 51825, address6: 'fd12::5/64');
-    expect($taken->backup->clashes($payload, 'wg0'))->toBe(['prefix fd12::1/64 overlaps wg5 (fd12::5/64)']);
+    expect($taken->backup->problems($payload, 'wg0'))->toBe(['Prefix fd12::1/64 overlaps link wg5 (fd12::5/64)']);
 })->with(['Linux' => 'linux', 'macOS' => 'mac']);
 
 it('restores peer names, disabled peers and networks behind peers', function (string $to) {
@@ -162,10 +164,109 @@ it('finds clashes with links that stay, not with ones being replaced', function 
     $new = new Rig('linux');
     $new->wg->createLink('wg9', '10.0.0.200/24', 51820); // same port and subnet as the backed-up wg0
 
-    expect($new->backup->clashes($payload, 'wg0'))->toBe(['port 51820 is used by wg9', 'subnet 10.0.0.1/24 overlaps wg9 (10.0.0.200/24)'])
-        ->and($new->backup->clashes($payload, 'wg0', ignore: ['wg9']))->toBe([])
-        ->and($new->backup->clashes($payload, 'wg1'))->toBe([])
+    expect($new->backup->problems($payload, 'wg0'))->toBe(['Port 51820 is already used by link wg9', 'Subnet 10.0.0.1/24 overlaps link wg9 (10.0.0.200/24)'])
+        ->and($new->backup->problems($payload, 'wg0', ignore: ['wg9']))->toBe([])
+        ->and($new->backup->problems($payload, 'wg1'))->toBe([])
         ->and(fn () => $new->backup->restore($payload, ['wg0' => 'restore']))->toThrow(ConflictException::class, 'Port 51820 is already used by link wg9');
+});
+
+it('finds what the restore itself would refuse, networks behind peers included', function () {
+    $old = new Rig('linux');
+    $old->wg->createLink('wg0', '10.0.0.1/24', 51820);
+    $old->wg->addPeer('wg0', networks: '192.168.50.0/24');
+    $payload = $old->backup->create();
+
+    // A link here whose peer routes the backed-up link's subnet
+    $routed = new Rig('linux');
+    $routed->wg->createLink('wgx', '10.5.0.1/24', 51821);
+    $routed->wg->addPeer('wgx', networks: '10.0.0.0/16');
+    expect($routed->backup->problems($payload, 'wg0'))->toBe(['10.0.0.1/24 overlaps 10.0.0.0/16, routed to a peer of link wgx']);
+
+    // A link here in the subnet that a backed-up peer routes
+    $lan = new Rig('linux');
+    $lan->wg->createLink('wgy', '192.168.50.1/24', 51822);
+    expect($lan->backup->problems($payload, 'wg0'))->toBe(['192.168.50.0/24 overlaps 192.168.50.1/24 of link wgy'])
+        ->and(fn () => $lan->backup->restore($payload, ['wg0' => 'restore']))->toThrow(ConflictException::class, 'of link wgy');
+
+    // A name another network interface has, and a config that isn't valid
+    $payload['links']['eth0'] = $payload['links']['wg0'];
+    $payload['links']['bad'] = ['conf' => str_replace('ListenPort = 51820', 'ListenPort = 0', $payload['links']['wg0']['conf']), 'clients' => [], 'up' => false];
+    $empty = new Rig('linux');
+    expect($empty->backup->problems($payload, 'eth0'))->toBe(['A network interface named eth0 already exists'])
+        ->and($empty->backup->problems($payload, 'bad'))->toBe(['Invalid port number: 0'])
+        ->and($empty->backup->problems($payload, 'wg0'))->toBe([]);
+});
+
+it('leaves a link alone when the one to replace it with cannot be restored', function (Closure $obstacle, string $exception) {
+    [$old] = backedUpServer('linux');
+    $payload = $old->backup->create();
+    $new = new Rig('linux');
+    $mine = $new->wg->createLink('wg0', '10.9.0.1/24', 51820, forward: true);
+    $peer = $new->wg->addPeer('wg0');
+    $obstacle($new);
+
+    expect(fn () => $new->backup->restore($payload, ['wg0' => 'replace']))->toThrow($exception);
+
+    expect($new->wg->getLink('wg0'))->public_key->toBe($mine->public_key)->up->toBeTrue()
+        ->and($new->host->runtimePeers('wg0'))->toBe([$peer->public_key => '10.9.0.2/32'])
+        ->and($new->wg->getPeerConfig('wg0', $peer->public_key))->toBe($peer->client_config)
+        ->and($new->host->firewall['wg0'])->toBe(['forward' => true, 'nat' => false]);
+})->with([
+    'a clash with another link' => [function (Rig $rig) {
+        $rig->wg->createLink('wgx', '10.5.0.1/24', 51821);
+        $rig->wg->addPeer('wgx', networks: '10.0.0.0/16'); // the backed-up wg0 is 10.0.0.1/24
+    }, ConflictException::class],
+    'a config the helper refuses' => [function (Rig $rig) {
+        $rig->shell->on('sudo -n :helper conf-write :name', fn () => throw new CommandFailed('wgla-helper: not allowed in a link config'));
+    }, SystemException::class],
+]);
+
+it('keeps a restored link that does not start, stopped', function (string $os, bool $replace) {
+    [$old, $peers] = backedUpServer($os);
+    $payload = $old->backup->create();
+    $new = new Rig($os, hostname: 'new.example.test');
+    if ($replace) {
+        $new->wg->createLink('wg0', '10.9.0.1/24', 51820);
+        $new->wg->addPeer('wg0');
+    }
+    // The restored link's own start, not the stop of the one it replaces
+    $new->host->failNextStart = true;
+
+    $report = $new->backup->restore($payload, ['wg0' => $replace ? 'replace' : 'restore']);
+
+    $link = $new->wg->getLink('wg0');
+    expect($report['restored'])->toBe(['wg0'])
+        ->and($report['not_started'])->toBe(['wg0' => 'wg-quick: failed to start wg0'])
+        // What was restored is not thrown away: the keys, the peers, their client configs
+        ->and($link->public_key)->toBe($old->wg->getLink('wg0')->public_key)
+        ->and($link->up)->toBeFalse()
+        ->and(array_keys($new->host->confPeers('wg0')))->toBe([$peers['plain']->public_key, $peers['custom']->public_key])
+        ->and($new->wg->getPeerConfig('wg0', $peers['plain']->public_key))->toContain('Endpoint = new.example.test:51820')
+        ->and($new->host->clients)->toHaveCount(2, 'The replaced link\'s client configs are gone')
+        // Down for good, until the admin starts it
+        ->and($new->host->interfaces)->toBe([])
+        ->and($new->host->enabledUnits)->toBe([])
+        ->and($new->host->firewall)->toBe([]);
+
+    expect($new->wg->updateLink('wg0', ['up' => true])->up)->toBeTrue();
+})->with('os')->with(['a new link' => false, 'in place of an existing one' => true]);
+
+it('backs up a hand-written config but does not restore it', function () {
+    $rig = new Rig('linux');
+    $rig->wg->createLink('wg0', '10.0.0.1/24', 51820);
+    $rig->host->confs['office'] = handWrittenConf();
+
+    $payload = $rig->backup->create();
+
+    expect($rig->backup->links($payload)['office']['unmanaged'])->toBe(['MTU', 'PostUp', 'comments', 'Endpoint', 'PersistentKeepalive'])
+        ->and($rig->backup->links($payload)['wg0']['unmanaged'])->toBe([]);
+
+    // Rebuilding it for another server would drop those settings
+    $new = new Rig('linux');
+    expect($new->backup->problems($payload, 'office'))->toHaveCount(1)
+        ->and($new->backup->problems($payload, 'office')[0])->toContain("has settings this app doesn't manage (MTU, PostUp, comments, Endpoint, PersistentKeepalive)")
+        ->and(fn () => $new->backup->restore($payload, ['office' => 'restore']))->toThrow(ConflictException::class, "doesn't manage")
+        ->and($new->host->files())->toBe([]);
 });
 
 it('never restores over an existing link by itself', function () {

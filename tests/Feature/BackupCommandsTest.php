@@ -107,3 +107,57 @@ it('says so when the passphrase is wrong', function () {
         ->expectsOutputToContain('Wrong passphrase, or the backup file is damaged.')
         ->assertFailed();
 });
+
+it('keeps a restored link that does not start, and says how to start it', function () {
+    $file = "{$this->dir}/server.backup";
+    $this->artisan('wg:backup', ['file' => $file, '--passphrase-file' => "{$this->dir}/pass"])->assertSuccessful();
+    $key = $this->wg->getLink('wg0')->public_key;
+    $this->host->failNextStart = true;
+
+    $this->artisan('wg:restore', ['file' => $file, '--passphrase-file' => "{$this->dir}/pass", '--existing' => 'replace', '--yes' => true, '--no-interaction' => true])
+        ->expectsOutputToContain('Restored wg0 (1 client config(s))')
+        ->expectsOutputToContain('wg0 was restored but did not start: wg-quick: failed to start wg0')
+        ->expectsOutputToContain('wgla link:update wg0 --up=true')
+        ->assertFailed();
+
+    expect($this->wg->getLink('wg0'))->public_key->toBe($key)->up->toBeFalse()
+        ->and($this->wg->getPeerConfig('wg0', $this->peer->public_key))->toBe($this->peer->client_config);
+});
+
+it('skips a link that cannot be restored here, and one that then clashes with it', function () {
+    // wg1 routes a network behind a peer; wg2 is a hand-written config
+    $this->wg->createLink('wg1', '10.1.0.1/24', 51821);
+    $this->wg->addPeer('wg1', networks: '192.168.60.0/24');
+    $this->host->confs['wg2'] = handWrittenConf();
+    $file = "{$this->dir}/server.backup";
+    $this->artisan('wg:backup', ['file' => $file, '--passphrase-file' => "{$this->dir}/pass"])
+        ->expectsOutputToContain("wg2 has settings this app doesn't manage (MTU, PostUp, comments, Endpoint, PersistentKeepalive). It is in the backup, but a restore will skip it")
+        ->assertSuccessful();
+
+    // Here now: only a link in the network that the backed-up wg1 routes
+    foreach (['wg0', 'wg1', 'wg2'] as $link) {
+        $this->wg->deleteLink($link);
+    }
+    $this->wg->createLink('lan', '192.168.60.1/24', 51900);
+
+    $this->artisan('wg:restore', ['file' => $file, '--passphrase-file' => "{$this->dir}/pass", '--existing' => 'skip', '--yes' => true, '--no-interaction' => true])
+        ->expectsOutputToContain('Restored wg0')
+        ->expectsOutputToContain('Skipped: wg1, wg2')
+        ->assertSuccessful();
+
+    expect($this->wg->listLinks())->toBe(['lan', 'wg0']);
+});
+
+it('restores nothing when a link cannot be restored and nobody said to skip it', function () {
+    $this->host->confs['wg2'] = handWrittenConf();
+    $file = "{$this->dir}/server.backup";
+    $this->artisan('wg:backup', ['file' => $file, '--passphrase-file' => "{$this->dir}/pass"])->assertSuccessful();
+    $this->wg->deleteLink('wg0');
+    $this->wg->deleteLink('wg2');
+
+    $this->artisan('wg:restore', ['file' => $file, '--passphrase-file' => "{$this->dir}/pass", '--yes' => true, '--no-interaction' => true])
+        ->expectsOutputToContain('or take them out first. Nothing was restored.')
+        ->assertFailed();
+
+    expect($this->wg->listLinks())->toBe([]);
+});

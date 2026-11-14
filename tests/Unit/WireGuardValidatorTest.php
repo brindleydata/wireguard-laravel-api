@@ -105,3 +105,32 @@ it('takes networks behind a peer as network addresses', function () {
 it('rejects networks that would hijack the server', function (string $networks) {
     expect(fn () => (new WireGuardValidator)->networks($networks))->toThrow(InvalidArgumentException::class);
 })->with(['0.0.0.0/0', '::/0', '127.0.0.0/8', '169.254.0.0/16', 'fe80::/64', '224.0.0.0/8', '192.168.1.0/33', '']);
+
+it('hands lists on the way they are written into configs', function () {
+    $validator = new WireGuardValidator;
+
+    // However they were typed: the root helper takes "a, b" and nothing else
+    expect($validator->validateDns(' 1.1.1.1 ,  8.8.8.8,corp.example.com'))->toBe('1.1.1.1, 8.8.8.8, corp.example.com')
+        ->and($validator->validateAllowedIps('10.0.0.0/8 ,192.168.0.0/16,  ::/0'))->toBe('10.0.0.0/8, 192.168.0.0/16, ::/0');
+});
+
+it('takes a link address as a host in a subnet of its own', function (string $given, string $address) {
+    expect((new WireGuardValidator)->linkAddress($given))->toBe($address);
+})->with([
+    ['10.0.0.1/24', '10.0.0.1/24'],
+    'a mask with a leading zero' => ['10.0.0.1/08', '10.0.0.1/8'],
+    'a point-to-point /31' => ['10.0.0.0/31', '10.0.0.0/31'],
+    'a single address' => ['10.0.0.1/32', '10.0.0.1/32'],
+]);
+
+it('rejects link addresses that would break routing', function (string $address, string $error) {
+    expect(fn () => (new WireGuardValidator)->linkAddress($address))->toThrow(InvalidArgumentException::class, $error);
+})->with([
+    'every address' => ['10.0.0.1/0', 'covers every address'],
+    'the network address' => ['10.0.0.0/24', 'network or broadcast address'],
+    'the broadcast address' => ['10.0.0.255/24', 'network or broadcast address'],
+    'the broadcast address of a /30' => ['10.0.0.3/30', 'network or broadcast address'],
+    'no mask' => ['10.0.0.1', 'Invalid CIDR'],
+    'IPv6' => ['fd12::1/64', 'Invalid CIDR'],
+    'an octet with a leading zero' => ['10.0.0.01/24', 'Invalid IPv4 address'],
+]);

@@ -68,7 +68,7 @@ wgla status                              version, system, root helper
 wgla links                               link names
 wgla link wg0                            a link and its peers
 wgla link:create wg0 10.0.0.1/24 --address6=auto --forward=true --nat=true
-wgla link:update wg0 --port=51821 --up=false     (--address6=none: IPv4 only)
+wgla link:update wg0 --port=51821 --up=false     (--address6=none: IPv4 only; --dns="": the default again)
 wgla link:delete wg0
 wgla link:peers wg0                      peers: names, state, live stats
 wgla peer:create wg0 --name=laptop --qr  the new client config, also as a QR code
@@ -91,11 +91,11 @@ Every route except `GET /health` needs the `api-key` header. `{pubkey}` is the p
 | `GET /links` | Link names |
 | `POST /link` | `name`, `ip` (CIDR), and optionally `address6`, `port`, `ifout`, `dns`, `keepalive`, `allowed_ips`, `forward`, `nat`, `up` |
 | `GET /link/{name}` | The link and its peers |
-| `PATCH /link/{name}` | Any of the above, with `address` instead of `ip` |
+| `PATCH /link/{name}` | Any of the above, with `address` instead of `ip`. `null` removes `address6`, and takes the link's own `dns`, `keepalive` or `allowed_ips` out, back to the default |
 | `DELETE /link/{name}` | |
 | `GET /link/{link}/peers` | Peers with `name`, `enabled`, `networks` and live stats: `endpoint`, `latest_handshake_at`, `connected` (a handshake within 3 minutes), `transfer_rx`, `transfer_tx`. The stats are `null` while the peer isn't on the interface |
 | `POST /link/{link}/peers` | Optionally `ip`, `name`, `networks`. Returns the keys and the client config |
-| `PATCH /link/{link}/peer/{pubkey}` | `ip`, `name`, `enabled`, `networks`, and the client config's `dns` and `allowed_ips`. `null` removes a name or networks |
+| `PATCH /link/{link}/peer/{pubkey}` | `ip`, `name`, `enabled`, `networks`, and the client config's `dns` and `allowed_ips`. `null` removes a name or networks, and takes the peer's own `dns` or `allowed_ips` out, back to the link's |
 | `DELETE /link/{link}/peer/{pubkey}` | |
 | `GET /link/{link}/peer/{pubkey}/config` | The client config |
 | `GET /link/{link}/peer/{pubkey}/qr` | The client config as a QR code (`image/svg+xml`), for the WireGuard apps |
@@ -104,12 +104,14 @@ Errors are `{"error": "…"}`: `403` (API key), `404`, `409` (port, subnet or na
 
 ### Links and peers
 
-- **Addresses.** A link has an IPv4 subnet and optionally an IPv6 prefix: `address6` is an address such as `fd12:3456:789a::1/64`, `auto` for a random private /64, or `null` to remove it. A peer gets the next free IPv4 address unless you give one, and the same host number in the prefix (`10.0.0.5` → `fd12:3456:789a::5`). Moving a peer or the link moves both.
+- **Addresses.** A link has an IPv4 subnet and optionally an IPv6 prefix: its address is a host in the subnet (not the network or broadcast address, and never a `/0`), and `address6` is an address such as `fd12:3456:789a::1/64`, `auto` for a random private /64, or `null` to remove it. A peer gets the next free IPv4 address unless you give one, and the same host number in the prefix (`10.0.0.5` → `fd12:3456:789a::5`). Moving a peer or the link moves both.
 - **Peers** can have a `name`, a label of up to 64 characters. Names don't have to be unique, and peers are still addressed by public key. A disabled peer (`enabled: false`) is off the interface but keeps its keys, address and client config. In the link config it's a commented-out `[Peer]` section.
 - **Networks behind a peer** (`networks`, site-to-site), such as a branch office LAN, are routed to that peer. They can't overlap the link's addresses, other peers or other links, and a default route is refused. The peer's client config needs `allowed_ips` for whatever it should reach, and the link needs `forward` for traffic between networks. Changing a peer's networks restarts a running link, because wg-quick sets up the routes. Peers reconnect by themselves when they next send traffic or a keepalive.
 - **No clashes.** Links can't share a listen port, overlap subnets or prefixes, or take the name of an existing interface. Without `port`, a free random one is picked.
 - **Forwarding and NAT** are per link and cover both families. On Linux each link has an nftables table, `inet wg_<link>`, and NAT only masquerades the link's own subnet and prefix. On macOS each link has a pf anchor, `wg/<link>`. Where Docker or ufw drop forwarded traffic, the helper adds tagged accepts to iptables and ip6tables. firewalld isn't handled.
 - **Client configs** are stored, and re-rendered when the link's port, addresses or client defaults change. A peer's own `dns` and `allowed_ips` are kept. Clients of a dual-stack link also route `::/0` by default.
+- **A change the link doesn't start with is undone.** A new port or address, or networks behind a peer, restart a running link. If it then doesn't come up (the port is taken, wg-quick can't add a route), the previous config goes back, the link runs again as it did, and the request fails with the reason.
+- **Configs written by hand.** Any config in the WireGuard directory is listed and shown, and can be deleted. One that only uses what the app writes too is managed like the app's own. One with more (`MTU`, `Table`, hooks of its own, a peer's `Endpoint`, comments) is never changed, because the app regenerates configs whole and would drop those: changes answer `409` and name what is in the way.
 - The server's private key is never returned.
 
 ## Backup and restore
@@ -119,7 +121,7 @@ wgla backup [file|-]
 wgla restore <file|->
 ```
 
-A backup holds every link with its keys and client configs, encrypted with your passphrase (Argon2id + libsodium). Pass the passphrase with `--passphrase-file=` or `WGLA_BACKUP_PASSPHRASE`, or type it when asked. A restore checks everything before it changes anything. An existing link is skipped or replaced (asked, or `--existing=skip|replace`), and a clashing one can only be skipped. Links are rebuilt for the new server (its OS, outbound interface and hostname) and start again if they were running. Backups are CLI only.
+A backup holds every link with its keys and client configs, encrypted with your passphrase (Argon2id + libsodium). Pass the passphrase with `--passphrase-file=` or `WGLA_BACKUP_PASSPHRASE`, or type it when asked. A restore checks everything before it changes anything. An existing link is skipped or replaced (asked, or `--existing=skip|replace`), and a link that can't be restored here can only be skipped: one that clashes with a link that stays, or a config written by hand with settings the app doesn't manage (`wgla backup` says so when it backs one up). A replaced link is only touched once the new config has passed every check. Links are rebuilt for the new server (its OS, outbound interface and hostname) and start again if they were running. One that doesn't start stays, stopped, with its keys and client configs, and the restore says why. Backups are CLI only.
 
 ## Security
 

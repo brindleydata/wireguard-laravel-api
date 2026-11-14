@@ -53,7 +53,10 @@ class WireGuardValidator
         }
     }
 
-    public function validateCidr(string $cidr): void
+    /**
+     * An IPv4 address with its mask. Returns it with the mask as a plain number (/08 → /8).
+     */
+    public function validateCidr(string $cidr): string
     {
         if (! preg_match('#^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$#', $cidr)) {
             throw new InvalidArgumentException("Invalid CIDR notation: {$cidr}");
@@ -65,6 +68,33 @@ class WireGuardValidator
         if ((int) $mask < 0 || (int) $mask > 32) {
             throw new InvalidArgumentException("Invalid CIDR mask: {$mask}");
         }
+
+        return $ip.'/'.(int) $mask;
+    }
+
+    /**
+     * A new address for a link (10.0.0.1/24), returned like validateCidr() does. It must be a
+     * host inside a subnet of its own: a /0 would route everything into the tunnel, and an
+     * interface can't have its subnet's network or broadcast address.
+     */
+    public function linkAddress(string $cidr): string
+    {
+        $cidr = $this->validateCidr($cidr);
+        [$ip, $mask] = explode('/', $cidr, 2);
+        $mask = (int) $mask;
+
+        if ($mask === 0) {
+            throw new InvalidArgumentException("{$cidr} covers every address; a link needs a subnet of its own (e.g. {$ip}/24).");
+        }
+        if ($mask <= 30) {
+            $network = ip2long($ip) & ((-1 << (32 - $mask)) & 0xFFFFFFFF);
+            $broadcast = $network | ((1 << (32 - $mask)) - 1);
+            if (in_array(ip2long($ip), [$network, $broadcast], true)) {
+                throw new InvalidArgumentException("{$ip} is the network or broadcast address of {$cidr}; give the link a host address in it (e.g. ".long2ip($network + 1)."/{$mask}).");
+            }
+        }
+
+        return $cidr;
     }
 
     /**
@@ -156,22 +186,26 @@ class WireGuardValidator
 
     /**
      * Comma-separated DNS servers and search domains, as the wg-quick DNS key takes them.
+     * Returns the list as it is written into configs: `a, b` (which is all the root helper takes).
      */
-    public function validateDns(string $dns): void
+    public function validateDns(string $dns): string
     {
-        foreach ($this->entries($dns) as $entry) {
+        foreach ($entries = $this->entries($dns) as $entry) {
             if (! filter_var($entry, FILTER_VALIDATE_IP) && ! $this->isHostname($entry)) {
                 throw new InvalidArgumentException("Invalid DNS server or search domain: {$entry}");
             }
         }
+
+        return implode(', ', $entries);
     }
 
     /**
-     * Comma-separated IPv4/IPv6 addresses or CIDRs, as in an AllowedIPs line.
+     * Comma-separated IPv4/IPv6 addresses or CIDRs, as in an AllowedIPs line. Returns the list
+     * as it is written into configs: `a, b`.
      */
-    public function validateAllowedIps(string $allowed_ips): void
+    public function validateAllowedIps(string $allowed_ips): string
     {
-        foreach ($this->entries($allowed_ips) as $entry) {
+        foreach ($entries = $this->entries($allowed_ips) as $entry) {
             [$ip, $mask] = array_pad(explode('/', $entry, 2), 2, null);
 
             $max = match (true) {
@@ -184,6 +218,8 @@ class WireGuardValidator
                 throw new InvalidArgumentException("Invalid allowed IP or CIDR: {$entry}");
             }
         }
+
+        return implode(', ', $entries);
     }
 
     /**

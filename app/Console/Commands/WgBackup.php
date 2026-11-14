@@ -44,6 +44,7 @@ class WgBackup extends WgCommand
 
         if ($file === '-') {
             fwrite(STDOUT, $document);
+            $this->warnAboutUnmanaged($backup->links($payload), fn (string $warning) => fwrite(STDERR, $warning."\n"));
 
             return Command::SUCCESS;
         }
@@ -63,8 +64,28 @@ class WgBackup extends WgCommand
 
         $clients = array_sum(array_map(fn (array $link) => count($link['clients']), $payload['links']));
         $this->info(sprintf('Backed up %d link(s) and %d client config(s) to %s', count($payload['links']), $clients, $file));
+        $this->warnAboutUnmanaged($backup->links($payload), fn (string $warning) => $this->warn($warning));
         $this->line('Keep the passphrase safe: without it the backup cannot be restored.');
 
         return Command::SUCCESS;
+    }
+
+    /**
+     * A restore rebuilds every config, so it can't take a hand-written one with settings the app
+     * doesn't write.
+     *
+     * @param  array<string, array{unmanaged: list<string>}>  $links
+     * @param  callable(string): mixed  $warn  stdout may be the backup itself
+     */
+    protected function warnAboutUnmanaged(array $links, callable $warn): void
+    {
+        foreach ($links as $name => $link) {
+            if ($link['unmanaged'] !== []) {
+                $warn(sprintf(
+                    "%s has settings this app doesn't manage (%s). It is in the backup, but a restore will skip it: keep a copy of its config file too.",
+                    $name, implode(', ', $link['unmanaged']),
+                ));
+            }
+        }
     }
 }

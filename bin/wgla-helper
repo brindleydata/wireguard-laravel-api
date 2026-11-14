@@ -15,11 +15,13 @@ set -euo pipefail
 umask 077
 IFS=$' \t\n'
 
-VERSION=4
+VERSION=5
 SELF=$0
 MAX_SIZE=1048576
 
 die() { echo "wgla-helper: $*" >&2; exit 1; }
+# A config that isn't there is exit status 3, so the app can tell "no such link" from a failure
+missing() { echo "wgla-helper: $*" >&2; exit 3; }
 
 # ─── Environment ─────────────────────────────────────────────────────────────
 
@@ -56,7 +58,9 @@ re_name='^[a-zA-Z][a-zA-Z0-9_-]{0,14}$'
 re_ifname='^[A-Za-z0-9_.-]{1,15}$'
 re_key='^[A-Za-z0-9+/]{42}[AEIMQUYcgkosw048]=$'
 re_safe_key='^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$'
-re_cidr4='^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})/([0-9]{1,2})$'
+# No leading zeros: "08" would pass a numeric test, but $(( )) reads it as (invalid) octal
+re_octet='(0|[1-9][0-9]{0,2})'
+re_cidr4="^$re_octet\\.$re_octet\\.$re_octet\\.$re_octet/(0|[1-9][0-9]?)\$"
 re_cidr6='^[0-9a-fA-F:]{2,39}/([0-9]{1,3})$'
 re_ips='^[0-9A-Fa-f.:/]+(, ?[0-9A-Fa-f.:/]+)*$'
 re_dns='^[A-Za-z0-9.:-]+(, ?[A-Za-z0-9.:-]+)*$'
@@ -378,7 +382,7 @@ case "$command" in
     conf-read)
         args 1 $# "$command"; name_arg "$1"
         file=$(conf_file "$1")
-        [ -f "$file" ] || die "no config for link $1"
+        [ -f "$file" ] || missing "no config for link $1"
         cat "$file"
         ;;
     conf-write)
@@ -394,7 +398,7 @@ case "$command" in
     client-read)
         args 2 $# "$command"; name_arg "$1"; safe_key_arg "$2"
         file=$(client_file "$1" "$2")
-        [ -f "$file" ] || die "no client config $2 for link $1"
+        [ -f "$file" ] || missing "no client config $2 for link $1"
         cat "$file"
         ;;
     client-write)

@@ -29,7 +29,7 @@ class WgLinkCreate extends WgCommand
         $port = $this->option('port') !== null ? (int) $this->option('port') : null;
         $ifout = $this->option('ifout');
         $dns = $this->option('dns');
-        $keepalive = $this->option('keepalive') !== null ? (int) $this->option('keepalive') : null;
+        $keepalive = in_array($this->option('keepalive'), [null, ''], true) ? null : (int) $this->option('keepalive');
         $allowed_ips = $this->option('allowed-ips');
         $forward = $this->option('forward') !== null && filter_var($this->option('forward'), FILTER_VALIDATE_BOOLEAN);
         $nat = $this->option('nat') !== null && filter_var($this->option('nat'), FILTER_VALIDATE_BOOLEAN);

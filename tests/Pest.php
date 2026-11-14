@@ -1,5 +1,6 @@
 <?php
 
+use App\Services\KeyManager;
 use Symfony\Component\Process\Process;
 use Tests\TestCase;
 
@@ -25,6 +26,31 @@ function helperVersion(): string
     preg_match('/^VERSION=(\S+)$/m', (string) file_get_contents(__DIR__.'/../bin/wgla-helper'), $match);
 
     return $match[1];
+}
+
+/**
+ * A wg-quick config written by hand, with what the app doesn't write: an MTU, a hook of its
+ * own, a comment, and a peer the server dials.
+ */
+function handWrittenConf(): string
+{
+    $keys = new KeyManager;
+
+    return implode("\n", [
+        '[Interface]',
+        'Address = 10.7.0.1/24',
+        'PrivateKey = '.$keys->genkey(),
+        'ListenPort = 51900',
+        'MTU = 1380',
+        'PostUp = /usr/local/bin/my-routes up',
+        '',
+        '[Peer]',
+        '# branch office',
+        'PublicKey = '.$keys->pubkey($keys->genkey()),
+        'AllowedIPs = 10.7.0.2/32, 192.168.9.0/24',
+        'Endpoint = branch.example.com:51820',
+        'PersistentKeepalive = 25',
+    ]);
 }
 
 /*

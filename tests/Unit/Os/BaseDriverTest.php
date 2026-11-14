@@ -45,14 +45,32 @@ it('hands config contents to the helper on stdin', function () {
 });
 
 it('reads a missing config as null', function () {
-    $shell = (new FakeShell)->otherwise(fn () => throw new CommandFailed('wgla-helper: no config for link wg0'));
+    // Exit status 3 is the helper's "not there"
+    $shell = (new FakeShell)->otherwise(fn () => throw new CommandFailed('wgla-helper: no config for link wg0', exitCode: 3));
     $driver = helperDriver($shell);
 
     expect($driver->readConfig('wg0'))->toBeNull()
         ->and($driver->configExists('wg0'))->toBeFalse()
         ->and($driver->parseConfig('wg0'))->toBeNull()
-        ->and($driver->readClientConfig('wg0', 'abc'))->toBeNull()
-        ->and($driver->listConfigNames())->toBe([])
+        ->and($driver->readClientConfig('wg0', 'abc'))->toBeNull();
+});
+
+it('never reads a failure as "nothing there"', function (Closure $read) {
+    // e.g. a broken sudo rule: an empty answer would make links look deleted or stopped
+    $shell = (new FakeShell)->otherwise(fn () => throw new CommandFailed('sudo: a password is required', exitCode: 1));
+
+    expect(fn () => $read(helperDriver($shell)))->toThrow(CommandFailed::class, 'a password is required');
+})->with([
+    'a link config' => [fn (LinuxDriver $driver) => $driver->readConfig('wg0')],
+    'a client config' => [fn (LinuxDriver $driver) => $driver->readClientConfig('wg0', 'abc')],
+    'the link list' => [fn (LinuxDriver $driver) => $driver->listConfigNames()],
+    'the running interfaces' => [fn (LinuxDriver $driver) => $driver->runningInterfaces()],
+]);
+
+it('reads no configs and no running interfaces as empty lists', function () {
+    $driver = helperDriver((new FakeShell)->otherwise(fn () => ''));
+
+    expect($driver->listConfigNames())->toBe([])
         ->and($driver->runningInterfaces())->toBe([]);
 });
 

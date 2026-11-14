@@ -151,7 +151,7 @@ class FakeHost
 
         // Link configs
         $helper('conf-list', fn () => implode("\n", array_keys($this->confs)));
-        $helper('conf-read :name', fn (array $b) => $this->confs[$b['name']] ?? $this->fail("no config for link {$b['name']}"));
+        $helper('conf-read :name', fn (array $b) => $this->confs[$b['name']] ?? $this->missing("no config for link {$b['name']}"));
         $helper('conf-write :name', function (array $b, ?string $input) {
             $this->confs[$b['name']] = (string) $input;
 
@@ -164,7 +164,7 @@ class FakeHost
         });
 
         // Client configs
-        $helper('client-read :link :key', fn (array $b) => $this->clients["{$b['link']}/{$b['key']}"] ?? $this->fail('no client config'));
+        $helper('client-read :link :key', fn (array $b) => $this->clients["{$b['link']}/{$b['key']}"] ?? $this->missing('no client config'));
         $helper('client-write :link :key', function (array $b, ?string $input) {
             $this->clients["{$b['link']}/{$b['key']}"] = (string) $input;
 
@@ -425,6 +425,12 @@ class FakeHost
 
     protected function fail(string $message = 'command failed'): never
     {
-        throw new CommandFailed($message);
+        throw new CommandFailed($message, exitCode: 1);
+    }
+
+    /** The helper's "no such config" (exit status 3), which the app reads as null. */
+    protected function missing(string $message): never
+    {
+        throw new CommandFailed($message, exitCode: 3);
     }
 }

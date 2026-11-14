@@ -108,7 +108,7 @@ class Backup
     /**
      * What's in a backup, per link.
      *
-     * @return array<string, array{port: int, address: string, address6: ?string, up: bool, peers: int, clients: int}>
+     * @return array<string, array{port: int, address: string, address6: ?string, up: bool, peers: int, clients: int, unmanaged: list<string>}>
      */
     public function links(array $payload): array
     {
@@ -122,6 +122,8 @@ class Backup
                 'up' => (bool) ($link['up'] ?? false),
                 'peers' => count($parsed['peers']),
                 'clients' => count($link['clients']),
+                // Settings of a hand-written config the app doesn't manage (absent in older backups)
+                'unmanaged' => array_values(array_filter((array) ($link['unmanaged'] ?? []), 'is_string')),
             ];
         }
 
@@ -129,28 +131,29 @@ class Backup
     }
 
     /**
-     * Why a backed-up link can't be restored next to the links already here (empty: it can).
+     * Why a backed-up link can't be restored here (empty: it can): its config is invalid or
+     * hand-written with settings the app doesn't manage, or it clashes with the links that stay.
+     * The restore itself checks the same things.
      *
      * @param  list<string>  $ignore  links that will be replaced
      * @return list<string>
      */
-    public function clashes(array $payload, string $name, array $ignore = []): array
+    public function problems(array $payload, string $name, array $ignore = []): array
     {
-        $link = $this->links($payload)[$name];
-
-        return $this->wg->findClashes($name, $link['port'], $link['address'], $ignore, $link['address6']);
+        return $this->wg->restoreProblems($name, $payload['links'][$name]['conf'], $ignore);
     }
 
     /**
-     * Restore the chosen links: 'restore' (new here), 'replace' (delete the existing one first)
-     * or 'skip'.
+     * Restore the chosen links: 'restore' (new here), 'replace' (in place of the existing one)
+     * or 'skip'. A link that is restored but then doesn't start stays, stopped, and is listed
+     * under `not_started` with the error.
      *
      * @param  array<string, string>  $choices
-     * @return array{restored: list<string>, skipped: list<string>, ifout: array<string, array{0: ?string, 1: string}>, clients: int, hostname: ?string, hostname_changed: bool}
+     * @return array{restored: list<string>, skipped: list<string>, ifout: array<string, array{0: ?string, 1: string}>, not_started: array<string, string>, clients: int, hostname: ?string, hostname_changed: bool}
      */
     public function restore(array $payload, array $choices): array
     {
-        $report = ['restored' => [], 'skipped' => [], 'ifout' => [], 'clients' => 0];
+        $report = ['restored' => [], 'skipped' => [], 'ifout' => [], 'not_started' => [], 'clients' => 0];
 
         foreach ($payload['links'] as $name => $link) {
             $choice = $choices[$name] ?? 'skip';
@@ -159,15 +162,15 @@ class Backup
 
                 continue;
             }
-            if ($choice === 'replace') {
-                $this->wg->deleteLink($name);
-            }
 
-            $result = $this->wg->restoreLink($name, $link['conf'], $link['clients'], (bool) ($link['up'] ?? false));
+            $result = $this->wg->restoreLink($name, $link['conf'], $link['clients'], (bool) ($link['up'] ?? false), replace: $choice === 'replace');
             $report['restored'][] = $name;
             $report['clients'] += $result['clients'];
             if ($result['ifout'] !== null) {
                 $report['ifout'][$name] = $result['ifout'];
+            }
+            if ($result['start_error'] !== null) {
+                $report['not_started'][$name] = $result['start_error'];
             }
         }
 

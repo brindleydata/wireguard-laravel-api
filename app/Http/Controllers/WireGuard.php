@@ -98,19 +98,21 @@ class WireGuard extends Controller
             'address6' => 'nullable|string',  // IPv6 address and prefix, or "auto"; null removes it
             'port' => 'nullable|integer|min:1|max:65535',
             'ifout' => 'nullable|string|max:15',
-            'dns' => 'nullable|string',
-            'keepalive' => 'nullable|integer|min:0|max:65535',
+            'dns' => 'nullable|string',                         // the link's client defaults:
+            'keepalive' => 'nullable|integer|min:0|max:65535',  // null goes back to the global one
             'allowed_ips' => 'nullable|string',
             'forward' => 'nullable|boolean',
             'nat' => 'nullable|boolean',
             'up' => 'nullable|boolean',
         ]);
 
-        // Filter out null values so only explicitly provided fields are passed; a null address6
-        // is explicit too: it makes the link IPv4 only
+        // Only the fields that were sent. For most a null says nothing; for these it is a value:
+        // no IPv6 address, or the global default instead of the link's own
         $params = array_filter($data, fn ($v) => $v !== null);
-        if ($request->exists('address6')) {
-            $params['address6'] = $data['address6'] ?? null;
+        foreach (['address6', 'dns', 'keepalive', 'allowed_ips'] as $field) {
+            if ($request->exists($field)) {
+                $params[$field] = $data[$field] ?? null;
+            }
         }
 
         $link = $this->wg->updateLink($name, $params);
@@ -154,15 +156,15 @@ class WireGuard extends Controller
     {
         $data = $request->validate([
             'ip' => 'nullable|string',          // tunnel address (server AllowedIPs + client Address)
-            'dns' => 'nullable|string',         // client config DNS
-            'allowed_ips' => 'nullable|string', // client config AllowedIPs (routes)
+            'dns' => 'nullable|string',         // client config DNS; null: the link's default
+            'allowed_ips' => 'nullable|string', // client config AllowedIPs (routes); null: the link's default
             'name' => 'nullable|string',        // a label; null removes it
             'enabled' => 'nullable|boolean',    // false takes the peer off the interface
             'networks' => 'nullable|string',    // networks behind the peer; null removes them
         ]);
 
         $params = array_filter($data, fn ($v) => $v !== null);
-        foreach (['name', 'networks'] as $field) {
+        foreach (['name', 'networks', 'dns', 'allowed_ips'] as $field) {
             if ($request->exists($field)) {
                 $params[$field] = $data[$field] ?? null;
             }

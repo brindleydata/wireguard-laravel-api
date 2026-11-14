@@ -25,6 +25,12 @@ class KeyManager
         return base64_encode(\sodium_crypto_scalarmult_base(base64_decode($privkey)));
     }
 
+    /** A WireGuard key as `wg` prints it: 32 bytes in base64. */
+    public static function isKey(string $key): bool
+    {
+        return preg_match('#^[A-Za-z0-9+/]{42}[AEIMQUYcgkosw048]=$#', $key) === 1;
+    }
+
     public static function pubkeyToSafe(string $pubkey): string
     {
         return rtrim(strtr($pubkey, '+/', '-_'), '=');

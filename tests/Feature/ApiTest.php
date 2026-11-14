@@ -4,6 +4,7 @@ use App\Services\KeyManager;
 use App\Services\Server;
 use App\Services\Shell;
 use Illuminate\Support\Env;
+use Tests\Fakes\CommandFailed;
 use Tests\Fakes\FakeHost;
 use Tests\Fakes\FakeShell;
 
@@ -158,6 +159,54 @@ it('names, disables and routes networks to peers', function () {
     $this->deleteJson('/link/wg0', [], $this->auth)->assertOk();
 });
 
+it('takes a link\'s or peer\'s own client setting out with null', function () {
+    $this->postJson('/link', ['name' => 'wg0', 'ip' => '10.0.0.1/24', 'port' => 51820, 'dns' => '9.9.9.9 ,1.1.1.1', 'keepalive' => 15], $this->auth)->assertCreated();
+    $safe = KeyManager::pubkeyToSafe($this->postJson('/link/wg0/peers', [], $this->auth)->json('public_key'));
+    $config = fn () => $this->getJson("/link/wg0/peer/{$safe}/config", $this->auth)->json('config');
+    expect($config())->toContain("DNS = 9.9.9.9, 1.1.1.1\n", 'PersistentKeepalive = 15');
+
+    // Leaving a field out keeps it; null goes back to the default
+    $this->patchJson('/link/wg0', ['forward' => true], $this->auth)->assertOk();
+    expect($config())->toContain("DNS = 9.9.9.9, 1.1.1.1\n");
+    $this->patchJson('/link/wg0', ['dns' => null, 'keepalive' => null], $this->auth)->assertOk();
+    expect($config())->toContain("DNS = 8.8.8.8\n", 'PersistentKeepalive = 25');
+
+    $this->patchJson("/link/wg0/peer/{$safe}", ['dns' => '1.1.1.1', 'allowed_ips' => '10.0.0.0/24'], $this->auth)->assertOk();
+    $this->patchJson("/link/wg0/peer/{$safe}", ['name' => 'laptop'], $this->auth)->assertOk();
+    expect($config())->toContain("DNS = 1.1.1.1\n", "AllowedIPs = 10.0.0.0/24\n");
+    $this->patchJson("/link/wg0/peer/{$safe}", ['dns' => null, 'allowed_ips' => null], $this->auth)
+        ->assertOk()
+        ->assertJsonPath('name', 'laptop');
+    expect($config())->toContain("DNS = 8.8.8.8\n", "AllowedIPs = 0.0.0.0/0\n");
+
+    $this->deleteJson('/link/wg0', [], $this->auth)->assertOk();
+});
+
+it('answers 500, not "no links", when the host cannot be asked', function () {
+    $this->postJson('/link', ['name' => 'wg0', 'ip' => '10.0.0.1/24', 'port' => 51820], $this->auth)->assertCreated();
+    $this->host->shell->on('sudo -n :helper interfaces', fn () => throw new CommandFailed('sudo: a password is required'));
+
+    $this->getJson('/links', $this->auth)->assertInternalServerError()->assertJsonPath('error', 'sudo: a password is required');
+    $this->getJson('/link/wg0', $this->auth)->assertInternalServerError();
+    $this->postJson('/link/wg0/peers', [], $this->auth)->assertInternalServerError();
+
+    // What can't exist is still a plain 404
+    $this->getJson('/link/no.such.link', $this->auth)->assertNotFound();
+});
+
+it('refuses to change a hand-written config with a 409', function () {
+    $this->host->confs['office'] = handWrittenConf();
+
+    $this->getJson('/link/office', $this->auth)->assertOk()->assertJsonPath('address', '10.7.0.1/24');
+    $this->postJson('/link/office/peers', [], $this->auth)
+        ->assertConflict()
+        ->assertJsonPath('error', fn (string $error) => str_contains($error, "has settings this app doesn't manage (MTU, PostUp, comments, Endpoint, PersistentKeepalive)"));
+    $this->patchJson('/link/office', ['dns' => '1.1.1.1'], $this->auth)->assertConflict();
+    expect($this->host->conf('office'))->toContain('MTU = 1380', 'Endpoint = branch.example.com:51820');
+
+    $this->deleteJson('/link/office', [], $this->auth)->assertOk();
+});
+
 it('serves a peer config as a QR code', function () {
     $this->postJson('/link', ['name' => 'wg0', 'ip' => '10.0.0.1/24', 'port' => 51820], $this->auth)->assertCreated();
     $safe = KeyManager::pubkeyToSafe($this->postJson('/link/wg0/peers', [], $this->auth)->json('public_key'));
@@ -188,6 +237,18 @@ it('maps errors to status codes with a message', function () {
 
     // Conflict with existing state
     $this->postJson('/link', $link, $this->auth)->assertCreated();
+
+    // A change the link doesn't start with: undone, and reported
+    $this->host->failNextStart = true;
+    $this->patchJson('/link/wg0', ['port' => 51999], $this->auth)
+        ->assertInternalServerError()
+        ->assertJsonPath('error', 'The change to link wg0 could not be applied and was undone: wg-quick: failed to start wg0');
+    $this->getJson('/link/wg0', $this->auth)->assertJsonPath('up', true)->assertJsonPath('listen_port', 51820);
+
+    // An address no interface can have, and a list typed loosely (stored as "a, b")
+    $this->patchJson('/link/wg0', ['address' => '10.0.0.0/24'], $this->auth)->assertUnprocessable();
+    $this->patchJson('/link/wg0', ['allowed_ips' => '10.0.0.0/8 ,192.168.0.0/16'], $this->auth)->assertOk();
+    expect($this->host->conf('wg0'))->toContain("# allowed_ips = 10.0.0.0/8, 192.168.0.0/16\n");
     $this->postJson('/link', $link, $this->auth)
         ->assertConflict()
         ->assertJsonPath('error', 'Link already exists: wg0');

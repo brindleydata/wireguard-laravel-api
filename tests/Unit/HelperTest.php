@@ -4,6 +4,7 @@ use App\Services\ConfigBuilder;
 use App\Services\KeyManager;
 use App\Services\Os\LinuxDriver;
 use App\Services\Os\MacDriver;
+use App\Validation\WireGuardValidator;
 use Tests\Fakes\FakeShell;
 use Tests\Support\HelperSandbox;
 
@@ -122,6 +123,10 @@ it('rejects anything else in a link config and keeps the saved one', function (s
     'a second IPv6 address' => ['/^Address = .*$/m', 'Address = 10.0.0.1/24, fd12::1/64, fd13::1/64', 'not allowed in a link config: Address'],
     'an IPv6-only address' => ['/^Address = .*$/m', 'Address = fd12::1/64', 'not allowed in a link config: Address'],
     'a malformed IPv6 address' => ['/^Address = .*$/m', 'Address = 10.0.0.1/24, fd12:::1/64', 'not allowed in a link config: Address'],
+    // "08" is no number to the shell arithmetic the firewall rules are built with
+    'a mask with a leading zero' => ['/^# address = .*$/m', '# address = 10.0.0.1/08', 'metadata not allowed'],
+    'an octet with a leading zero' => ['/^Address = .*$/m', 'Address = 10.0.0.01/24', 'not allowed in a link config: Address'],
+    'spaces around a comma in a list' => ['/^# dns = .*$/m', '# dns = 1.1.1.1 , 8.8.8.8', 'metadata not allowed'],
     'unknown metadata' => ['/^/', "# owner = me\n", 'metadata not allowed'],
     'a comment after [Interface]' => ['/^\[Peer\]$/m', "# note\n[Peer]", 'comments are only allowed before [Interface]'],
     'a peer name in [Interface]' => ['/^ListenPort/m', "# name = me\nListenPort", 'comments are only allowed before [Interface]'],
@@ -135,6 +140,35 @@ it('rejects anything else in a link config and keeps the saved one', function (s
     'no [Interface]' => ['/\A[\s\S]*\z/', "[Peer]\nPublicKey = ".HELPER_TEST_KEY."\n", '[Peer] before [Interface]'],
     'more than 1 MB' => ['/\z/', str_repeat("#\n", 600000), 'larger than'],
 ]);
+
+it('takes the lists the validator hands on, however they were typed', function () {
+    $box = new HelperSandbox('Linux');
+    $validator = new WireGuardValidator;
+    $driver = new LinuxDriver(new FakeShell, HelperSandbox::path());
+
+    $conf = (new ConfigBuilder([], $driver))->buildConfFile(
+        '10.0.0.1/24', (new KeyManager)->genkey(), 51820, 'eth0',
+        dns: $validator->validateDns(' 1.1.1.1 ,  8.8.8.8,corp.example.com'),
+        allowed_ips: $validator->validateAllowedIps('10.0.0.0/8 ,192.168.0.0/16,  ::/0'),
+    )."\n";
+
+    $run = $box->run(['conf-write', 'wg0'], $conf);
+
+    expect($run['exit'])->toBe(0, $run['stderr'])
+        ->and($conf)->toContain("# dns = 1.1.1.1, 8.8.8.8, corp.example.com\n", "# allowed_ips = 10.0.0.0/8, 192.168.0.0/16, ::/0\n");
+});
+
+it('answers a config that is not there with exit status 3, and an error with another', function () {
+    $box = new HelperSandbox;
+    $key = rtrim(strtr(HELPER_TEST_KEY, '+/', '-_'), '=');
+
+    // The app reads 3 as "no such link" and anything else as a failure
+    expect($box->run(['conf-read', 'wg0'])['exit'])->toBe(3)
+        ->and($box->run(['client-read', 'wg0', $key])['exit'])->toBe(3)
+        ->and($box->run(['conf-read', '../etc/shadow'])['exit'])->toBe(1)
+        ->and($box->run(['client-read', 'wg0', 'not-a-key'])['exit'])->toBe(1)
+        ->and($box->run(['up', 'wg0'])['exit'])->toBe(1, 'Starting a link without a config is an error');
+});
 
 it('lists only configs with valid link names', function () {
     $box = new HelperSandbox;

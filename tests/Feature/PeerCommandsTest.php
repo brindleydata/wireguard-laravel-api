@@ -44,3 +44,30 @@ it('disables and enables a peer, and removes its name', function () {
         ->assertSuccessful();
     expect(app(WireGuard::class)->getLink('wg0')->peers[0])->name->toBeNull()->enabled->toBeTrue();
 });
+
+it('takes a link\'s or peer\'s own client setting out with an empty option', function () {
+    $wg = app(WireGuard::class);
+    $wg->updateLink('wg0', ['dns' => '9.9.9.9', 'keepalive' => 15]);
+    $key = $wg->addPeer('wg0')->public_key;
+    $wg->updatePeer('wg0', $key, ['dns' => '1.1.1.1']);
+
+    $this->artisan('wg:peer:update', ['link' => 'wg0', 'pubkey' => $key, '--dns' => ''])
+        ->expectsOutputToContain('DNS = 9.9.9.9')
+        ->assertSuccessful();
+
+    // "" is not 0 seconds
+    $this->artisan('wg:link:update', ['link' => 'wg0', '--dns' => '', '--keepalive' => ''])->assertSuccessful();
+    expect($wg->getPeerConfig('wg0', $key))->toContain("DNS = 8.8.8.8\n", 'PersistentKeepalive = 25');
+
+    $this->artisan('wg:link:update', ['link' => 'wg0', '--keepalive' => '0'])->assertSuccessful();
+    expect($wg->getPeerConfig('wg0', $key))->toContain('PersistentKeepalive = 0');
+});
+
+it('shows a client config for either form of the public key', function () {
+    $key = app(WireGuard::class)->addPeer('wg0')->public_key;
+
+    $this->artisan('wg:peer', ['link' => 'wg0', 'pubkey' => rtrim(strtr($key, '+/', '-_'), '=')])
+        ->expectsOutputToContain('PrivateKey = ')
+        ->assertSuccessful();
+    $this->artisan('wg:peer', ['link' => 'wg0', 'pubkey' => 'not-a-key'])->assertFailed();
+});

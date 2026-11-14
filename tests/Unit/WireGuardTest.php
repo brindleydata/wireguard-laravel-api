@@ -3,6 +3,8 @@
 use App\DTOs\PeerInfo;
 use App\Exceptions\ConflictException;
 use App\Exceptions\SystemException;
+use App\Services\KeyManager;
+use Tests\Fakes\CommandFailed;
 use Tests\Support\Rig;
 
 /*
@@ -173,6 +175,262 @@ it('rolls back a link that fails to start', function (string $os) {
         ->and($rig->host->enabledUnits)->toBe([])
         ->and($rig->wg->listLinks())->toBe([]);
 })->with('os');
+
+it('undoes a link change that the link does not start with', function (string $os) {
+    $rig = new Rig($os);
+    $rig->wg->createLink('wg0', '10.0.0.1/24', 51820, forward: true);
+    $peer = $rig->wg->addPeer('wg0');
+    $conf = $rig->host->conf('wg0');
+    $rig->host->failNextStart = true; // e.g. another program has the new port
+
+    expect(fn () => $rig->wg->updateLink('wg0', ['port' => 51999, 'dns' => '9.9.9.9']))
+        ->toThrow(SystemException::class, 'The change to link wg0 could not be applied and was undone: wg-quick: failed to start wg0');
+
+    // Up again as it was, config and client configs untouched
+    expect($rig->wg->getLink('wg0'))->up->toBeTrue()->listen_port->toBe(51820)
+        ->and($rig->host->conf('wg0'))->toBe($conf)
+        ->and($rig->host->runtimePeers('wg0'))->toBe([$peer->public_key => '10.0.0.2/32'])
+        ->and($rig->host->firewall['wg0'])->toBe(['forward' => true, 'nat' => false])
+        ->and($rig->wg->getPeerConfig('wg0', $peer->public_key))->toBe($peer->client_config);
+})->with('os');
+
+it('leaves a stopped link stopped when it does not start', function (string $os) {
+    $rig = new Rig($os);
+    $rig->wg->createLink('wg0', '10.0.0.1/24', 51820, up: false);
+    $conf = $rig->host->conf('wg0');
+    $rig->host->failNextStart = true;
+
+    expect(fn () => $rig->wg->updateLink('wg0', ['up' => true, 'port' => 51999]))->toThrow(SystemException::class, 'was undone');
+
+    expect($rig->host->conf('wg0'))->toBe($conf)
+        ->and($rig->host->interfaces)->toBe([])
+        ->and($rig->host->enabledUnits)->toBe([], 'It would start at the next boot otherwise');
+})->with('os');
+
+it('says so when undoing a failed change fails too', function () {
+    $rig = new Rig('linux');
+    $rig->wg->createLink('wg0', '10.0.0.1/24', 51820);
+    $rig->shell->on('sudo -n :helper up :name', fn () => throw new CommandFailed('wg-quick: no such device'));
+
+    expect(fn () => $rig->wg->updateLink('wg0', ['port' => 51999]))
+        ->toThrow(SystemException::class, 'could not be applied, and undoing it failed too (check the link with wg:link wg0): wg-quick: no such device');
+
+    // Down, but with the config it had
+    expect($rig->host->conf('wg0'))->toContain('ListenPort = 51820');
+});
+
+it('takes back networks behind a peer that the link does not start with', function (string $os) {
+    $rig = new Rig($os);
+    $rig->wg->createLink('wg0', '10.0.0.1/24', 51820);
+    $first = $rig->wg->addPeer('wg0');
+    $conf = $rig->host->conf('wg0');
+
+    // wg-quick can't route them, say: the link would stay down for every peer
+    $rig->host->failNextStart = true;
+    expect(fn () => $rig->wg->addPeer('wg0', networks: '192.168.1.0/24'))->toThrow(SystemException::class, 'was undone');
+
+    expect($rig->host->conf('wg0'))->toBe($conf)
+        ->and($rig->host->runtimePeers('wg0'))->toBe([$first->public_key => '10.0.0.2/32'])
+        ->and($rig->host->clients)->toHaveCount(1, 'No client config for a peer that was not added');
+
+    $rig->host->failNextStart = true;
+    expect(fn () => $rig->wg->updatePeer('wg0', $first->public_key, ['networks' => '192.168.1.0/24', 'name' => 'branch']))->toThrow(SystemException::class, 'was undone');
+
+    expect($rig->host->conf('wg0'))->toBe($conf)
+        ->and($rig->host->runtimePeers('wg0'))->toBe([$first->public_key => '10.0.0.2/32'])
+        ->and($rig->wg->getLink('wg0')->peers[0])->name->toBeNull()->networks->toBeNull();
+})->with('os');
+
+it('fails instead of taking a running link for a stopped one', function (string $os) {
+    $rig = new Rig($os);
+    $rig->wg->createLink('wg0', '10.0.0.1/24', 51820);
+    $first = $rig->wg->addPeer('wg0');
+    $conf = $rig->host->conf('wg0');
+    $list = fn () => implode(' ', array_keys($rig->host->interfaces));
+
+    // `wg show interfaces` fails once. Read as "nothing runs", the new peer would only be written
+    // to the config, and dropped from it by the next change to the (running) link
+    $rig->shell->on('sudo -n :helper interfaces', fn () => throw new CommandFailed('sudo: a password is required'));
+    expect(fn () => $rig->wg->addPeer('wg0'))->toThrow(SystemException::class, 'a password is required')
+        ->and(fn () => $rig->wg->listLinks())->toThrow(SystemException::class)
+        ->and(fn () => $rig->wg->getLink('wg0'))->toThrow(SystemException::class)
+        ->and($rig->host->conf('wg0'))->toBe($conf);
+
+    $rig->shell->on('sudo -n :helper interfaces', $list);
+    $second = $rig->wg->addPeer('wg0');
+    $rig->wg->updatePeer('wg0', $first->public_key, ['name' => 'first']);
+
+    expect(array_keys($rig->host->confPeers('wg0')))->toBe([$first->public_key, $second->public_key]);
+})->with('os');
+
+it('does not read a config that cannot be read as a link that is not there', function () {
+    $rig = new Rig('linux');
+    $rig->wg->createLink('wg0', '10.0.0.1/24', 51820, up: false);
+    $rig->wg->createLink('wg1', '10.1.0.1/24', 51821, up: false);
+    $rig->shell->on('sudo -n :helper conf-read :name', fn () => throw new CommandFailed('sudo: a password is required'));
+
+    // Not a 404, not a backup without the link, not a clash check that skips it
+    expect(fn () => $rig->wg->getLink('wg0'))->toThrow(SystemException::class)
+        ->and(fn () => $rig->wg->updateLink('wg0', ['port' => 51999]))->toThrow(SystemException::class)
+        ->and(fn () => $rig->wg->exportLinks())->toThrow(SystemException::class)
+        ->and(fn () => $rig->wg->createLink('wg2', '10.1.0.5/24', 51822))->toThrow(SystemException::class)
+        // A name no link can have is still simply not there, without asking the host
+        ->and($rig->wg->getLink('../etc/passwd'))->toBeNull()
+        ->and($rig->wg->getPeerConfig('wg0', 'not-a-key'))->toBeNull()
+        ->and($rig->wg->getPeerConfig('../etc', str_repeat('A', 43).'='))->toBeNull();
+});
+
+it('finds a client config by either form of the public key', function () {
+    $rig = new Rig('linux');
+    $rig->wg->createLink('wg0', '10.0.0.1/24', 51820);
+    $peer = $rig->wg->addPeer('wg0');
+
+    expect($rig->wg->getPeerConfig('wg0', KeyManager::pubkeyToSafe($peer->public_key)))->toBe($peer->client_config)
+        ->and($rig->wg->getPeerConfig('wg0', $peer->public_key))->toBe($peer->client_config);
+});
+
+// ─── Configs the app didn't write ───────────────────────────────────
+
+it('shows a hand-written config but refuses to change it', function (string $os, Closure $change) {
+    $rig = new Rig($os);
+    $conf = $rig->host->confs['office'] = handWrittenConf();
+    preg_match('/^PublicKey = (.+)$/m', $conf, $key);
+
+    // Regenerating it would drop the MTU, the hook, the comment and the peer's endpoint
+    expect(fn () => $change($rig->wg, $key[1]))
+        ->toThrow(ConflictException::class, "Link office has settings this app doesn't manage (MTU, PostUp, comments, Endpoint, PersistentKeepalive), and a change made here would drop them.");
+
+    $link = $rig->wg->getLink('office');
+    expect($rig->host->conf('office'))->toBe($conf)
+        ->and($rig->host->clients)->toBe([])
+        ->and($link->address)->toBe('10.7.0.1/24')
+        ->and($link->peers[0]->networks)->toBe('192.168.9.0/24')
+        ->and($rig->wg->listLinks())->toBe(['office']);
+})->with('os')->with([
+    'a new peer' => [fn ($wg) => $wg->addPeer('office')],
+    'a link setting' => [fn ($wg) => $wg->updateLink('office', ['dns' => '1.1.1.1'])],
+    'starting it' => [fn ($wg) => $wg->updateLink('office', ['up' => true])],
+    'a peer change' => [fn ($wg, string $key) => $wg->updatePeer('office', $key, ['name' => 'branch'])],
+    'removing a peer' => [fn ($wg, string $key) => $wg->removePeer('office', $key)],
+]);
+
+it('refuses to change a running hand-written link before touching the interface', function () {
+    $rig = new Rig('linux');
+    $rig->host->confs['office'] = handWrittenConf();
+    $rig->shell->run('sudo -n :helper up :name', ['name' => 'office']); // started by its owner
+    $calls = count($rig->shell->calls);
+
+    expect(fn () => $rig->wg->addPeer('office'))->toThrow(ConflictException::class);
+
+    $after = array_column(array_slice($rig->shell->calls, $calls), 'command');
+    expect($after)->not->toContain('sudo -n :helper peer-add :iface')->not->toContain('sudo -n :helper conf-write :name');
+});
+
+it('names what it would drop without quoting it', function () {
+    $rig = new Rig('linux');
+    // A second key line is one the app would lose: it must not end up in an error message
+    $rig->host->confs['office'] = str_replace('MTU = 1380', 'PrivateKey = '.($secret = (new KeyManager)->genkey()), handWrittenConf());
+
+    try {
+        $rig->wg->addPeer('office');
+    } catch (ConflictException $e) {
+    }
+
+    expect($e->getMessage())->toContain('PrivateKey')->not->toContain($secret)->not->toContain('branch.example.com');
+});
+
+it('adopts a hand-written config that has nothing to lose, and can delete any', function (string $os) {
+    $rig = new Rig($os);
+    $keys = new KeyManager;
+    // Only what the app writes too, typed a little differently
+    $rig->host->confs['plain'] = "[Interface]\nAddress=10.8.0.1/24\nPrivateKey = {$keys->genkey()}\n  ListenPort =51901\n\n[Peer]\nPublicKey = {$keys->pubkey($keys->genkey())}\nAllowedIPs = 10.8.0.2/32\n";
+    $rig->host->confs['office'] = handWrittenConf();
+
+    $peer = $rig->wg->addPeer('plain', name: 'new');
+
+    expect($peer->allowed_ips)->toBe('10.8.0.3/32')
+        ->and($rig->host->conf('plain'))->toContain('# address = 10.8.0.1/24', 'ListenPort = 51901', '# name = new')
+        ->and(array_values($rig->host->confPeers('plain')))->toBe(['10.8.0.2/32', '10.8.0.3/32']);
+
+    $rig->wg->deleteLink('office');
+    expect($rig->wg->listLinks())->toBe(['plain']);
+})->with('os');
+
+it('takes a config with hooks from another helper path or OS as its own', function () {
+    $rig = new Rig('linux');
+    $rig->wg->createLink('wg0', '10.0.0.1/24', 51820, forward: true, up: false);
+    // As after moving the helper, or a config copied over from a Mac
+    $rig->host->confs['wg0'] = preg_replace('/^(Post(?:Up|Down) = )\S+ (firewall-\w+) %i/m', '$1/opt/old/wgla-helper $2 %I', $rig->host->conf('wg0'));
+
+    $rig->wg->addPeer('wg0');
+
+    expect($rig->host->conf('wg0'))->toContain('PostUp = /usr/local/sbin/wgla-helper firewall-up %i %i')->not->toContain('/opt/old');
+});
+
+// ─── Settings as they are written ───────────────────────────────────
+
+it('writes lists the way the helper takes them, however they were typed', function () {
+    $rig = new Rig('linux');
+
+    $rig->wg->createLink('wg0', '10.0.0.1/24', 51820, dns: '1.1.1.1 ,  8.8.8.8', allowed_ips: '10.0.0.0/8 ,192.168.0.0/16');
+    $peer = $rig->wg->addPeer('wg0');
+
+    expect($rig->host->conf('wg0'))->toContain("# dns = 1.1.1.1, 8.8.8.8\n", "# allowed_ips = 10.0.0.0/8, 192.168.0.0/16\n")
+        ->and($peer->client_config)->toContain("DNS = 1.1.1.1, 8.8.8.8\n", "AllowedIPs = 10.0.0.0/8, 192.168.0.0/16\n");
+
+    $rig->wg->updateLink('wg0', ['dns' => '9.9.9.9,1.1.1.1']);
+    $rig->wg->updatePeer('wg0', $peer->public_key, ['allowed_ips' => '10.0.0.0/24 ,  10.1.0.0/24']);
+
+    expect($rig->host->conf('wg0'))->toContain("# dns = 9.9.9.9, 1.1.1.1\n")
+        ->and($rig->wg->getPeerConfig('wg0', $peer->public_key))->toContain("DNS = 9.9.9.9, 1.1.1.1\n", "AllowedIPs = 10.0.0.0/24, 10.1.0.0/24\n");
+});
+
+it('refuses a link address that is no host in a subnet of its own', function (string $address, string $error) {
+    $rig = new Rig('linux');
+    $rig->wg->createLink('wg1', '10.1.0.1/24', 51821, up: false);
+
+    expect(fn () => $rig->wg->createLink('wg0', $address, 51820))->toThrow(InvalidArgumentException::class, $error)
+        ->and(fn () => $rig->wg->updateLink('wg1', ['address' => $address]))->toThrow(InvalidArgumentException::class, $error)
+        ->and($rig->wg->listLinks())->toBe(['wg1']);
+})->with([
+    'every address' => ['10.0.0.1/0', 'covers every address'],
+    'the network address' => ['10.0.0.0/24', 'network or broadcast address'],
+    'the broadcast address' => ['10.0.0.255/24', 'network or broadcast address'],
+]);
+
+it('writes a mask as a plain number', function () {
+    $rig = new Rig('linux');
+
+    // "/08" is nothing `ip` or the helper's firewall arithmetic can read
+    expect($rig->wg->createLink('wg0', '10.0.0.1/08', 51820)->address)->toBe('10.0.0.1/8')
+        ->and($rig->host->conf('wg0'))->toContain("# address = 10.0.0.1/8\n", "Address = 10.0.0.1/8\n");
+});
+
+it('goes back to the default when a link\'s or peer\'s own client setting is taken out', function (string $os, mixed $nothing) {
+    $rig = new Rig($os);
+    $rig->wg->createLink('wg0', '10.0.0.1/24', 51820, dns: '9.9.9.9', keepalive: 15, allowed_ips: '10.0.0.0/24');
+    $plain = $rig->wg->addPeer('wg0');
+    $custom = $rig->wg->addPeer('wg0');
+    $rig->wg->updatePeer('wg0', $custom->public_key, ['dns' => '1.1.1.1', 'allowed_ips' => '10.0.0.0/16']);
+
+    // The link's own: back to the global WIREGUARD_* defaults, for peers without their own
+    $rig->wg->updateLink('wg0', ['dns' => $nothing, 'keepalive' => $nothing, 'allowed_ips' => $nothing]);
+
+    expect($rig->host->conf('wg0'))->not->toContain('# dns')->not->toContain('# keepalive')->not->toContain('# allowed_ips')
+        ->and($rig->wg->getPeerConfig('wg0', $plain->public_key))->toContain("DNS = 8.8.8.8\n", 'PersistentKeepalive = 25', "AllowedIPs = 0.0.0.0/0\n")
+        ->and($rig->wg->getPeerConfig('wg0', $custom->public_key))->toContain("DNS = 1.1.1.1\n", 'PersistentKeepalive = 25', "AllowedIPs = 10.0.0.0/16\n");
+
+    // The peer's own: back to the link's
+    $rig->wg->updateLink('wg0', ['dns' => '9.9.9.9']);
+    $updated = $rig->wg->updatePeer('wg0', $custom->public_key, ['dns' => $nothing, 'allowed_ips' => $nothing]);
+
+    expect($updated->client_config)->toContain("DNS = 9.9.9.9\n", "AllowedIPs = 0.0.0.0/0\n");
+
+    // A keepalive of 0 is a value (off), not "nothing"
+    $rig->wg->updateLink('wg0', ['keepalive' => 0]);
+    expect($rig->host->conf('wg0'))->toContain("# keepalive = 0\n")
+        ->and($rig->wg->getPeerConfig('wg0', $plain->public_key))->toContain('PersistentKeepalive = 0');
+})->with('os')->with(['null' => [null], 'an empty value' => ['']]);
 
 it('lists unmanaged running interfaces once', function (string $os) {
     $rig = new Rig($os);

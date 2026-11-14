@@ -21,14 +21,19 @@ it('adds no hooks without forward or NAT', function () {
 });
 
 it('resolves the utun interface through the helper', function () {
-    $shell = (new FakeShell)->on('sudo -n :helper resolve :name', fn (array $b) => match ($b['name']) {
-        'wg0' => "utun7\n",
-        default => throw new CommandFailed,
-    });
+    // The helper answers with the link name when wg-quick recorded no utunN for it
+    $shell = (new FakeShell)->on('sudo -n :helper resolve :name', fn (array $b) => $b['name'] === 'wg0' ? "utun7\n" : "{$b['name']}\n");
     $driver = new MacDriver($shell);
 
     expect($driver->resolveInterface('wg0'))->toBe('utun7')
-        ->and($driver->resolveInterface('wg1'))->toBe('wg1', 'Falls back to the link name');
+        ->and($driver->resolveInterface('wg1'))->toBe('wg1');
+});
+
+it('does not guess the interface when the helper cannot be asked', function () {
+    // A guess (the link name) would make a running link look stopped
+    $shell = (new FakeShell)->on('sudo -n :helper resolve :name', fn () => throw new CommandFailed('sudo: a password is required'));
+
+    expect(fn () => (new MacDriver($shell))->resolveInterface('wg0'))->toThrow(CommandFailed::class, 'a password is required');
 });
 
 it('computes RAM with the page size vm_stat reports', function () {

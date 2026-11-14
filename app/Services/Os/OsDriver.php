@@ -64,7 +64,8 @@ interface OsDriver
     // ─── WireGuard runtime state ────────────────────────────────────
 
     /**
-     * Names of the running WireGuard interfaces (`wg show interfaces`).
+     * Names of the running WireGuard interfaces (`wg show interfaces`). Throws
+     * CommandFailedException when they can't be read: an empty list would say every link is down.
      */
     public function runningInterfaces(): array;
 
@@ -90,6 +91,7 @@ interface OsDriver
      * Linux: the link name itself. macOS: wg-quick always creates a fresh utunN and records it in
      * /var/run/wireguard/<link>.name; falls back to the link name when there is no mapping.
      * The caller must still check runningInterfaces() to know whether it is running.
+     * Throws CommandFailedException when the helper can't be asked.
      */
     public function resolveInterface(string $link): string;
 
@@ -119,14 +121,15 @@ interface OsDriver
     public function deleteConfig(string $name): void;
 
     /**
-     * Read a wg-quick .conf, or null if it doesn't exist.
+     * Read a wg-quick .conf, or null if it doesn't exist. Throws CommandFailedException when it
+     * can't be read for any other reason.
      */
     public function readConfig(string $name): ?string;
 
     public function configExists(string $name): bool;
 
     /**
-     * Names of all links that have a .conf.
+     * Names of all links that have a .conf. Throws CommandFailedException when they can't be listed.
      */
     public function listConfigNames(): array;
 
@@ -140,6 +143,9 @@ interface OsDriver
 
     public function writeClientConfig(string $link, string $key, string $content): void;
 
+    /**
+     * A peer's stored client config, or null if there is none. Throws like readConfig().
+     */
     public function readClientConfig(string $link, string $key): ?string;
 
     public function deleteClientConfig(string $link, string $key): void;

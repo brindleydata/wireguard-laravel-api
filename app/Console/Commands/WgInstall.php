@@ -95,11 +95,16 @@ class WgInstall extends WgCommand
                 return Command::FAILURE;
             }
             $step->after($ctx);
-            $installer->save($ctx);
 
             if ($print) {
+                // Only prints: the answers aren't saved either
                 $this->printStep($step, $ctx);
-            } elseif (! $this->fix($installer, $step, $ctx, $interactive, $yes)) {
+
+                continue;
+            }
+
+            $installer->save($ctx);
+            if (! $this->fix($installer, $step, $ctx, $interactive, $yes)) {
                 $pending[] = $step->title();
             }
         }

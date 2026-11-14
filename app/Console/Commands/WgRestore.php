@@ -75,22 +75,28 @@ class WgRestore extends WgCommand
             }
         }
 
-        // Links that would clash with what stays here (port, subnet) can only be skipped
-        $replaced = array_keys(array_filter($choices, fn (string $choice) => $choice === 'replace'));
-        foreach ($choices as $name => $choice) {
-            if ($choice === 'skip' || ($clashes = $backup->clashes($payload, $name, $replaced)) === []) {
-                continue;
-            }
+        // Links that can't be restored here can only be skipped: one that would clash with what
+        // stays (port, subnet, routed networks), or a hand-written config the app can't rebuild.
+        // Checked again after each skip: a link that now stays may be in another one's way.
+        do {
+            $skipped = false;
+            foreach ($choices as $name => $choice) {
+                $replaced = array_keys($choices, 'replace', true);
+                if ($choice === 'skip' || ($problems = $backup->problems($payload, $name, $replaced)) === []) {
+                    continue;
+                }
 
-            $why = implode('; ', $clashes);
-            if ($existing === 'skip' || ($interactive && confirm("{$name} can't be restored here ({$why}). Skip it?", default: true))) {
-                $choices[$name] = 'skip';
-            } else {
-                $this->error("{$name} can't be restored here: {$why}. Nothing was restored.");
+                $why = rtrim(implode('; ', $problems), '.');
+                if ($existing === 'skip' || ($interactive && confirm("{$name} can't be restored here ({$why}). Skip it?", default: true))) {
+                    $choices[$name] = 'skip';
+                    $skipped = true;
+                } else {
+                    $this->error("{$name} can't be restored here: {$why}. Nothing was restored.");
 
-                return Command::FAILURE;
+                    return Command::FAILURE;
+                }
             }
-        }
+        } while ($skipped);
 
         $this->table(['Link', 'Action', 'Address', 'Port', 'Peers', 'Was up'], array_map(fn (string $name) => [
             $name, $choices[$name], implode(', ', array_filter([$links[$name]['address'], $links[$name]['address6']])), $links[$name]['port'], $links[$name]['peers'], $links[$name]['up'] ? 'yes' : 'no',
@@ -125,7 +131,12 @@ class WgRestore extends WgCommand
         if ($report['hostname_changed']) {
             $this->warn('Client configs now point at '.($report['hostname'] ?? 'this server').': peers need their new config (wg:peer, or GET /link/{link}/peer/{pubkey}/config).');
         }
+        // Restored, with its keys and client configs, but down
+        foreach ($report['not_started'] as $name => $error) {
+            $this->error("{$name} was restored but did not start: {$error}");
+            $this->line("  Once that is fixed, start it: wgla link:update {$name} --up=true");
+        }
 
-        return Command::SUCCESS;
+        return $report['not_started'] === [] ? Command::SUCCESS : Command::FAILURE;
     }
 }

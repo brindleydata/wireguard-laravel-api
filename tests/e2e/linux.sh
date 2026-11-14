@@ -49,7 +49,7 @@ api() { curl -s "${CURL_OPTS[@]}" -o /tmp/wgla-e2e-body -w '%{http_code}' -H "ap
 FORWARD_POLICY=$(iptables -S FORWARD 2>/dev/null | sed -n 's/^-P FORWARD //p')
 FORWARD6_POLICY=$(ip6tables -S FORWARD 2>/dev/null | sed -n 's/^-P FORWARD //p')
 cleanup() {
-    for link in e2e0 e2e1 e2e2; do "${ART[@]}" wg:link:delete "$link" > /dev/null 2>&1; done
+    for link in e2e0 e2e1 e2e2 e2e3; do "${ART[@]}" wg:link:delete "$link" > /dev/null 2>&1; done
     ip netns del e2e-client 2>/dev/null; ip netns del e2e-far 2>/dev/null
     ip link del e2e-h 2>/dev/null; ip link del e2e-fh 2>/dev/null
     [ -n "$FORWARD_POLICY" ] && iptables -P FORWARD "$FORWARD_POLICY"
@@ -68,6 +68,8 @@ check "the helper refuses a path as link name" "! as_web sudo -n $HELPER conf-re
 printf '[Interface]\nAddress = 10.9.0.1/24\nPrivateKey = xTIBA5rboUvnH4htodjb6e697QjLERt1NAB4mZqp8Dg=\nListenPort = 51899\nPostUp = touch /tmp/wgla-e2e-pwned\n' > /tmp/wgla-e2e-evil.conf
 check "the helper refuses a config with a planted hook" "! as_web sudo -n $HELPER conf-write e2eevil < /tmp/wgla-e2e-evil.conf"
 check "... so it never runs" "! as_web sudo -n $HELPER up e2eevil && [ ! -e /tmp/wgla-e2e-pwned ]"
+# The app tells "no such link" (3) from a failure (anything else), so the status must survive sudo
+check "a config that isn't there is exit status 3 through sudo" "as_web sudo -n $HELPER conf-read e2enone; [ \$? -eq 3 ]"
 check "the API reports the helper ok" "[ \"\$(api $URL/status)\" = 200 ] && grep -q '\"state\":\"ok\"' /tmp/wgla-e2e-body"
 check "/health is public and ok" "[ \"\$(curl -s ${CURL_OPTS[*]} -o /dev/null -w '%{http_code}' $URL/health)\" = 200 ]"
 check "/status needs the API key" "[ \"\$(curl -s ${CURL_OPTS[*]} -o /dev/null -w '%{http_code}' $URL/status)\" = 403 ]"
@@ -169,7 +171,16 @@ systemctl enable wg-quick@e2e1 > /dev/null 2>&1
 cli wg:link:delete e2e1 > /dev/null
 check "deleting it also disables a leftover unit" "! systemctl is-enabled -q wg-quick@e2e1 && [ ! -e /etc/wireguard/e2e1.conf ]"
 
+step "A config written by hand"
+printf '[Interface]\nAddress = 10.83.0.1/24\nPrivateKey = %s\nListenPort = 51883\nMTU = 1380\n' "$(wg genkey)" > /etc/wireguard/e2e3.conf
+chmod 600 /etc/wireguard/e2e3.conf
+check "is listed and shown" "cli wg:links | grep -qw e2e3 && cli wg:link e2e3 | grep -q '10.83.0.1/24'"
+check "but not changed: that would drop its MTU" "! \"\${ART[@]}\" wg:peer:create e2e3 && grep -qx 'MTU = 1380' /etc/wireguard/e2e3.conf"
+cli wg:link:delete e2e3 > /dev/null
+check "and can be deleted" "[ ! -e /etc/wireguard/e2e3.conf ]"
+
 step "HTTP API ($URL)"
+check "a link that isn't there -> 404" "[ \"\$(api $URL/link/e2enone)\" = 404 ]"
 check "GET /link has the interface, no private key" "[ \"\$(api $URL/link/e2e0)\" = 200 ] && grep -q '\"interface\":\"e2e0\"' /tmp/wgla-e2e-body && ! grep -q private_key /tmp/wgla-e2e-body"
 check "POST /link -> 201" "[ \"\$(api -X POST $URL/link -d '{\"name\":\"e2e2\",\"ip\":\"10.82.0.1/24\",\"port\":51882}')\" = 201 ]"
 check "a port clash -> 409" "[ \"\$(api -X POST $URL/link -d '{\"name\":\"e2e3\",\"ip\":\"10.83.0.1/24\",\"port\":51882}')\" = 409 ]"

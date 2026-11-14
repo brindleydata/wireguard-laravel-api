@@ -9,9 +9,9 @@ class WgLinkUpdate extends WgCommand
 {
     protected $signature = 'wg:link:update
         {link : Interface name}
-        {--dns= : DNS server for peers}
-        {--keepalive= : Persistent keepalive interval in seconds}
-        {--allowed-ips= : Allowed IPs for peer configs}
+        {--dns= : DNS server for peers ("" goes back to WIREGUARD_DNS)}
+        {--keepalive= : Persistent keepalive interval in seconds ("" goes back to WIREGUARD_KEEPALIVE)}
+        {--allowed-ips= : Allowed IPs for peer configs ("" goes back to WIREGUARD_ALLOWED_IPS)}
         {--ifout= : Outbound network interface for NAT}
         {--port= : Listen port}
         {--address= : VPN address in CIDR notation}
@@ -32,7 +32,8 @@ class WgLinkUpdate extends WgCommand
             $params['dns'] = $this->option('dns');
         }
         if ($this->option('keepalive') !== null) {
-            $params['keepalive'] = (int) $this->option('keepalive');
+            // "" is not 0 seconds: it takes the link's own value out
+            $params['keepalive'] = $this->option('keepalive') === '' ? null : (int) $this->option('keepalive');
         }
         if ($this->option('allowed-ips') !== null) {
             $params['allowed_ips'] = $this->option('allowed-ips');

@@ -2,6 +2,7 @@
 
 namespace App\Services\Os;
 
+use App\Exceptions\CommandFailedException;
 use App\Exceptions\HelperException;
 use App\Services\ConfigBuilder;
 use App\Services\Shell;
@@ -13,6 +14,9 @@ use App\Services\Shell;
  */
 abstract class BaseDriver implements OsDriver
 {
+    /** The helper's exit status for a config that doesn't exist (any other failure is an error). */
+    protected const NOT_FOUND = 3;
+
     /**
      * @param  string|null  $bundledHelperPath  The bin/wgla-helper this app ships. When given, the
      *                                          installed helper must be identical before it is used.
@@ -56,9 +60,10 @@ abstract class BaseDriver implements OsDriver
 
     public function runningInterfaces(): array
     {
-        $output = $this->tryHelper('interfaces');
+        // Throws when it can't be read: "none" would make every running link look stopped
+        $output = $this->helper('interfaces');
 
-        return $output === null || $output === '' ? [] : preg_split('/\s+/', $output);
+        return $output === '' ? [] : preg_split('/\s+/', $output);
     }
 
     public function interfaceDump(string $iface): string
@@ -85,7 +90,7 @@ abstract class BaseDriver implements OsDriver
 
     public function resolveInterface(string $link): string
     {
-        return $this->tryHelper('resolve :name', ['name' => $link]) ?: $link;
+        return $this->helper('resolve :name', ['name' => $link]) ?: $link;
     }
 
     public function startInterface(string $name): void
@@ -130,7 +135,7 @@ abstract class BaseDriver implements OsDriver
 
     public function readConfig(string $name): ?string
     {
-        return $this->tryHelper('conf-read :name', ['name' => $name]);
+        return $this->read('conf-read :name', ['name' => $name]);
     }
 
     public function configExists(string $name): bool
@@ -140,9 +145,9 @@ abstract class BaseDriver implements OsDriver
 
     public function listConfigNames(): array
     {
-        $output = $this->tryHelper('conf-list');
+        $output = $this->helper('conf-list');
 
-        return $output === null || $output === '' ? [] : explode("\n", $output);
+        return $output === '' ? [] : explode("\n", $output);
     }
 
     public function parseConfig(string $name): ?array
@@ -161,7 +166,7 @@ abstract class BaseDriver implements OsDriver
 
     public function readClientConfig(string $link, string $key): ?string
     {
-        return $this->tryHelper('client-read :link :key', ['link' => $link, 'key' => $key]);
+        return $this->read('client-read :link :key', ['link' => $link, 'key' => $key]);
     }
 
     public function deleteClientConfig(string $link, string $key): void
@@ -209,6 +214,23 @@ abstract class BaseDriver implements OsDriver
         $this->assertHelperCurrent();
 
         return $this->shell->run("sudo -n :helper {$command}", ['helper' => $this->helperPath, ...$bindings], $input);
+    }
+
+    /**
+     * Read a config through the helper: null only when it doesn't exist. A read that fails for
+     * another reason (sudo, the helper) throws, so a failure never looks like "no such link".
+     */
+    protected function read(string $command, array $bindings): ?string
+    {
+        try {
+            return $this->helper($command, $bindings);
+        } catch (CommandFailedException $e) {
+            if ($e->exitCode === self::NOT_FOUND) {
+                return null;
+            }
+
+            throw $e;
+        }
     }
 
     protected function tryHelper(string $command, array $bindings = [], ?string $input = null): ?string

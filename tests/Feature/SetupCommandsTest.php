@@ -1,6 +1,8 @@
 <?php
 
 use App\Services\Shell;
+use App\Setup\Context;
+use App\Setup\Installer;
 use Tests\Fakes\CommandFailed;
 use Tests\Fakes\FakeShell;
 
@@ -11,6 +13,19 @@ use Tests\Fakes\FakeShell;
 beforeEach(function () {
     $this->shell = new FakeShell;
     $this->app->instance(Shell::class, $this->shell);
+
+    // These commands run against this checkout: whatever they'd save must not land in its .env
+    $this->installer = new class($this->shell) extends Installer
+    {
+        /** @var list<array<string, mixed>> */
+        public array $saved = [];
+
+        public function save(Context $ctx): void
+        {
+            $this->saved[] = $ctx->answers;
+        }
+    };
+    $this->app->instance(Installer::class, $this->installer);
 });
 
 /** A shell where the installer runs as $user and git answers from $git (command template => output). */
@@ -41,7 +56,8 @@ it('prints the whole setup as a shell script without running anything', function
         ->expectsOutputToContain("printf '%s\\n' 'www-data ALL=(root) NOPASSWD: ")
         ->assertSuccessful();
 
-    expect($this->shell->interactive)->toBe([], 'Nothing was run');
+    expect($this->shell->interactive)->toBe([], 'Nothing was run')
+        ->and($this->installer->saved)->toBe([], 'And no answer was saved to .env');
 });
 
 it('refuses to run as root', function () {

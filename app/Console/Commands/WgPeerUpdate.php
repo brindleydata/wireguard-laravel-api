@@ -11,8 +11,8 @@ class WgPeerUpdate extends WgCommand
         {link : Interface name}
         {pubkey : Peer public key}
         {--ip= : New tunnel address within the link subnet}
-        {--dns= : DNS servers for this peer\'s client config}
-        {--allowed-ips= : Routes for this peer\'s client config (AllowedIPs)}
+        {--dns= : DNS servers for this peer\'s client config ("" goes back to the link\'s)}
+        {--allowed-ips= : Routes for this peer\'s client config (AllowedIPs; "" goes back to the link\'s)}
         {--name= : A label for the peer ("" removes it)}
         {--enabled= : false takes the peer off the interface, true puts it back}
         {--networks= : Networks behind the peer, routed to it ("" removes them)}';
