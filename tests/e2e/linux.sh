@@ -93,10 +93,11 @@ ip link add e2e-h type veth peer name e2e-c
 ip link set e2e-c netns e2e-client
 ip addr add 10.99.0.1/24 dev e2e-h; ip link set e2e-h up
 ip netns exec e2e-client sh -c 'ip addr add 10.99.0.2/24 dev e2e-c; ip link set e2e-c up; ip link set lo up'
-cp "$CLIENT" /tmp/wgla-e2e-c0.conf
-sed -i "s/^Endpoint = .*/Endpoint = 10.99.0.1:51880/" /tmp/wgla-e2e-c0.conf
 ip netns exec e2e-client ip link add e2ec0 type wireguard
-ip netns exec e2e-client wg setconf e2ec0 <(wg-quick strip /tmp/wgla-e2e-c0.conf)
+# The client config minus wg-quick's own keys (Address, DNS), through a pipe: Ubuntu's AppArmor
+# profiles only let wg and wg-quick open files under /etc/wireguard, so no `wg-quick strip` of a copy
+grep -vE '^(Address|DNS) =' "$CLIENT" | sed 's/^Endpoint = .*/Endpoint = 10.99.0.1:51880/' \
+    | ip netns exec e2e-client wg setconf e2ec0 /dev/stdin
 ip netns exec e2e-client sh -c 'ip addr add 10.80.0.2/32 dev e2ec0; ip link set e2ec0 up; ip route add 10.80.0.0/24 dev e2ec0; ip route add 10.98.0.0/24 dev e2ec0'
 check "the client reaches the server through the tunnel" "ip netns exec e2e-client ping -c1 -W3 10.80.0.1"
 check "and the far network (forward + NAT)" "ip netns exec e2e-client ping -c1 -W3 10.98.0.2"
