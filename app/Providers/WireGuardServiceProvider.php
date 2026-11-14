@@ -17,6 +17,12 @@ use Illuminate\Support\ServiceProvider;
 
 class WireGuardServiceProvider extends ServiceProvider
 {
+    public function boot(): void
+    {
+        // Without resolving any service: tests (and the container) may still swap them
+        Server::rememberRunningCode(base_path());
+    }
+
     public function register(): void
     {
         $this->app->singleton(Shell::class, fn () => new Shell);

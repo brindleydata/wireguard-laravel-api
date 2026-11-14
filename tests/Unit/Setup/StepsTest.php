@@ -289,6 +289,50 @@ it('wants the service installed, enabled and running', function () {
     expect($step->check($ctx))->toBe(['The wgla service is not installed, or its settings changed'], 'A changed answer re-renders the unit');
 });
 
+it('reloads a running API that still serves the code from before a deploy', function (bool $stale) {
+    $ctx = setupContext(answers: ['tls' => 'http', 'bind' => '127.0.0.1', 'port' => '8080']);
+    touch($ctx->app('frankenphp'));
+    chmod($ctx->app('frankenphp'), 0755);
+    file_put_contents($ctx->app('.env'), "API_KEY=secret\n");
+    $onDisk = App\Services\Server::codeFingerprint($ctx->app());
+    $shell = (new FakeShell)
+        ->on('systemctl is-enabled wgla', fn () => 'enabled')
+        ->on('systemctl is-active wgla', fn () => 'active')
+        ->on('curl -s --max-time 3 -H @- :url', fn (array $b, ?string $input) => $b['url'] === 'http://127.0.0.1:8080/status' && $input === "api-key: secret\n"
+            ? json_encode(['app' => ['code' => $stale ? 'older0000000000' : $onDisk]])
+            : throw new CommandFailed);
+    $step = new Server($shell);
+    mkdir(dirname($ctx->system(Server::UNIT)), 0755, true);
+    file_put_contents($ctx->system(Server::UNIT), $step->unit($ctx));
+
+    expect($step->check($ctx))->toBe($stale ? ['The API still runs the code from before the last deploy'] : [])
+        ->and(array_map(fn ($action) => $action->command, $step->plan($ctx)))->toBe($stale ? ['sudo systemctl reload wgla'] : [])
+        ->and(implode(' ', array_column($shell->calls, 'bound')))->not->toContain('secret', 'The key never goes on a command line');
+})->with(['after a deploy' => true, 'up to date' => false]);
+
+it('fingerprints the code by content, not by timestamps', function () {
+    $ctx = setupContext();
+    mkdir($ctx->app('app'), 0755, true);
+    mkdir($ctx->app('storage'), 0755, true);
+    file_put_contents($ctx->app('app/Thing.php'), '<?php // v1');
+    file_put_contents($ctx->app('.env'), "APP_KEY=x\n");
+    $fingerprint = fn () => App\Services\Server::codeFingerprint($ctx->app());
+    $v1 = $fingerprint();
+
+    file_put_contents($ctx->app('storage/log'), 'noise');
+    touch($ctx->app('app/Thing.php'), time() - 86400);
+    expect($fingerprint())->toBe($v1, 'storage/ and timestamps are not code');
+
+    file_put_contents($ctx->app('app/Thing.php'), '<?php // v2');
+    expect($fingerprint())->not->toBe($v1);
+
+    file_put_contents($ctx->app('app/Thing.php'), '<?php // v1');
+    expect($fingerprint())->toBe($v1, 'Back to the old code: the same code');
+
+    file_put_contents($ctx->app('.env'), "APP_KEY=y\n");
+    expect($fingerprint())->not->toBe($v1, '.env counts: workers read it at boot');
+});
+
 // ─── Installer ──────────────────────────────────────────────────────
 
 it('saves answers in .env and reads them back on the next run', function () {

@@ -15,3 +15,7 @@ Homestead.yaml
 npm-debug.log
 yarn-error.log
 /frankenphp
+# octane:install appends these when they're missing. Listing them keeps a deploy checkout clean,
+# which wg:update needs (it refuses local changes). tests/Unit/OctaneTest.php checks the list.
+**/caddy
+frankenphp-worker.php

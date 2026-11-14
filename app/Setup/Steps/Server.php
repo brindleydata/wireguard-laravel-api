@@ -2,8 +2,10 @@
 
 namespace App\Setup\Steps;
 
+use App\Services\Server as ServerService;
 use App\Setup\Action;
 use App\Setup\Context;
+use App\Setup\EnvFile;
 use App\Setup\Question;
 use App\Setup\Step;
 
@@ -82,11 +84,12 @@ class Server extends Step
             $problems[] = 'FrankenPHP is not downloaded';
         }
 
-        $unit = $ctx->system(self::UNIT);
-        if (! is_file($unit) || file_get_contents($unit) !== $this->unit($ctx)) {
+        if (! $this->unitCurrent($ctx)) {
             $problems[] = 'The wgla service is not installed, or its settings changed';
-        } elseif ($this->shell->tryRun('systemctl is-enabled wgla') !== 'enabled' || $this->shell->tryRun('systemctl is-active wgla') !== 'active') {
+        } elseif (! $this->running()) {
             $problems[] = 'The wgla service is not enabled and running';
+        } elseif ($this->stale($ctx)) {
+            $problems[] = 'The API still runs the code from before the last deploy';
         }
 
         if ($ctx->answer('tls') === 'cert' && $ctx->separateWebUser()) {
@@ -109,17 +112,53 @@ class Server extends Step
 
         $unit = self::q($ctx->system(self::UNIT));
 
-        return [
-            ...$actions,
-            Action::command('Install the systemd service', '(tmp=$(mktemp) && printf \'%s\' '.self::q($this->unit($ctx)).' > "$tmp"'
-                ." && sudo install -o root -g root -m 644 \"\$tmp\" {$unit}; status=\$?; rm -f \"\$tmp\"; exit \$status)"),
-            Action::command('Start it now and at boot', 'sudo systemctl daemon-reload && sudo systemctl enable wgla 2> /dev/null && sudo systemctl restart wgla'),
-        ];
+        if (! $this->unitCurrent($ctx) || ! $this->running()) {
+            return [
+                ...$actions,
+                Action::command('Install the systemd service', '(tmp=$(mktemp) && printf \'%s\' '.self::q($this->unit($ctx)).' > "$tmp"'
+                    ." && sudo install -o root -g root -m 644 \"\$tmp\" {$unit}; status=\$?; rm -f \"\$tmp\"; exit \$status)"),
+                Action::command('Start it now and at boot', 'sudo systemctl daemon-reload && sudo systemctl enable wgla 2> /dev/null && sudo systemctl restart wgla'),
+            ];
+        }
+
+        // Octane reloads its workers without dropping connections
+        return $this->stale($ctx) ? [...$actions, Action::command('Reload the API with the code on disk', 'sudo systemctl reload wgla')] : $actions;
     }
 
     public function manual(Context $ctx): string
     {
         return "Make the certificate and key readable by {$ctx->webUser()} (e.g. a group it belongs to), or copy them somewhere it can read.";
+    }
+
+    protected function unitCurrent(Context $ctx): bool
+    {
+        $unit = $ctx->system(self::UNIT);
+
+        return is_file($unit) && file_get_contents($unit) === $this->unit($ctx);
+    }
+
+    protected function running(): bool
+    {
+        return $this->shell->tryRun('systemctl is-enabled wgla') === 'enabled' && $this->shell->tryRun('systemctl is-active wgla') === 'active';
+    }
+
+    /**
+     * Whether the API serves different code than what's on disk: it reports the fingerprint it
+     * booted with in /status. Unknown (API not answering, no key) counts as not stale.
+     */
+    protected function stale(Context $ctx): bool
+    {
+        $key = (new EnvFile($ctx->app('.env')))->get('API_KEY');
+        if (! $key) {
+            return false;
+        }
+
+        [$url, $options] = $this->localUrl($ctx);
+        // The key goes in on stdin, not on the command line where other users could see it
+        $body = $this->shell->tryRun(trim("curl -s --max-time 3 {$options}").' -H @- :url', ['url' => "{$url}/status"], "api-key: {$key}\n");
+        $running = $body === null ? null : (json_decode($body, true)['app']['code'] ?? null);
+
+        return $running !== null && $running !== ServerService::codeFingerprint($ctx->app());
     }
 
     /** The systemd unit for the current answers. */

@@ -42,7 +42,7 @@ class Health extends Step
             [$url, $options] = $this->server->localUrl($ctx);
             $code = '000';
             for ($attempt = 0; $attempt < 15 && $code === '000'; $attempt++) {
-                $code = $this->shell->tryRun("curl -s -o /dev/null -w '%{http_code}' --max-time 3 {$options} :url", ['url' => "{$url}/health"]) ?? '000';
+                $code = $this->shell->tryRun(trim("curl -s -o /dev/null -w '%{http_code}' --max-time 3 {$options}").' :url', ['url' => "{$url}/health"]) ?? '000';
                 if ($code === '000' && $attempt < 14) {
                     sleep(1);
                 }

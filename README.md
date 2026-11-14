@@ -80,6 +80,8 @@ Run it as the deploy user. It refuses to overwrite local changes to the code. Be
 1. checks out the release and runs `composer install --no-dev`;
 2. in a fresh process with the new code, reinstalls the helper if it changed, updates the sudo rule and the service, reloads the API without dropping connections, and runs the health check.
 
+If you deploy code another way, such as a plain `git pull` or rsync, run `php artisan wg:install` afterwards. It notices that the API still runs the old code and reloads it. (The API reports the code it booted with, and the wizard compares that with what's on disk.)
+
 If any of that fails, it goes back to the previous version by itself. Updates are never unattended: an update installs code that runs as root. The release it ends up on is what `/status` reports as the version.
 
 ## Backup and restore

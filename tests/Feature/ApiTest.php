@@ -1,6 +1,7 @@
 <?php
 
 use App\Services\KeyManager;
+use App\Services\Server;
 use App\Services\Shell;
 use Tests\Fakes\FakeHost;
 use Tests\Fakes\FakeShell;
@@ -60,6 +61,14 @@ it('reports a missing root helper as a 500 that says how to fix it', function ()
     $this->getJson('/links', $this->auth)
         ->assertInternalServerError()
         ->assertJsonPath('error', 'The root helper is not installed at /nonexistent/wgla-helper. Install it with: php artisan wg:install');
+});
+
+it('reports the code it booted with in /status', function () {
+    $this->host->shell->otherwise(fn () => '0');
+
+    $this->getJson('/status', $this->auth)
+        ->assertOk()
+        ->assertJsonPath('app.code', Server::codeFingerprint(base_path()));
 });
 
 it('shows only health publicly, and status and IP behind the API key', function () {

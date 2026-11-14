@@ -55,6 +55,11 @@ jobs:
           php artisan wg:install --yes --user=www-data --hostname=127.0.0.1 --forward=true
           --tls=http --bind=127.0.0.1 --port=8080
 
+      - name: The installer leaves the checkout clean (wg:update refuses local changes)
+        run: |
+          changes=$(git -C /srv/wgla status --porcelain --untracked-files=no)
+          [ -z "$changes" ] || { echo "$changes"; exit 1; }
+
       - name: A second run only checks
         working-directory: /srv/wgla
         run: php artisan wg:install --no-interaction

@@ -4,11 +4,9 @@ namespace App\Console\Commands;
 
 use App\Console\Commands\Concerns\RunsSetupSteps;
 use App\Services\WireGuard;
-use App\Setup\Action;
 use App\Setup\Context;
 use App\Setup\Installer;
 use App\Setup\Step;
-use App\Setup\Steps\Server;
 use App\Setup\Updater;
 use Illuminate\Console\Command;
 
@@ -170,14 +168,7 @@ class WgUpdate extends WgCommand
                 return false;
             }
             $installer->save($ctx);
-
-            // Workers still run the old code: reload them before the health check
-            if ($step->key() === 'health' && app(Server::class)->applies($ctx)) {
-                $this->line('→ Reloading the API');
-                if (! $installer->run(Action::command('Reload the API', 'sudo systemctl reload wgla'), $ctx)) {
-                    return false;
-                }
-            }
+            // (The server step reloads the API: it still runs the old code.)
 
             if (! $this->fix($installer, $step, $ctx, $interactive, $yes)) {
                 return false;
