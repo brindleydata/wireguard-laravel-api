@@ -601,41 +601,78 @@ it('replaces a FrankenPHP that is older than Octane needs, and restarts the API 
     $shell = (new FakeShell)
         ->on('systemctl is-enabled wgla', fn () => 'enabled')
         ->on('systemctl is-active wgla', fn () => 'active')
-        ->on(':bin version', fn () => 'FrankenPHP v1.0.0 PHP 8.5.0 Caddy v2.8.0 h1:abc');
+        ->on(':bin version', fn () => 'FrankenPHP v1.0.0 PHP 8.5.0 Caddy v2.8.0 h1:abc')
+        ->on('getconf GNU_LIBC_VERSION', fn () => 'glibc 2.39');
     $step = new Server($shell);
     mkdir(dirname($ctx->system(Server::UNIT)), 0755, true);
     file_put_contents($ctx->system(Server::UNIT), $step->unit($ctx));
 
     expect($step->check($ctx))->toHaveCount(1)
         ->and($step->check($ctx)[0])->toStartWith('FrankenPHP 1.0.0 is older than this version of Octane needs (')
-        ->and(array_map(fn ($action) => $action->command, $step->plan($ctx)))->toBe([$step->replaceFrankenPhp($ctx), 'sudo systemctl restart wgla'])
-        ->and($step->replaceFrankenPhp($ctx))->toContain('mv frankenphp frankenphp.old', 'octane:install --server=frankenphp --no-interaction', 'mv -f frankenphp.old frankenphp');
+        ->and(array_map(fn ($action) => $action->command, $step->plan($ctx)))->toBe([$step->downloadFrankenPhp($ctx), 'sudo systemctl restart wgla']);
 });
 
-it('keeps the installed FrankenPHP when the new one cannot be fetched', function () {
+it('downloads FrankenPHP from its releases, not through the rate-limited GitHub API', function () {
+    $ctx = setupContext(answers: ['tls' => 'http', 'bind' => '127.0.0.1', 'port' => '8080']);
+    $step = new Server((new FakeShell)->otherwise(fn () => throw new CommandFailed)); // no glibc found: the static build
+
+    // api.github.com allows 60 requests an hour per IP address without a token, and CI runners
+    // and offices share theirs: an install must not depend on it
+    $download = $step->downloadFrankenPhp($ctx);
+    expect($download)->toContain('https://github.com/php/frankenphp/releases/latest/download/frankenphp-linux-'.php_uname('m')."'")
+        ->not->toContain('api.github.com')->not->toContain('octane:install')
+        ->and(array_map(fn ($action) => $action->command, $step->plan($ctx))[0])->toBe($download, 'A first install downloads the same way');
+
+    // Named as Octane's own installer names them, which is what the project publishes
+    $octane = (string) file_get_contents(__DIR__.'/../../../vendor/laravel/octane/src/Commands/Concerns/InstallsFrankenPhpDependencies.php');
+    expect($octane)->toContain('"frankenphp-linux-x86_64$gnu"', '"frankenphp-linux-aarch64$gnu"', '"frankenphp-mac-$arch"', "['getconf', 'GNU_LIBC_VERSION']")
+        ->and((new Server((new FakeShell)->on('getconf GNU_LIBC_VERSION', fn () => 'glibc 2.39')))->downloadFrankenPhp($ctx))->toContain('/frankenphp-linux-'.php_uname('m')."-gnu'")
+        ->and((new Server(new FakeShell))->downloadFrankenPhp(setupContext('mac')))->toContain('/frankenphp-mac-'.php_uname('m')."'");
+});
+
+it('knows the installed and the current FrankenPHP release without the API', function () {
+    $ctx = setupContext();
+    touch($ctx->app('frankenphp'));
+    chmod($ctx->app('frankenphp'), 0755);
+    $redirect = 'https://github.com/php/frankenphp/releases/tag/v1.14.0';
+    $shell = (new FakeShell)
+        ->on(':bin version', fn () => 'FrankenPHP v1.13.2 PHP 8.5.0 Caddy v2.10.0 h1:abc')
+        ->on("curl -fsS -o /dev/null -w '%{redirect_url}' --max-time 10 :url", function (array $b) use (&$redirect) {
+            expect($b['url'])->toBe('https://github.com/php/frankenphp/releases/latest');
+
+            return $redirect ?? throw new CommandFailed('curl: (6) Could not resolve host');
+        });
+    $step = new Server($shell);
+
+    expect($step->frankenPhpVersion($ctx))->toBe('1.13.2')
+        ->and($step->latestFrankenPhp())->toBe('1.14.0');
+
+    $redirect = null; // GitHub can't be reached: unknown, not "current"
+    expect($step->latestFrankenPhp())->toBeNull()
+        ->and($step->frankenPhpVersion(setupContext()))->toBeNull('No binary yet');
+});
+
+it('keeps the installed FrankenPHP unless a complete, working one was downloaded', function (string $curl, int $exit, string $installed) {
     $ctx = setupContext();
     file_put_contents($ctx->app('frankenphp'), 'old binary');
     chmod($ctx->app('frankenphp'), 0755);
-    file_put_contents($ctx->app('artisan'), "<?php exit(1); // the download fails\n");
-    $step = new Server(new FakeShell);
-    $command = str_replace("'/usr/bin/php'", escapeshellarg(PHP_BINARY), $step->replaceFrankenPhp($ctx));
+    // A curl that "downloads" what the case says, where the real one would fetch the release
+    mkdir("{$this->tmp}/bin");
+    file_put_contents("{$this->tmp}/bin/curl", "#!/bin/sh\n{$curl}\n");
+    chmod("{$this->tmp}/bin/curl", 0755);
 
-    $process = Process::fromShellCommandline($command);
+    $step = new Server((new FakeShell)->otherwise(fn () => throw new CommandFailed));
+    $process = Process::fromShellCommandline($step->downloadFrankenPhp($ctx), env: ['PATH' => "{$this->tmp}/bin:/usr/bin:/bin"]);
     $process->run();
 
-    expect($process->getExitCode())->toBe(1)
-        ->and(file_get_contents($ctx->app('frankenphp')))->toBe('old binary')
-        ->and(file_exists($ctx->app('frankenphp.old')))->toBeFalse();
-
-    // And takes the new one when the download works
-    file_put_contents($ctx->app('artisan'), "<?php file_put_contents(__DIR__.'/frankenphp', 'new binary'); chmod(__DIR__.'/frankenphp', 0755);\n");
-    $process = Process::fromShellCommandline($command);
-    $process->run();
-
-    expect($process->getExitCode())->toBe(0, $process->getErrorOutput())
-        ->and(file_get_contents($ctx->app('frankenphp')))->toBe('new binary')
-        ->and(file_exists($ctx->app('frankenphp.old')))->toBeFalse();
-});
+    expect($process->getExitCode())->toBe($exit, $process->getErrorOutput())
+        ->and(file_get_contents($ctx->app('frankenphp')))->toBe($installed)
+        ->and(file_exists($ctx->app('frankenphp.new')))->toBeFalse('Nothing half-downloaded is left behind');
+})->with([
+    'a working binary' => ["printf '#!/bin/sh\\necho FrankenPHP v9.9.9\\n' > frankenphp.new", 0, "#!/bin/sh\necho FrankenPHP v9.9.9\n"],
+    'a failed download' => ['exit 22', 1, 'old binary'],
+    'an error page instead of a binary' => ["printf '<html>rate limited</html>' > frankenphp.new", 1, 'old binary'],
+]);
 
 it('tells an update whether FrankenPHP changed', function (?string $downloaded, int $exit, ?bool $changed) {
     $ctx = setupContext();

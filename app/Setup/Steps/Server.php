@@ -22,6 +22,13 @@ class Server extends Step
     /** FrankenPHP's admin API, which Octane reloads workers through. Caddy's default too. */
     public const ADMIN_PORT = 2019;
 
+    /**
+     * Where FrankenPHP's releases are downloaded from. Not through api.github.com, as Octane's own
+     * installer does: without a token that is limited to 60 requests an hour per IP address,
+     * which CI runners, offices and cloud NAT gateways share. Then nothing could be installed.
+     */
+    public const RELEASES = 'https://github.com/php/frankenphp/releases';
+
     public function key(): string
     {
         return 'server';
@@ -128,9 +135,9 @@ class Server extends Step
     {
         $actions = [];
         if (! is_executable($ctx->app('frankenphp'))) {
-            $actions[] = Action::command('Download FrankenPHP', 'cd '.self::q($ctx->app()).' && '.self::q($ctx->php).' artisan octane:install --server=frankenphp --no-interaction');
+            $actions[] = Action::command('Download FrankenPHP', $this->downloadFrankenPhp($ctx));
         } elseif ($this->outdatedFrankenPhp($ctx) !== null) {
-            $actions[] = Action::command('Download the current FrankenPHP (the installed one stays if that fails)', $this->replaceFrankenPhp($ctx));
+            $actions[] = Action::command('Download the current FrankenPHP (the installed one stays if that fails)', $this->downloadFrankenPhp($ctx));
             if ($this->unitCurrent($ctx) && $this->running()) {
                 // A reload only restarts the workers inside the running binary
                 return [...$actions, Action::command('Restart the API with it', 'sudo systemctl restart wgla')];
@@ -164,14 +171,50 @@ class Server extends Step
     }
 
     /**
-     * Replace the FrankenPHP binary with the current release. `octane:install` only downloads
-     * one when there is none, so the installed one steps aside first, and comes back if the
-     * download fails.
+     * Download the current FrankenPHP release into the app, in place of an installed one. The new
+     * binary only takes its place once it is complete and runs, so a failed download leaves
+     * things as they were.
      */
-    public function replaceFrankenPhp(Context $ctx): string
+    public function downloadFrankenPhp(Context $ctx): string
     {
-        return '(cd '.self::q($ctx->app()).' && mv frankenphp frankenphp.old && '.self::q($ctx->php).' artisan octane:install --server=frankenphp --no-interaction'
-            .' && test -x frankenphp && rm -f frankenphp.old || { [ -e frankenphp.old ] && mv -f frankenphp.old frankenphp; exit 1; })';
+        $url = self::q(self::RELEASES.'/latest/download/'.$this->frankenPhpAsset($ctx));
+
+        return '(cd '.self::q($ctx->app())." && curl -fsSL --retry 3 --retry-delay 2 -o frankenphp.new {$url}"
+            .' && chmod 755 frankenphp.new && ./frankenphp.new version > /dev/null && mv -f frankenphp.new frankenphp'
+            .' || { rm -f frankenphp.new; exit 1; })';
+    }
+
+    /**
+     * The release asset for this machine, named as Octane's installer names them (OctaneTest
+     * checks that against its source): a glibc build where there is glibc, else the static one.
+     */
+    protected function frankenPhpAsset(Context $ctx): string
+    {
+        $arch = php_uname('m');
+        if ($ctx->isMac()) {
+            return "frankenphp-mac-{$arch}";
+        }
+
+        return 'frankenphp-linux-'.$arch.($this->shell->tryRun('getconf GNU_LIBC_VERSION') === null ? '' : '-gnu');
+    }
+
+    /** The installed binary's version (1.13.2), or null when there is none or it doesn't say. */
+    public function frankenPhpVersion(Context $ctx): ?string
+    {
+        $version = is_executable($ctx->app('frankenphp')) ? $this->shell->tryRun(':bin version', ['bin' => $ctx->app('frankenphp')]) : null;
+
+        return $version !== null && preg_match('/FrankenPHP v?(\d+\.\d+\.\d+)/', $version, $m) ? $m[1] : null;
+    }
+
+    /**
+     * The current release's version, or null when GitHub can't be asked: read from where
+     * …/releases/latest redirects to, which needs no API either.
+     */
+    public function latestFrankenPhp(): ?string
+    {
+        $url = $this->shell->tryRun("curl -fsS -o /dev/null -w '%{redirect_url}' --max-time 10 :url", ['url' => self::RELEASES.'/latest']);
+
+        return $url !== null && preg_match('#/tag/v?(\d+\.\d+\.\d+)$#', $url, $m) ? $m[1] : null;
     }
 
     /**
@@ -186,11 +229,9 @@ class Server extends Step
         $required = class_exists(StartFrankenPhpCommand::class)
             ? ((new ReflectionClass(StartFrankenPhpCommand::class))->getDefaultProperties()['requiredFrankenPhpVersion'] ?? null)
             : null;
-        $version = $this->shell->tryRun(':bin version', ['bin' => $ctx->app('frankenphp')]);
+        $installed = $this->frankenPhpVersion($ctx);
 
-        return is_string($required) && $version !== null && preg_match('/FrankenPHP v?(\d+\.\d+\.\d+)/', $version, $m) && version_compare($m[1], $required, '<')
-            ? [$m[1], $required]
-            : null;
+        return is_string($required) && $installed !== null && version_compare($installed, $required, '<') ? [$installed, $required] : null;
     }
 
     /** The admin port of the service as it is installed, so a re-run or an update doesn't move it. */

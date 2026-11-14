@@ -4,6 +4,7 @@ use App\Http\Middleware\AuthenticateByApiKey;
 use App\Services\KeyManager;
 use App\Services\Server;
 use App\Services\Shell;
+use App\Services\WireGuard;
 use Illuminate\Support\Env;
 use Tests\Fakes\CommandFailed;
 use Tests\Fakes\FakeHost;
@@ -415,4 +416,34 @@ it('refuses networks that cover an address of the server with a 422', function (
     $this->postJson('/link/wg0/peers', ['networks' => '192.0.2.0/24'], $this->auth)
         ->assertUnprocessable()
         ->assertJsonPath('error', fn (string $error) => str_starts_with($error, '192.0.2.0/24 covers 192.0.2.10, an address this server uses itself'));
+});
+
+it('refuses a field it does not know instead of ignoring it', function (string $method, string $uri, array $body, string $error) {
+    $this->postJson('/link', ['name' => 'wg0', 'ip' => '10.0.0.1/24', 'port' => 51820], $this->auth)->assertCreated();
+    $safe = KeyManager::pubkeyToSafe($this->postJson('/link/wg0/peers', [], $this->auth)->json('public_key'));
+    $before = $this->host->conf('wg0');
+
+    // A misspelled field used to get a 200 that had changed nothing
+    $this->json($method, str_replace('{peer}', $safe, $uri), $body, $this->auth)
+        ->assertUnprocessable()
+        ->assertJsonPath('error', fn (string $message) => str_starts_with($message, $error));
+
+    expect($this->host->conf('wg0'))->toBe($before)
+        ->and(app(WireGuard::class)->listLinks())->toBe(['wg0']);
+})->with([
+    'creating a link' => ['POST', '/link', ['name' => 'wg1', 'ip' => '10.1.0.1/24', 'adress6' => 'auto'], 'Unknown field: adress6. Known: name, ip, address6,'],
+    'changing a link' => ['PATCH', '/link/wg0', ['forwrad' => true, 'allowedips' => '10.0.0.0/8'], 'Unknown fields: forwrad, allowedips. Known: address,'],
+    'adding a peer' => ['POST', '/link/wg0/peers', ['name' => 'x', 'network' => '192.168.1.0/24'], 'Unknown field: network. Known: ip, name, networks, remote.'],
+    'changing a peer' => ['PATCH', '/link/wg0/peer/{peer}', ['enable' => false], 'Unknown field: enable. Known: ip,'],
+]);
+
+it('lists the host\'s interfaces, for a link\'s ifout', function () {
+    $this->postJson('/link', ['name' => 'wg0', 'ip' => '10.0.0.1/24', 'port' => 51820], $this->auth)->assertCreated();
+    [$uplink, $loopback] = PHP_OS_FAMILY === 'Darwin' ? ['en0', 'lo0'] : ['eth0', 'lo'];
+
+    $this->getJson('/interfaces', $this->auth)
+        ->assertOk()
+        ->assertJsonPath('default', $uplink)
+        ->assertJsonPath('interfaces', [$loopback, $uplink, $this->host->interfaceOf('wg0')]);
+    $this->getJson('/interfaces')->assertForbidden();
 });

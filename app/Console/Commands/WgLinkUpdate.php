@@ -3,7 +3,6 @@
 namespace App\Console\Commands;
 
 use App\Services\WireGuard;
-use Illuminate\Console\Command;
 
 class WgLinkUpdate extends WgCommand
 {
@@ -49,28 +48,24 @@ class WgLinkUpdate extends WgCommand
             }
 
             if ($params === []) {
-                $this->warn('No options provided. Nothing to update.');
-
-                return Command::SUCCESS;
+                return $this->respond(['message' => 'No options given: nothing to update.'], fn () => $this->warn('No options provided. Nothing to update.'));
             }
 
             $link = $wg->updateLink($name, $params);
         } catch (\Throwable $e) {
-            $this->error($e->getMessage());
-
-            return Command::FAILURE;
+            return $this->failed($e->getMessage());
         }
 
-        $this->info("Updated link {$link->name}");
-        $this->line("Address: {$link->address}");
-        $this->line('IPv6 Address: '.($link->address6 ?? '(none)'));
-        $this->line("Listen Port: {$link->listen_port}");
-        $this->line('MTU: '.($link->mtu ?? '(default)'));
-        $this->line("Outbound: {$link->ifout}");
-        $this->line('Forward: '.($link->forward ? 'enabled' : 'disabled'));
-        $this->line('NAT: '.($link->nat ? 'enabled' : 'disabled'));
-        $this->line('Up: '.($link->up ? 'yes' : 'no'));
-
-        return Command::SUCCESS;
+        return $this->respond($link->toArray(), function () use ($link) {
+            $this->info("Updated link {$link->name}");
+            $this->line("Address: {$link->address}");
+            $this->line('IPv6 Address: '.($link->address6 ?? '(none)'));
+            $this->line("Listen Port: {$link->listen_port}");
+            $this->line('MTU: '.($link->mtu ?? '(default)'));
+            $this->line("Outbound: {$link->ifout}");
+            $this->line('Forward: '.($link->forward ? 'enabled' : 'disabled'));
+            $this->line('NAT: '.($link->nat ? 'enabled' : 'disabled'));
+            $this->line('Up: '.($link->up ? 'yes' : 'no'));
+        });
     }
 }

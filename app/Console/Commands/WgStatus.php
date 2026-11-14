@@ -12,39 +12,45 @@ class WgStatus extends WgCommand
 
     protected $description = 'Show system status';
 
+    /**
+     * Fails when the root helper isn't usable, as GET /health answers 503 then: the API (and
+     * every other command) can't do its job.
+     */
     public function handle(WireGuard $wg): int
     {
         $server = app(Server::class);
 
         try {
             $status = $server->status();
+            $ip = $server->ip();
+            $interfaces = $server->interfaces();
         } catch (\Throwable $e) {
-            $this->error($e->getMessage());
-
-            return Command::FAILURE;
+            return $this->failed($e->getMessage());
         }
-
-        $ip = $server->ip();
-
-        $this->info($status->app['name'].' v'.($status->app['version'] ?? '0.0'));
-        $this->line("Hostname: {$status->hostname}");
-        $this->line('IPv4: '.($ip['ipv4'] ?? '(none)'));
-        $this->line('IPv6: '.($ip['ipv6'] ?? '(none)'));
-        $this->line('');
-        $this->line("CPU: {$status->cpu['cores']} cores, load {$status->cpu['load']}, {$status->cpu['usage']}%");
-        $this->line("RAM: {$status->ram['usage']}% used ({$status->ram['free']} kB free / {$status->ram['total']} kB)");
-        $this->line("Disk: {$status->disk['usage']}% used ({$status->disk['free']} free / {$status->disk['size']})");
-        $this->line('');
-
         $helper = $status->helper;
-        $versions = "installed v{$helper['installed']}, app ships v{$helper['bundled']}";
-        match ($helper['state']) {
-            'ok' => $this->line("Root helper: ok (v{$helper['installed']})"),
-            'missing' => $this->error('Root helper: not installed. Run: php artisan wg:install'),
-            'outdated' => $this->error("Root helper: outdated ({$versions}). Run: php artisan wg:install"),
-            default => $this->error('Root helper: installed, but sudoers does not allow running it. Run: php artisan wg:install'),
-        };
 
-        return Command::SUCCESS;
+        // What GET /status, /ip and /interfaces answer, in one
+        $this->respond([...$status->toArray(), 'ip' => $ip, ...$interfaces], function () use ($status, $ip, $interfaces, $helper) {
+            $this->info($status->app['name'].' v'.($status->app['version'] ?? '0.0'));
+            $this->line("Hostname: {$status->hostname}");
+            $this->line('IPv4: '.($ip['ipv4'] ?? '(none)'));
+            $this->line('IPv6: '.($ip['ipv6'] ?? '(none)'));
+            $this->line('Interfaces: '.implode(' ', $interfaces['interfaces'])." (links go out through {$interfaces['default']} unless told otherwise)");
+            $this->line('');
+            $this->line("CPU: {$status->cpu['cores']} cores, load {$status->cpu['load']}, {$status->cpu['usage']}%");
+            $this->line("RAM: {$status->ram['usage']}% used ({$status->ram['free']} kB free / {$status->ram['total']} kB)");
+            $this->line("Disk: {$status->disk['usage']}% used ({$status->disk['free']} free / {$status->disk['size']})");
+            $this->line('');
+
+            $versions = "installed v{$helper['installed']}, app ships v{$helper['bundled']}";
+            match ($helper['state']) {
+                'ok' => $this->line("Root helper: ok (v{$helper['installed']})"),
+                'missing' => $this->error('Root helper: not installed. Run: php artisan wg:install'),
+                'outdated' => $this->error("Root helper: outdated ({$versions}). Run: php artisan wg:install"),
+                default => $this->error('Root helper: installed, but sudoers does not allow running it. Run: php artisan wg:install'),
+            };
+        });
+
+        return $helper['state'] === 'ok' ? Command::SUCCESS : Command::FAILURE;
     }
 }

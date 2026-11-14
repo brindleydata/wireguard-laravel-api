@@ -3,7 +3,6 @@
 namespace App\Console\Commands;
 
 use App\Services\WireGuard;
-use Illuminate\Console\Command;
 
 class WgPeerUpdate extends WgCommand
 {
@@ -42,29 +41,25 @@ class WgPeerUpdate extends WgCommand
             }
 
             if ($params === []) {
-                $this->warn('No options provided. Nothing to update.');
-
-                return Command::SUCCESS;
+                return $this->respond(['message' => 'No options given: nothing to update.'], fn () => $this->warn('No options provided. Nothing to update.'));
             }
 
             $peer = $wg->updatePeer($link, $pubkey, $params);
         } catch (\Throwable $e) {
-            $this->error($e->getMessage());
-
-            return Command::FAILURE;
+            return $this->failed($e->getMessage());
         }
 
-        $this->info("Updated peer {$peer->public_key}".($peer->name === null ? '' : " ({$peer->name})"));
-        $this->line("Allowed IPs: {$peer->allowed_ips}");
-        $this->line('Enabled: '.($peer->enabled ? 'yes' : 'no'));
+        return $this->respond($peer->toArray(), function () use ($peer) {
+            $this->info("Updated peer {$peer->public_key}".($peer->name === null ? '' : " ({$peer->name})"));
+            $this->line("Allowed IPs: {$peer->allowed_ips}");
+            $this->line('Enabled: '.($peer->enabled ? 'yes' : 'no'));
 
-        if ($peer->client_config !== null) {
-            $this->line('');
-            $this->info('Updated client configuration:');
-            $this->line('');
-            $this->line($peer->client_config);
-        }
-
-        return Command::SUCCESS;
+            if ($peer->client_config !== null) {
+                $this->line('');
+                $this->info('Updated client configuration:');
+                $this->line('');
+                $this->line($peer->client_config);
+            }
+        });
     }
 }

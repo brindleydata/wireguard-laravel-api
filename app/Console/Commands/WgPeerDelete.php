@@ -3,7 +3,6 @@
 namespace App\Console\Commands;
 
 use App\Services\WireGuard;
-use Illuminate\Console\Command;
 
 class WgPeerDelete extends WgCommand
 {
@@ -19,13 +18,9 @@ class WgPeerDelete extends WgCommand
         try {
             $wg->removePeer($link, $pubkey);
         } catch (\Throwable $e) {
-            $this->error($e->getMessage());
-
-            return Command::FAILURE;
+            return $this->failed($e->getMessage());
         }
 
-        $this->info("Removed peer {$pubkey} from {$link}");
-
-        return Command::SUCCESS;
+        return $this->respond(['message' => "Removed peer from {$link}"], fn () => $this->info("Removed peer {$pubkey} from {$link}"));
     }
 }

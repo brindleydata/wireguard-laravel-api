@@ -1,9 +1,10 @@
 <?php
 
 /*
- * wg:install runs `octane:install --server=frankenphp`, which appends entries to .gitignore when
- * they're missing. That would leave every deploy checkout with a local change, and wg:update
- * refuses to update over local changes. So .gitignore must already have everything Octane adds.
+ * `octane:install --server=frankenphp` appends entries to .gitignore when they're missing. The
+ * installer downloads FrankenPHP itself and doesn't run it, but an admin may: that would leave
+ * the deploy checkout with a local change, and wg:update refuses to update over local changes.
+ * So .gitignore must already have everything Octane adds.
  */
 
 it('has every .gitignore entry octane:install would add', function () {

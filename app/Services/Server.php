@@ -114,8 +114,14 @@ class Server
         return $healthy;
     }
 
+    /**
+     * The host's network interfaces, for choosing a link's outbound one (`ifout`), and the one a
+     * link gets when none is given: the default route's.
+     *
+     * @return array{interfaces: list<string>, default: string}
+     */
     public function interfaces(): array
     {
-        return $this->os->networkInterfaces();
+        return ['interfaces' => array_values($this->os->networkInterfaces()), 'default' => $this->os->defaultOutboundInterface()];
     }
 }

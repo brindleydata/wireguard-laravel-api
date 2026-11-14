@@ -56,16 +56,16 @@ wgla update --to=v1.4.0         # a specific release, also an older one
 wgla update --branch=master     # a branch, for testing
 ```
 
-It runs as the deploy user and shows the changelog and any change to the root helper, checks out the release, reinstalls what changed and reloads the API without dropping connections. It also fetches the current FrankenPHP release each time, and restarts the API (briefly) when that changed. If anything fails, it goes back to the previous version.
+It runs as the deploy user and shows the changelog and any change to the root helper, checks out the release, reinstalls what changed and reloads the API without dropping connections. It also brings FrankenPHP to its current release, and restarts the API (briefly) when that changed. If anything fails, it goes back to the previous version.
 
 After deploying another way (`git pull`, rsync), run `wgla install`. It notices that the API runs old code and reloads it.
 
 ## CLI
 
-`wgla <command>` runs `php artisan wg:<command>` as the user it belongs to: link and peer commands as the web user (like the API), `install` and `update` as the deploy user. `wgla` alone lists the commands, and `wgla help <command>` shows a command's options. In a checkout, `bin/wgla` also works without installing, e.g. on macOS for development. It then uses that project, the `php` on your `PATH`, the web user from `.env` (otherwise you), and the project's owner for `install` and `update`. Without an installed root helper, link and peer commands use the project's `bin/wgla-helper` through your own `sudo`, which asks for your password once.
+`wgla <command>` runs `php artisan wg:<command>` as the user it belongs to: link and peer commands as the web user (like the API), `install` and `update` as the deploy user. `wgla` alone lists the commands, and `wgla help <command>` shows a command's options. The link and peer commands and `status` take `--json` and then print exactly what the API returns for the same thing; a failure is `{"error": "…"}` with a non-zero exit code. A public key can be given in either form, as `wg` prints it or as the API's URLs have it. In a checkout, `bin/wgla` also works without installing, e.g. on macOS for development. It then uses that project, the `php` on your `PATH`, the web user from `.env` (otherwise you), and the project's owner for `install` and `update`. Without an installed root helper, link and peer commands use the project's `bin/wgla-helper` through your own `sudo`, which asks for your password once.
 
 ```text
-wgla status                              version, system, root helper
+wgla status                              version, system, interfaces, root helper (fails when the helper isn't usable)
 wgla links                               link names
 wgla link wg0                            a link and its peers
 wgla link:create wg0 10.0.0.1/24 --address6=auto --forward=true --nat=true
@@ -75,7 +75,7 @@ wgla link:repair wg0                     put its forward/NAT rules back, if anot
 wgla link:delete wg0
 wgla link:peers wg0                      peers: names, state, live stats
 wgla peer:create wg0 --name=laptop --qr  the new client config, also as a QR code
-wgla peer wg0 <pubkey> [--qr]            the client config again
+wgla peer wg0 <pubkey> [--qr]            the peer, and its client config again
 wgla peer:update wg0 <pubkey> --enabled=false    (--name --ip --networks --remote --dns --allowed-ips --keepalive)
 wgla peer:rekey wg0 <pubkey>             new keys for a peer; its old client config stops working
 wgla peer:delete wg0 <pubkey>
@@ -92,6 +92,7 @@ Every route except `GET /health` needs the `api-key` header. `{pubkey}` is the p
 | `GET /health` | `200` or `503`, nothing else. Public |
 | `GET /status` | Version, system stats, root helper state |
 | `GET /ip` | The server's public IPv4 and IPv6 |
+| `GET /interfaces` | The host's network interfaces, and the `default` one a link goes out through (for `ifout`) |
 | `GET /links` | Link names |
 | `POST /link` | `name`, `ip` (CIDR), and optionally `address6`, `port`, `ifout`, `mtu`, `dns`, `keepalive`, `allowed_ips`, `forward`, `nat`, `up` |
 | `GET /link/{name}` | The link and its peers. `client` has the `dns`, `keepalive` and `allowed_ips` of its own (`null`: the default), and `firewall` is `ok` or `missing` for a running link with forward or NAT |
@@ -107,7 +108,7 @@ Every route except `GET /health` needs the `api-key` header. `{pubkey}` is the p
 | `GET /link/{link}/peer/{pubkey}/config` | The client config, as it is now |
 | `GET /link/{link}/peer/{pubkey}/qr` | The client config as a QR code (`image/svg+xml`), for the WireGuard apps |
 
-Errors are `{"error": "…"}`: `403` (API key), `404`, `409` (port, subnet or name taken), `422` (invalid input; with `errors` per field when a field has the wrong type), `500` (a system command failed; the message says why).
+Errors are `{"error": "…"}`: `403` (API key), `404`, `409` (port, subnet or name taken), `422` (invalid input, or a field the route doesn't know; with `errors` per field when a field has the wrong type), `500` (a system command failed; the message says why).
 
 ### Links and peers
 

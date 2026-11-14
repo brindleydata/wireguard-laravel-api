@@ -3,7 +3,6 @@
 namespace App\Console\Commands;
 
 use App\Services\WireGuard;
-use Illuminate\Console\Command;
 
 class WgLinkCreate extends WgCommand
 {
@@ -25,34 +24,33 @@ class WgLinkCreate extends WgCommand
 
     public function handle(WireGuard $wg): int
     {
-        $name = $this->argument('link');
-        $ip = $this->argument('ip');
-        $ifout = $this->option('ifout');
-        $dns = $this->option('dns');
-        $allowed_ips = $this->option('allowed-ips');
-
         try {
-            $port = $this->number('port');
-            $keepalive = $this->option('keepalive') === '' ? null : $this->number('keepalive');
-            $forward = $this->flag('forward') ?? false;
-            $nat = $this->flag('nat') ?? false;
-            $up = $this->flag('up') ?? true;
-
-            $link = $wg->createLink($name, $ip, $port, $ifout, $dns, $keepalive, $allowed_ips, $forward, $nat, $up, $this->option('address6'), $this->number('mtu'));
+            $link = $wg->createLink(
+                $this->argument('link'),
+                $this->argument('ip'),
+                $this->number('port'),
+                $this->option('ifout'),
+                $this->option('dns'),
+                $this->option('keepalive') === '' ? null : $this->number('keepalive'),
+                $this->option('allowed-ips'),
+                $this->flag('forward') ?? false,
+                $this->flag('nat') ?? false,
+                $this->flag('up') ?? true,
+                $this->option('address6'),
+                $this->number('mtu'),
+            );
         } catch (\Throwable $e) {
-            $this->error($e->getMessage());
-
-            return Command::FAILURE;
+            return $this->failed($e->getMessage());
         }
 
-        $this->info("Created link {$link->name}");
-        $this->line("Public Key: {$link->public_key}");
-        $this->line("Listen Port: {$link->listen_port}");
-        $this->line("Address: {$link->address}");
-        if ($link->address6 !== null) {
-            $this->line("IPv6 Address: {$link->address6}");
-        }
-
-        return Command::SUCCESS;
+        return $this->respond($link->toArray(), function () use ($link) {
+            $this->info("Created link {$link->name}");
+            $this->line("Public Key: {$link->public_key}");
+            $this->line("Listen Port: {$link->listen_port}");
+            $this->line("Address: {$link->address}");
+            if ($link->address6 !== null) {
+                $this->line("IPv6 Address: {$link->address6}");
+            }
+        });
     }
 }

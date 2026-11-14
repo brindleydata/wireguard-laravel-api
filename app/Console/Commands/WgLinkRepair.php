@@ -16,16 +16,14 @@ class WgLinkRepair extends WgCommand
         try {
             $link = $wg->repairLink($this->argument('link'));
         } catch (\Throwable $e) {
-            $this->error($e->getMessage());
-
-            return Command::FAILURE;
+            return $this->failed($e->getMessage());
         }
 
-        $this->info(match ($link->firewall) {
+        $this->respond($link->toArray(), fn () => $this->info(match ($link->firewall) {
             'ok' => "The firewall rules of {$link->name} are in place.",
             'missing' => "The firewall rules of {$link->name} are still missing.",
             default => $link->up ? "{$link->name} has neither forward nor NAT: no rules to install." : "{$link->name} is down: its rules are installed when it starts.",
-        });
+        }));
 
         return $link->firewall === 'missing' ? Command::FAILURE : Command::SUCCESS;
     }

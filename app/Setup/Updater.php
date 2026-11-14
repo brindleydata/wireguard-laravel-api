@@ -76,7 +76,7 @@ class Updater
     }
 
     /**
-     * Run $command (Steps\Server::replaceFrankenPhp()) to fetch the current FrankenPHP release.
+     * Run $command (Steps\Server::downloadFrankenPhp()) to fetch the current FrankenPHP release.
      * True when the binary changed, false when it was current already, null when the download
      * failed and the installed one is still there.
      */

@@ -170,10 +170,15 @@ class WgUpdate extends WgCommand
         $server = array_find($steps, fn (Step $step) => $step instanceof Server);
         $new_server = false;
         if ($server !== null && is_file($ctx->app('frankenphp'))) {
-            $this->line('→ Fetching the current FrankenPHP');
-            $new_server = $updater->refreshFrankenPhp($ctx, $server->replaceFrankenPhp($ctx));
-            if ($new_server === null) {
-                $this->warn('  That failed. The installed FrankenPHP stays; the next update tries again.');
+            $installed = $server->frankenPhpVersion($ctx);
+            if ($installed !== null && $installed === $server->latestFrankenPhp()) {
+                $this->line("<info>✓</info> FrankenPHP {$installed} is the current release");
+            } else {
+                $this->line('→ Fetching the current FrankenPHP');
+                $new_server = $updater->refreshFrankenPhp($ctx, $server->downloadFrankenPhp($ctx));
+                if ($new_server === null) {
+                    $this->warn('  That failed. The installed FrankenPHP stays; the next update tries again.');
+                }
             }
         }
 

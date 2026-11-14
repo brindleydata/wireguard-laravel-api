@@ -9,6 +9,7 @@ use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Http\Response;
 use Illuminate\Routing\Controller;
+use InvalidArgumentException;
 
 class WireGuard extends Controller
 {
@@ -35,6 +36,26 @@ class WireGuard extends Controller
         return $this->server->ip();
     }
 
+    /** The host's network interfaces (for a link's `ifout`), and the default one. */
+    public function interfaces(): array
+    {
+        return $this->server->interfaces();
+    }
+
+    /**
+     * A request's fields, checked against $rules. A field no rule knows is refused, not dropped:
+     * a misspelled one would otherwise look like a change that was made.
+     */
+    protected function fields(Request $request, array $rules): array
+    {
+        $unknown = array_diff(array_map('strval', array_keys($request->all())), array_keys($rules));
+        if ($unknown !== []) {
+            throw new InvalidArgumentException((count($unknown) === 1 ? 'Unknown field: ' : 'Unknown fields: ').implode(', ', $unknown).'. Known: '.implode(', ', array_keys($rules)).'.');
+        }
+
+        return $request->validate($rules);
+    }
+
     public function links(): array
     {
         return $this->wg->listLinks();
@@ -53,7 +74,7 @@ class WireGuard extends Controller
 
     public function linkCreate(Request $request): JsonResponse
     {
-        $data = $request->validate([
+        $data = $this->fields($request, [
             'name' => 'required|string|max:15',
             'ip' => 'required|string',
             'address6' => 'nullable|string',  // IPv6 address and prefix, or "auto"
@@ -95,7 +116,7 @@ class WireGuard extends Controller
 
     public function linkUpdate(Request $request, string $name): array
     {
-        $data = $request->validate([
+        $data = $this->fields($request, [
             'address' => 'nullable|string',
             'address6' => 'nullable|string',  // IPv6 address and prefix, or "auto"; null removes it
             'port' => 'nullable|integer|min:1|max:65535',
@@ -154,7 +175,7 @@ class WireGuard extends Controller
 
     public function peerCreate(Request $request, string $link): JsonResponse
     {
-        $data = $request->validate([
+        $data = $this->fields($request, [
             'ip' => 'nullable|string',
             'name' => 'nullable|string',      // a label
             'networks' => 'nullable|string',  // networks behind the peer (site-to-site)
@@ -168,15 +189,14 @@ class WireGuard extends Controller
 
     public function peerDelete(string $link, string $pubkey): array
     {
-        $decoded = WireGuardService::safeToPubkey($pubkey);
-        $this->wg->removePeer($link, $decoded);
+        $this->wg->removePeer($link, $pubkey);
 
         return ['message' => "Removed peer from {$link}"];
     }
 
     public function peerUpdate(Request $request, string $link, string $pubkey): array
     {
-        $data = $request->validate([
+        $data = $this->fields($request, [
             'ip' => 'nullable|string',          // tunnel address (server AllowedIPs + client Address)
             'dns' => 'nullable|string',         // client config DNS; null: the link's default
             'allowed_ips' => 'nullable|string', // client config AllowedIPs (routes); null: the link's default
@@ -193,9 +213,7 @@ class WireGuard extends Controller
                 $params[$field] = $data[$field] ?? null;
             }
         }
-        $decoded = WireGuardService::safeToPubkey($pubkey);
-
-        $peer = $this->wg->updatePeer($link, $decoded, $params);
+        $peer = $this->wg->updatePeer($link, $pubkey, $params);
 
         return $peer->toArray();
     }
@@ -203,7 +221,7 @@ class WireGuard extends Controller
     /** New keys for a peer. Its public key changes: the answer has the new one, and the new client config. */
     public function peerRekey(string $link, string $pubkey): array
     {
-        return $this->wg->rekeyPeer($link, WireGuardService::safeToPubkey($pubkey))->toArray();
+        return $this->wg->rekeyPeer($link, $pubkey)->toArray();
     }
 
     public function peerConfig(string $link, string $pubkey): array

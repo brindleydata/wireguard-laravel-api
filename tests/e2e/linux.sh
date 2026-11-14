@@ -212,6 +212,7 @@ check "GET /link has the interface, no private key" "[ \"\$(api $URL/link/e2e0)\
 check "POST /link -> 201" "[ \"\$(api -X POST $URL/link -d '{\"name\":\"e2e2\",\"ip\":\"10.82.0.1/24\",\"port\":51882}')\" = 201 ]"
 check "a port clash -> 409" "[ \"\$(api -X POST $URL/link -d '{\"name\":\"e2e3\",\"ip\":\"10.83.0.1/24\",\"port\":51882}')\" = 409 ]"
 check "a line break in dns -> 422" "[ \"\$(api -X POST $URL/link -d '{\"name\":\"e2e3\",\"ip\":\"10.83.0.1/24\",\"dns\":\"1.1.1.1\\\\nPostUp = id\"}')\" = 422 ]"
+check "a misspelled field -> 422, not a silent 200" "[ \"\$(api -X PATCH $URL/link/e2e0 -d '{\"forwrad\":true}')\" = 422 ] && grep -q 'Unknown field: forwrad' /tmp/wgla-e2e-body"
 check "no API key -> 403" "[ \"\$(curl -s ${CURL_OPTS[*]} -o /dev/null -w '%{http_code}' $URL/links)\" = 403 ]"
 check "DELETE /link/e2e2 -> 200" "[ \"\$(api -X DELETE $URL/link/e2e2)\" = 200 ]"
 
@@ -229,6 +230,7 @@ check "... over IPv6 too" "ip netns exec e2e-client ping -6 -c1 -W3 fd80::1"
 step "The wgla shortcut (wg:install)"
 check "wgla runs link commands as the web user" "wgla links | grep -qw e2e0 && wgla link e2e0 | grep -q 'Interface: e2e0'"
 check "... and takes a backup passphrase through sudo" "WGLA_BACKUP_PASSPHRASE='correct horse battery staple' wgla backup - | grep -q '\"format\": \"wgla-backup\"'"
+check "wgla --json prints what the API returns" "wgla link e2e0 --json | grep -q '\"name\": \"e2e0\"' && wgla links --json | grep -q '\"e2e0\"'"
 check "wgla help shows a command's options" "wgla help peer:create | grep -q -- '--networks'"
 
 step "Delete everything"

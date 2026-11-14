@@ -4,9 +4,11 @@ namespace App\Console\Commands;
 
 use App\Services\Server;
 use App\Services\WireGuard;
+use Closure;
 use Illuminate\Console\Command;
 use InvalidArgumentException;
 use Symfony\Component\Console\Input\InputInterface;
+use Symfony\Component\Console\Input\InputOption;
 use Symfony\Component\Console\Output\OutputInterface;
 
 /**
@@ -41,6 +43,49 @@ class WgCommand extends Command
     protected function runsAsWebUser(): bool
     {
         return $this->getName() !== 'wg:help';
+    }
+
+    /**
+     * The link and peer commands take --json and then print what the API returns for the same
+     * thing, for scripts. Not the ones that walk an admin through something.
+     */
+    protected function configure(): void
+    {
+        parent::configure();
+
+        if (! in_array($this->getName(), ['wg:help', 'wg:install', 'wg:update', 'wg:backup', 'wg:restore'], true)) {
+            $this->addOption('json', null, InputOption::VALUE_NONE, 'Print the result as JSON, as the API returns it');
+        }
+    }
+
+    protected function json(): bool
+    {
+        return $this->input->hasOption('json') && (bool) $this->option('json');
+    }
+
+    /**
+     * The command's result: $data as JSON with --json (what the API answers), else whatever
+     * $text prints.
+     */
+    protected function respond(array $data, Closure $text): int
+    {
+        if ($this->json()) {
+            $this->line(json_encode($data, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE));
+        } else {
+            $text();
+        }
+
+        return self::SUCCESS;
+    }
+
+    /** What went wrong: for people, or as {"error": …} with --json. */
+    protected function failed(string $message): int
+    {
+        $this->json()
+            ? $this->line(json_encode(['error' => $message], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE))
+            : $this->error($message);
+
+        return self::FAILURE;
     }
 
     /**

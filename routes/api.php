@@ -10,6 +10,7 @@ Route::get('/health', [WireGuard::class, 'health']);
 Route::middleware(AuthenticateByApiKey::class)->group(function () {
     Route::get('/status', [WireGuard::class, 'status']);
     Route::get('/ip', [WireGuard::class, 'ip']);
+    Route::get('/interfaces', [WireGuard::class, 'interfaces']);
 
     // Link routes
     Route::get('/links', [WireGuard::class, 'links']);

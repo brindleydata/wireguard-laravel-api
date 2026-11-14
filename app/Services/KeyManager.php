@@ -31,6 +31,15 @@ class KeyManager
         return preg_match('#^[A-Za-z0-9+/]{42}[AEIMQUYcgkosw048]=$#', $key) === 1;
     }
 
+    /**
+     * A public key as `wg` prints it, from either form it is written in: that one, or the
+     * URL-safe one of the API's routes.
+     */
+    public static function normalize(string $key): string
+    {
+        return self::safeToPubkey(self::pubkeyToSafe($key));
+    }
+
     public static function pubkeyToSafe(string $pubkey): string
     {
         return rtrim(strtr($pubkey, '+/', '-_'), '=');

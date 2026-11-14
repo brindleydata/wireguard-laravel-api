@@ -3,7 +3,6 @@
 namespace App\Console\Commands;
 
 use App\Services\WireGuard;
-use Illuminate\Console\Command;
 
 class WgLinkDelete extends WgCommand
 {
@@ -18,13 +17,9 @@ class WgLinkDelete extends WgCommand
         try {
             $wg->deleteLink($name);
         } catch (\Throwable $e) {
-            $this->error($e->getMessage());
-
-            return Command::FAILURE;
+            return $this->failed($e->getMessage());
         }
 
-        $this->info("Deleted link {$name}");
-
-        return Command::SUCCESS;
+        return $this->respond(['message' => "Deleted link: {$name}"], fn () => $this->info("Deleted link {$name}"));
     }
 }

@@ -412,6 +412,8 @@ class WireGuard
 
     public function removePeer(string $link_name, string $pubkey): void
     {
+        $pubkey = KeyManager::normalize($pubkey);
+
         $this->withLock(function () use ($link_name, $pubkey) {
             $iface = $this->runtimeInterface($link_name);
             $link = $this->loadLink($link_name, $iface);
@@ -449,7 +451,7 @@ class WireGuard
      */
     public function getPeer(string $link_name, string $pubkey): ?PeerInfo
     {
-        $pubkey = self::safeToPubkey(self::pubkeyToSafe($pubkey));
+        $pubkey = KeyManager::normalize($pubkey);
         if (! $this->isLinkName($link_name) || ! KeyManager::isKey($pubkey)) {
             return null;
         }
@@ -465,7 +467,7 @@ class WireGuard
      */
     public function getPeerConfig(string $link_name, string $pubkey): ?string
     {
-        $pubkey = self::safeToPubkey(self::pubkeyToSafe($pubkey));
+        $pubkey = KeyManager::normalize($pubkey);
         if (! $this->isLinkName($link_name) || ! KeyManager::isKey($pubkey)) {
             return null;
         }
@@ -503,6 +505,7 @@ class WireGuard
      */
     public function updatePeer(string $link_name, string $pubkey, array $params): PeerInfo
     {
+        $pubkey = KeyManager::normalize($pubkey);
         $params = $this->validateSettings($params);
         if (array_key_exists('name', $params)) {
             $params['name'] = $params['name'] === null || $params['name'] === '' ? null : $this->validator->peerName((string) $params['name']);
@@ -601,6 +604,8 @@ class WireGuard
      */
     public function rekeyPeer(string $link_name, string $pubkey): PeerInfo
     {
+        $pubkey = KeyManager::normalize($pubkey);
+
         return $this->withLock(function () use ($link_name, $pubkey) {
             $iface = $this->runtimeInterface($link_name);
             $link = $this->loadLink($link_name, $iface);
