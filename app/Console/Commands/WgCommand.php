@@ -5,6 +5,7 @@ namespace App\Console\Commands;
 use App\Services\Server;
 use App\Services\WireGuard;
 use Illuminate\Console\Command;
+use InvalidArgumentException;
 use Symfony\Component\Console\Input\InputInterface;
 use Symfony\Component\Console\Output\OutputInterface;
 
@@ -40,6 +41,44 @@ class WgCommand extends Command
     protected function runsAsWebUser(): bool
     {
         return $this->getName() !== 'wg:help';
+    }
+
+    /**
+     * Whether there is someone to ask: not with --no-interaction, and not when stdin is a pipe
+     * or a file (cron, CI, `wgla restore - < file`), where a prompt could only fail.
+     */
+    protected function interactive(): bool
+    {
+        return $this->input->isInteractive() && (stream_isatty(STDIN) || app()->runningUnitTests());
+    }
+
+    /**
+     * A true/false option; null when it wasn't given. A typo is refused, not read as false:
+     * `--up=treu` must not bring a link down.
+     */
+    protected function flag(string $name): ?bool
+    {
+        $value = $this->option($name);
+        if ($value === null) {
+            return null;
+        }
+
+        $flag = $value === '' ? null : filter_var($value, FILTER_VALIDATE_BOOLEAN, FILTER_NULL_ON_FAILURE);
+
+        return $flag ?? throw new InvalidArgumentException("--{$name} must be true or false, not \"{$value}\".");
+    }
+
+    /**
+     * A whole-number option; null when it wasn't given.
+     */
+    protected function number(string $name): ?int
+    {
+        $value = $this->option($name);
+        if ($value === null) {
+            return null;
+        }
+
+        return ctype_digit($value) ? (int) $value : throw new InvalidArgumentException("--{$name} must be a whole number, not \"{$value}\".");
     }
 
     public function handle(WireGuard $wg): int

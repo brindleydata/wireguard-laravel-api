@@ -27,7 +27,8 @@ class WgInstall extends WgCommand
         {--domain= : Domain for the Let\'s Encrypt certificate}
         {--cert= : Certificate file (with --tls=cert)}
         {--key= : Private key file (with --tls=cert)}
-        {--bind= : Address to listen on (with --tls=http)}';
+        {--bind= : Address to listen on (with --tls=http)}
+        {--admin-port= : Local port of FrankenPHP\'s admin API (default: 2019, or the next free one)}';
 
     protected $description = 'Set up this server step by step (re-run any time to check it)';
 
@@ -42,19 +43,30 @@ class WgInstall extends WgCommand
         $installer = app(Installer::class);
         $print = (bool) $this->option('print');
         $yes = (bool) $this->option('yes');
-        $interactive = ! $print && ! $yes && $this->input->isInteractive();
+        $interactive = ! $print && ! $yes && $this->interactive();
 
-        $forward = $this->option('forward');
+        try {
+            $forward = $this->flag('forward');
+            $admin_port = $this->number('admin-port');
+            if ($admin_port !== null && ($admin_port < 1 || $admin_port > 65535)) {
+                throw new \InvalidArgumentException('--admin-port must be a port number.');
+            }
+        } catch (\InvalidArgumentException $e) {
+            $this->error($e->getMessage());
+
+            return Command::FAILURE;
+        }
         $ctx = $installer->context([
             'web_user' => $this->option('user'),
             'hostname' => $this->option('hostname'),
-            'forward' => $forward === null ? null : filter_var($forward, FILTER_VALIDATE_BOOLEAN),
+            'forward' => $forward,
             'tls' => $this->option('tls'),
             'port' => $this->option('port'),
             'domain' => $this->option('domain'),
             'cert' => $this->option('cert'),
             'key' => $this->option('key'),
             'bind' => $this->option('bind'),
+            'admin_port' => $admin_port === null ? null : (string) $admin_port,
         ]);
 
         $steps = $installer->steps();

@@ -53,6 +53,17 @@ function handWrittenConf(): string
     ]);
 }
 
+/**
+ * A link config as written before format 2: no format line, and nothing of a peer's own client
+ * settings in its section (they only showed in its client config).
+ */
+function asFormat1(string $conf): string
+{
+    [$header, $sections] = explode('[Interface]', $conf, 2);
+
+    return preg_replace('/^# format = .*\n/m', '', $header).'[Interface]'.preg_replace('/^# (dns|keepalive|allowed_ips) = .*\n/m', '', $sections);
+}
+
 /*
  * A pf ruleset the real pfctl accepts (parse only: no root needed). Skipped where pfctl is missing.
  */

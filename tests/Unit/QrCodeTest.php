@@ -54,3 +54,10 @@ it('encodes the config so a scanner reads it back', function () {
 
     expect((string) (new Generator)->readFromBlob($png))->toBe(QR_TEST_CONFIG);
 });
+
+it('says so when a client config is too long for a QR code', function (string $form) {
+    // Just under 3 KB fit; a very long AllowedIPs list is more
+    $config = QR_TEST_CONFIG."\nAllowedIPs = ".implode(', ', array_map(fn (int $i) => "10.{$i}.0.0/16", range(1, 250)));
+
+    expect(fn () => (new QrCode)->{$form}($config))->toThrow(InvalidArgumentException::class, 'too long for a QR code');
+})->with(['svg', 'terminal']);

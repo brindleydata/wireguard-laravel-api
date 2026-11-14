@@ -413,10 +413,10 @@ it('goes back to the default when a link\'s or peer\'s own client setting is tak
     $custom = $rig->wg->addPeer('wg0');
     $rig->wg->updatePeer('wg0', $custom->public_key, ['dns' => '1.1.1.1', 'allowed_ips' => '10.0.0.0/16']);
 
-    // The link's own: back to the global WIREGUARD_* defaults, for peers without their own
+    // The link's own: back to the fixed defaults, for peers without their own
     $rig->wg->updateLink('wg0', ['dns' => $nothing, 'keepalive' => $nothing, 'allowed_ips' => $nothing]);
 
-    expect($rig->host->conf('wg0'))->not->toContain('# dns')->not->toContain('# keepalive')->not->toContain('# allowed_ips')
+    expect(explode('[Interface]', $rig->host->conf('wg0'))[0])->not->toContain('# dns')->not->toContain('# keepalive')->not->toContain('# allowed_ips')
         ->and($rig->wg->getPeerConfig('wg0', $plain->public_key))->toContain("DNS = 8.8.8.8\n", 'PersistentKeepalive = 25', "AllowedIPs = 0.0.0.0/0\n")
         ->and($rig->wg->getPeerConfig('wg0', $custom->public_key))->toContain("DNS = 1.1.1.1\n", 'PersistentKeepalive = 25', "AllowedIPs = 10.0.0.0/16\n");
 
@@ -875,3 +875,189 @@ it('refuses a link subnet that a peer of another link routes', function () {
     $rig->wg->addPeer('wg2', networks: '172.21.0.0/16');
     expect(fn () => $rig->wg->updateLink('wg2', ['address' => '172.20.0.1/14']))->toThrow(InvalidArgumentException::class, '172.20.0.1/14 would overlap 172.21.0.0/16');
 });
+
+// ─── A peer's own client settings ───────────────────────────────────
+
+it('stores a peer\'s own client settings with the peer, not in what its client config happens to say', function (string $os) {
+    $rig = new Rig($os);
+    $rig->wg->createLink('wg0', '10.0.0.1/24', 51820);
+    $plain = $rig->wg->addPeer('wg0');
+    $custom = $rig->wg->addPeer('wg0', name: 'laptop');
+
+    $updated = $rig->wg->updatePeer('wg0', $custom->public_key, ['dns' => '1.1.1.1 ,9.9.9.9', 'keepalive' => 5, 'allowed_ips' => '10.0.0.0/24']);
+
+    expect($updated->clientSettings())->toBe(['dns' => '1.1.1.1, 9.9.9.9', 'keepalive' => 5, 'allowed_ips' => '10.0.0.0/24'])
+        ->and($updated->toArray()['client'])->toBe($updated->clientSettings())
+        ->and($updated->allowed_ips)->toBe('10.0.0.3/32', 'What the server routes to it is another matter')
+        ->and($updated->client_config)->toContain("DNS = 1.1.1.1, 9.9.9.9\n", "AllowedIPs = 10.0.0.0/24\n", 'PersistentKeepalive = 5')
+        ->and($rig->host->conf('wg0'))->toContain("[Peer]\n# name = laptop\n# dns = 1.1.1.1, 9.9.9.9\n# keepalive = 5\n# allowed_ips = 10.0.0.0/24\nPublicKey = {$custom->public_key}\n")
+        ->and($rig->wg->getLink('wg0')->peers[0]->clientSettings())->toBe(['dns' => null, 'keepalive' => null, 'allowed_ips' => null])
+        ->and($rig->wg->getLink('wg0')->peers[1]->clientSettings())->toBe($updated->clientSettings());
+
+    // Through live changes, a restart, and being disabled
+    $rig->wg->addPeer('wg0');
+    $rig->wg->updateLink('wg0', ['port' => 51821, 'dns' => '8.8.4.4']);
+    $rig->wg->updatePeer('wg0', $custom->public_key, ['enabled' => false]);
+
+    expect($rig->host->conf('wg0'))->toContain("# [Peer] disabled\n# name = laptop\n# dns = 1.1.1.1, 9.9.9.9\n# keepalive = 5\n# allowed_ips = 10.0.0.0/24\n# PublicKey = {$custom->public_key}\n")
+        ->and($rig->wg->getLink('wg0')->peers[1]->clientSettings())->toBe($updated->clientSettings())
+        ->and($rig->wg->getPeerConfig('wg0', $custom->public_key))->toContain("DNS = 1.1.1.1, 9.9.9.9\n", 'Endpoint = vpn.example.test:51821', 'PersistentKeepalive = 5')
+        ->and($rig->wg->getPeerConfig('wg0', $plain->public_key))->toContain("DNS = 8.8.4.4\n", 'PersistentKeepalive = 25');
+
+    // One taken out again: the others stay
+    $rig->wg->updatePeer('wg0', $custom->public_key, ['keepalive' => null, 'enabled' => true]);
+    expect($rig->wg->getLink('wg0')->peers[1]->clientSettings())->toBe(['dns' => '1.1.1.1, 9.9.9.9', 'keepalive' => null, 'allowed_ips' => '10.0.0.0/24'])
+        ->and($rig->wg->getPeerConfig('wg0', $custom->public_key))->toContain('PersistentKeepalive = 25');
+})->with('os');
+
+it('follows the link when a peer happens to have had the same value', function () {
+    $rig = new Rig('linux');
+    $rig->wg->createLink('wg0', '10.0.0.1/24', 51820, dns: '9.9.9.9');
+    $peer = $rig->wg->addPeer('wg0');
+
+    // Nothing of its own: its config said 9.9.9.9 because its link did. Compared, as it once
+    // was, a client config kept whatever differed from the default of the moment.
+    $rig->wg->updateLink('wg0', ['dns' => '1.1.1.1']);
+    $rig->wg->updateLink('wg0', ['dns' => null]);
+
+    expect($rig->wg->getPeerConfig('wg0', $peer->public_key))->toContain("DNS = 8.8.8.8\n")
+        ->and($rig->host->conf('wg0'))->not->toContain('# dns');
+});
+
+it('records once what the peers of an older config had of their own', function (string $os, bool $up) {
+    $rig = new Rig($os);
+    $rig->wg->createLink('wg0', '10.0.0.1/24', 51820, dns: '9.9.9.9', up: $up);
+    $plain = $rig->wg->addPeer('wg0');
+    $custom = $rig->wg->addPeer('wg0');
+    $rig->wg->updatePeer('wg0', $custom->public_key, ['dns' => '1.1.1.1', 'allowed_ips' => '10.0.0.0/24']);
+    // As an older version left it: the peer's own values only in its client config
+    $rig->host->confs['wg0'] = asFormat1($rig->host->conf('wg0'));
+    expect($rig->host->conf('wg0'))->not->toContain('# format')->not->toContain('1.1.1.1');
+
+    // Readable as it is, and the first change brings it up to date
+    expect($rig->wg->getLink('wg0')->peers[1]->clientSettings())->toBe(['dns' => null, 'keepalive' => null, 'allowed_ips' => null]);
+    $rig->wg->updateLink('wg0', ['dns' => '8.8.4.4']);
+
+    expect($rig->host->conf('wg0'))->toContain("# format = 2\n", "# dns = 1.1.1.1\n# allowed_ips = 10.0.0.0/24\nPublicKey = {$custom->public_key}\n")
+        ->and($rig->wg->getLink('wg0')->peers[0]->clientSettings())->toBe(['dns' => null, 'keepalive' => null, 'allowed_ips' => null])
+        ->and($rig->wg->getPeerConfig('wg0', $plain->public_key))->toContain("DNS = 8.8.4.4\n")
+        ->and($rig->wg->getPeerConfig('wg0', $custom->public_key))->toContain("DNS = 1.1.1.1\n", "AllowedIPs = 10.0.0.0/24\n");
+
+    // Nothing is compared again: a client config changed by hand is just re-rendered
+    $safe = KeyManager::pubkeyToSafe($plain->public_key);
+    $rig->host->clients["wg0/{$safe}"] = str_replace('DNS = 8.8.4.4', 'DNS = 4.4.4.4', $rig->host->clients["wg0/{$safe}"]);
+    $rig->wg->updateLink('wg0', ['keepalive' => 30]);
+
+    expect($rig->wg->getPeerConfig('wg0', $plain->public_key))->toContain("DNS = 8.8.4.4\n")
+        ->and($rig->wg->getLink('wg0')->peers[0]->dns)->toBeNull();
+})->with('os')->with(['running' => true, 'stopped' => false]);
+
+// ─── Moving a link, and other leftovers ─────────────────────────────
+
+it('moves a link to another subnet with its peers, when told to', function (string $os, bool $up) {
+    $rig = new Rig($os);
+    $rig->wg->createLink('wg0', '10.0.0.1/24', 51820, address6: 'fd12::1/64', up: $up);
+    $first = $rig->wg->addPeer('wg0');
+    $branch = $rig->wg->addPeer('wg0', '10.0.0.77', networks: '192.168.1.0/24');
+    $rig->wg->updatePeer('wg0', $first->public_key, ['enabled' => false]);
+
+    // Not by itself: every client would need a new config
+    expect(fn () => $rig->wg->updateLink('wg0', ['address' => '10.1.0.1/24']))
+        ->toThrow(InvalidArgumentException::class, 'Peer 10.0.0.2 would not fit the new address 10.1.0.1/24. To move the link\'s peers along (each keeps its host number, and every client needs its new config), pass move_peers (--move-peers).');
+
+    $link = $rig->wg->updateLink('wg0', ['address' => '10.1.0.1/24', 'move_peers' => true]);
+
+    expect($link->address)->toBe('10.1.0.1/24')
+        ->and($link->up)->toBe($up)
+        ->and(array_map(fn (PeerInfo $p) => $p->allowed_ips, $link->peers))->toBe(['10.1.0.2/32, fd12::2/128', '10.1.0.77/32, fd12::4d/128, 192.168.1.0/24'])
+        ->and($link->peers[0]->enabled)->toBeFalse()
+        ->and($rig->wg->getPeerConfig('wg0', $first->public_key))->toContain("Address = 10.1.0.2/32, fd12::2/128\n")
+        ->and($rig->wg->getPeerConfig('wg0', $branch->public_key))->toContain("Address = 10.1.0.77/32, fd12::4d/128\n");
+    if ($up) {
+        expect($rig->host->runtimePeers('wg0'))->toBe([$branch->public_key => '10.1.0.77/32, fd12::4d/128, 192.168.1.0/24']);
+    }
+
+    // The next free address is in the new subnet
+    expect($rig->wg->addPeer('wg0')->allowed_ips)->toBe('10.1.0.3/32, fd12::3/128');
+})->with('os')->with(['running' => true, 'stopped' => false]);
+
+it('refuses to move peers where they have no place', function (string $address, string $error) {
+    $rig = new Rig('linux');
+    $rig->wg->createLink('wg0', '10.0.0.1/24', 51820);
+    $rig->wg->addPeer('wg0', '10.0.0.5');
+    $rig->wg->addPeer('wg0', '10.0.0.200');
+    $conf = $rig->host->conf('wg0');
+
+    expect(fn () => $rig->wg->updateLink('wg0', ['address' => $address, 'move_peers' => true]))->toThrow(InvalidArgumentException::class, $error)
+        ->and($rig->host->conf('wg0'))->toBe($conf);
+})->with([
+    'a subnet too small for a host number' => ['10.1.0.1/25', "Peer 10.0.0.200 can't move along: its host number 200 doesn't fit 10.1.0.1/25."],
+    "the link's own new address" => ['10.1.0.5/24', "Peer 10.1.0.5 would not fit the new address 10.1.0.5/24: that is the link's own"],
+]);
+
+it('leaves peers where they are when a link only grows or shrinks around them', function () {
+    $rig = new Rig('linux');
+    $rig->wg->createLink('wg0', '10.0.0.1/24', 51820);
+    $peer = $rig->wg->addPeer('wg0', '10.0.0.127');
+
+    expect($rig->wg->updateLink('wg0', ['address' => '10.0.0.1/16'])->peers[0]->allowed_ips)->toBe('10.0.0.127/32')
+        // .127 would be the broadcast address of a /25
+        ->and(fn () => $rig->wg->updateLink('wg0', ['address' => '10.0.0.1/25']))->toThrow(InvalidArgumentException::class, 'the network or the broadcast address')
+        ->and($rig->host->confPeers('wg0'))->toBe([$peer->public_key => '10.0.0.127/32']);
+});
+
+it('keeps the link\'s mask when a new address comes without one', function () {
+    $rig = new Rig('linux');
+    $rig->wg->createLink('wg0', '10.0.0.1/16', 51820);
+    $rig->wg->addPeer('wg0', '10.0.200.7');
+
+    // It used to become a /24, whatever the link was
+    expect($rig->wg->updateLink('wg0', ['address' => '10.0.0.9'])->address)->toBe('10.0.0.9/16')
+        ->and($rig->wg->createLink('wg1', '10.1.0.1', 51821)->address)->toBe('10.1.0.1/24', 'A new link without one is a /24');
+});
+
+it('restarts the link when a peer with networks behind it goes, so its routes go too', function (string $os) {
+    $rig = new Rig($os);
+    $rig->wg->createLink('wg0', '10.0.0.1/24', 51820);
+    $plain = $rig->wg->addPeer('wg0');
+    $branch = $rig->wg->addPeer('wg0', networks: '192.168.1.0/24');
+    $starts = fn () => count($rig->shell->callsTo('sudo -n :helper up :name'));
+    $before = $starts();
+
+    $rig->wg->removePeer('wg0', $branch->public_key);
+
+    expect($starts())->toBe($before + 1, 'wg-quick only takes routes away when the link stops')
+        ->and($rig->host->runtimePeers('wg0'))->toBe([$plain->public_key => '10.0.0.2/32'])
+        ->and($rig->wg->getPeerConfig('wg0', $branch->public_key))->toBeNull();
+
+    // A peer without networks goes live, as before
+    $rig->wg->removePeer('wg0', $plain->public_key);
+    expect($starts())->toBe($before + 1)->and($rig->host->runtimePeers('wg0'))->toBe([]);
+})->with('os');
+
+it('keeps a peer whose removal the link does not restart with', function () {
+    $rig = new Rig('linux');
+    $rig->wg->createLink('wg0', '10.0.0.1/24', 51820);
+    $branch = $rig->wg->addPeer('wg0', networks: '192.168.1.0/24');
+    $rig->host->failNextStart = true;
+
+    expect(fn () => $rig->wg->removePeer('wg0', $branch->public_key))->toThrow(SystemException::class, 'was undone');
+
+    expect($rig->host->runtimePeers('wg0'))->toBe([$branch->public_key => '10.0.0.2/32, 192.168.1.0/24'])
+        ->and($rig->wg->getPeerConfig('wg0', $branch->public_key))->toBe($branch->client_config);
+});
+
+it('leaves a disabled peer where it was among the others', function (string $os, bool $up) {
+    $rig = new Rig($os);
+    $rig->wg->createLink('wg0', '10.0.0.1/24', 51820, up: $up);
+    $keys = array_map(fn (string $name) => $rig->wg->addPeer('wg0', name: $name)->public_key, ['a', 'b', 'c']);
+    $order = fn () => implode('', array_map(fn (PeerInfo $p) => $p->name, $rig->wg->getLink('wg0')->peers));
+
+    $rig->wg->updatePeer('wg0', $keys[0], ['enabled' => false]);
+    $rig->wg->updatePeer('wg0', $keys[1], ['enabled' => false]);
+    expect($order())->toBe('abc');
+
+    $rig->wg->updatePeer('wg0', $keys[0], ['enabled' => true]);
+    $rig->wg->addPeer('wg0', name: 'd');
+    expect($order())->toBe('abcd');
+})->with('os')->with(['running' => true, 'stopped' => false]);

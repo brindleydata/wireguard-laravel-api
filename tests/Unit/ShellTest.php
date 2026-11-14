@@ -45,3 +45,14 @@ it('runs commands from / whatever the caller\'s directory', function () {
 it('returns null from tryRun when the command fails', function () {
     expect((new Shell)->tryRun('sh -c :script', ['script' => 'exit 1']))->toBeNull();
 });
+
+it('never binds a placeholder inside a value it has bound', function () {
+    // Bound one after the other, ":key" inside the first value would be replaced by the second
+    // value, quoted on its own: it would end up outside the first value's quotes
+    expect((new Shell)->run('printf "%s|%s" :link :key', ['link' => 'a:key', 'key' => '$(echo injected)']))
+        ->toBe('a:key|$(echo injected)');
+});
+
+it('leaves what is not a binding alone', function () {
+    expect((new Shell)->run('printf %s :value:8080/:path', ['value' => 'host']))->toBe('host:8080/:path');
+});

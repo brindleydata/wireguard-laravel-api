@@ -71,3 +71,46 @@ it('shows a client config for either form of the public key', function () {
         ->assertSuccessful();
     $this->artisan('wg:peer', ['link' => 'wg0', 'pubkey' => 'not-a-key'])->assertFailed();
 });
+
+it('refuses a mistyped option instead of reading it as false or 0', function (string $command, array $options, string $error) {
+    $wg = app(WireGuard::class);
+    $key = $wg->addPeer('wg0')->public_key;
+    $arguments = str_contains($command, 'peer') ? ['link' => 'wg0', 'pubkey' => $key] : ['link' => 'wg0'];
+
+    $this->artisan($command, [...$arguments, ...$options])->expectsOutputToContain($error)->assertFailed();
+
+    // "--up=treu" used to bring the link down
+    expect($wg->getLink('wg0')->up)->toBeTrue()
+        ->and($wg->getLink('wg0')->peers[0]->enabled)->toBeTrue()
+        ->and($wg->getLink('wg0')->listen_port)->toBe(51820);
+})->with([
+    ['wg:link:update', ['--up' => 'treu'], '--up must be true or false, not "treu".'],
+    ['wg:link:update', ['--forward' => 'enable'], '--forward must be true or false'],
+    ['wg:link:update', ['--port' => '51821x'], '--port must be a whole number, not "51821x".'],
+    ['wg:link:update', ['--keepalive' => 'abc'], '--keepalive must be a whole number'],
+    ['wg:peer:update', ['--enabled' => 'no way'], '--enabled must be true or false'],
+    ['wg:peer:update', ['--keepalive' => '-5'], '--keepalive must be a whole number'],
+]);
+
+it('still takes the usual words for true and false', function () {
+    $this->artisan('wg:link:update', ['link' => 'wg0', '--forward' => 'yes', '--nat' => '1'])->expectsOutputToContain('Forward: enabled')->assertSuccessful();
+    $this->artisan('wg:link:update', ['link' => 'wg0', '--up' => 'off'])->expectsOutputToContain('Up: no')->assertSuccessful();
+    $this->artisan('wg:link:create', ['link' => 'wg1', 'ip' => '10.1.0.1/24', '--up' => 'flase'])->expectsOutputToContain('--up must be true or false')->assertFailed();
+
+    expect(app(WireGuard::class)->listLinks())->toBe(['wg0']);
+});
+
+it('moves a link and its peers, and gives a peer its own keepalive', function () {
+    $wg = app(WireGuard::class);
+    $key = $wg->addPeer('wg0')->public_key;
+
+    $this->artisan('wg:link:update', ['link' => 'wg0', '--address' => '10.5.0.1/24'])->expectsOutputToContain('--move-peers')->assertFailed();
+    $this->artisan('wg:link:update', ['link' => 'wg0', '--address' => '10.5.0.1/24', '--move-peers' => true])
+        ->expectsOutputToContain('Address: 10.5.0.1/24')
+        ->assertSuccessful();
+    $this->artisan('wg:peer:update', ['link' => 'wg0', 'pubkey' => $key, '--keepalive' => '7'])
+        ->expectsOutputToContain('PersistentKeepalive = 7')
+        ->assertSuccessful();
+
+    expect($wg->getLink('wg0')->peers[0])->allowed_ips->toBe('10.5.0.2/32')->keepalive->toBe(7);
+});

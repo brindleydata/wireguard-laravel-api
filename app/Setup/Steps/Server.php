@@ -8,6 +8,8 @@ use App\Setup\Context;
 use App\Setup\EnvFile;
 use App\Setup\Question;
 use App\Setup\Step;
+use Laravel\Octane\Commands\StartFrankenPhpCommand;
+use ReflectionClass;
 
 /**
  * Linux: the API as a systemd service running Octane + FrankenPHP as the web user. FrankenPHP
@@ -16,6 +18,9 @@ use App\Setup\Step;
 class Server extends Step
 {
     public const UNIT = '/etc/systemd/system/wgla.service';
+
+    /** FrankenPHP's admin API, which Octane reloads workers through. Caddy's default too. */
+    public const ADMIN_PORT = 2019;
 
     public function key(): string
     {
@@ -77,11 +82,25 @@ class Server extends Step
         ];
     }
 
+    /**
+     * The admin port isn't asked for: it stays what the installed service uses, and a new
+     * install takes 2019 unless something else has it (a Caddy reverse proxy on this host does),
+     * then the next free port. `--admin-port=` sets it by hand.
+     */
+    public function after(Context $ctx): void
+    {
+        if ($ctx->answer('admin_port') === null) {
+            $ctx->answers['admin_port'] = (string) ($this->installedAdminPort($ctx) ?? $this->freeAdminPort($ctx));
+        }
+    }
+
     public function check(Context $ctx): array
     {
         $problems = [];
         if (! is_executable($ctx->app('frankenphp'))) {
             $problems[] = 'FrankenPHP is not downloaded';
+        } elseif (($outdated = $this->outdatedFrankenPhp($ctx)) !== null) {
+            $problems[] = "FrankenPHP {$outdated[0]} is older than this version of Octane needs ({$outdated[1]}): the service would not start again";
         }
 
         if (! $this->unitCurrent($ctx)) {
@@ -110,6 +129,12 @@ class Server extends Step
         $actions = [];
         if (! is_executable($ctx->app('frankenphp'))) {
             $actions[] = Action::command('Download FrankenPHP', 'cd '.self::q($ctx->app()).' && '.self::q($ctx->php).' artisan octane:install --server=frankenphp --no-interaction');
+        } elseif ($this->outdatedFrankenPhp($ctx) !== null) {
+            $actions[] = Action::command('Download the current FrankenPHP (the installed one stays if that fails)', $this->replaceFrankenPhp($ctx));
+            if ($this->unitCurrent($ctx) && $this->running()) {
+                // A reload only restarts the workers inside the running binary
+                return [...$actions, Action::command('Restart the API with it', 'sudo systemctl restart wgla')];
+            }
         }
 
         $unit = self::q($ctx->system(self::UNIT));
@@ -136,6 +161,67 @@ class Server extends Step
     public function manual(Context $ctx): string
     {
         return "Make the certificate and key readable by {$ctx->webUser()} (e.g. a group it belongs to), or copy them somewhere it can read.";
+    }
+
+    /**
+     * Replace the FrankenPHP binary with the current release. `octane:install` only downloads
+     * one when there is none, so the installed one steps aside first, and comes back if the
+     * download fails.
+     */
+    public function replaceFrankenPhp(Context $ctx): string
+    {
+        return '(cd '.self::q($ctx->app()).' && mv frankenphp frankenphp.old && '.self::q($ctx->php).' artisan octane:install --server=frankenphp --no-interaction'
+            .' && test -x frankenphp && rm -f frankenphp.old || { [ -e frankenphp.old ] && mv -f frankenphp.old frankenphp; exit 1; })';
+    }
+
+    /**
+     * [installed, required] when the binary is older than Octane's minimum. Octane then wants to
+     * replace it when the service starts, which the web user can't (the code is read-only for
+     * it), so the service wouldn't come up again. Null when it is recent enough, or unknown.
+     *
+     * @return array{0: string, 1: string}|null
+     */
+    protected function outdatedFrankenPhp(Context $ctx): ?array
+    {
+        $required = class_exists(StartFrankenPhpCommand::class)
+            ? ((new ReflectionClass(StartFrankenPhpCommand::class))->getDefaultProperties()['requiredFrankenPhpVersion'] ?? null)
+            : null;
+        $version = $this->shell->tryRun(':bin version', ['bin' => $ctx->app('frankenphp')]);
+
+        return is_string($required) && $version !== null && preg_match('/FrankenPHP v?(\d+\.\d+\.\d+)/', $version, $m) && version_compare($m[1], $required, '<')
+            ? [$m[1], $required]
+            : null;
+    }
+
+    /** The admin port of the service as it is installed, so a re-run or an update doesn't move it. */
+    protected function installedAdminPort(Context $ctx): ?int
+    {
+        $unit = $ctx->system(self::UNIT);
+
+        return is_file($unit) && preg_match('/--admin-port=(\d+)/', (string) file_get_contents($unit), $m) ? (int) $m[1] : null;
+    }
+
+    protected function freeAdminPort(Context $ctx): int
+    {
+        for ($port = self::ADMIN_PORT; $port < self::ADMIN_PORT + 100; $port++) {
+            if ((string) $port !== (string) $ctx->answer('port') && $this->portFree($port)) {
+                return $port;
+            }
+        }
+
+        return self::ADMIN_PORT;
+    }
+
+    /** Whether nothing listens on a local port: can we bind it ourselves? */
+    protected function portFree(int $port): bool
+    {
+        $socket = @stream_socket_server("tcp://127.0.0.1:{$port}");
+        if ($socket === false) {
+            return false;
+        }
+        fclose($socket);
+
+        return true;
     }
 
     protected function unitCurrent(Context $ctx): bool
@@ -186,6 +272,7 @@ class Server extends Step
     {
         $app = $ctx->app();
         $port = (string) $ctx->answer('port', '443');
+        $admin = (string) $ctx->answer('admin_port', self::ADMIN_PORT);
         $tls = $ctx->answer('tls');
 
         [$site, $directive, $host] = match ($tls) {
@@ -207,7 +294,7 @@ class Server extends Step
             Environment=XDG_DATA_HOME={$app}/storage/framework/caddy XDG_CONFIG_HOME={$app}/storage/framework/caddy
             Environment="WGLA_SITE_ADDRESS={$site}"
             Environment="WGLA_TLS_DIRECTIVE={$directive}"
-            ExecStart={$ctx->php} {$app}/artisan octane:start --server=frankenphp --host={$host} --port={$port} --admin-port=2019{$https} --caddyfile={$app}/deploy/Caddyfile
+            ExecStart={$ctx->php} {$app}/artisan octane:start --server=frankenphp --host={$host} --port={$port} --admin-port={$admin}{$https} --caddyfile={$app}/deploy/Caddyfile
             ExecReload={$ctx->php} {$app}/artisan octane:reload --server=frankenphp
             Restart=on-failure
             # Bind ports below 1024 without root. Never add NoNewPrivileges: it would break sudo to the root helper.

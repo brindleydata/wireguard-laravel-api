@@ -3,9 +3,11 @@
 namespace App\Services;
 
 use chillerlan\QRCode\Common\EccLevel;
+use chillerlan\QRCode\Data\QRCodeDataException;
 use chillerlan\QRCode\Output\QRMarkupSVG;
 use chillerlan\QRCode\QRCode as Generator;
 use chillerlan\QRCode\QROptions;
+use InvalidArgumentException;
 
 /**
  * QR codes of client configs, which the WireGuard apps can scan. Dark modules on a light
@@ -16,12 +18,12 @@ class QrCode
     /** An SVG image with a white background (also on a dark page). */
     public function svg(string $data): string
     {
-        $svg = (new Generator(new QROptions([
+        $svg = $this->fitting(fn () => (new Generator(new QROptions([
             'eccLevel' => EccLevel::L,
             'outputInterface' => QRMarkupSVG::class,
             'outputBase64' => false,
             'drawLightModules' => false,
-        ])))->render($data);
+        ])))->render($data));
 
         // The SVG output has no background of its own: put one behind the modules
         return preg_replace('/(<svg\b[^>]*>)/', '$1<rect width="100%" height="100%" fill="#ffffff"/>', $svg, 1);
@@ -33,10 +35,10 @@ class QrCode
      */
     public function terminal(string $data): string
     {
-        $rows = (new Generator(new QROptions(['eccLevel' => EccLevel::L, 'quietzoneSize' => 2])))
+        $rows = $this->fitting(fn () => (new Generator(new QROptions(['eccLevel' => EccLevel::L, 'quietzoneSize' => 2])))
             ->addByteSegment($data)
             ->getQRMatrix()
-            ->getBooleanMatrix();
+            ->getBooleanMatrix());
 
         $lines = [];
         for ($y = 0; $y < count($rows); $y += 2) {
@@ -52,5 +54,17 @@ class QrCode
         }
 
         return implode("\n", $lines);
+    }
+
+    /**
+     * A QR code holds just under 3 KB; a client config with a very long AllowedIPs list is more.
+     */
+    protected function fitting(callable $render): mixed
+    {
+        try {
+            return $render();
+        } catch (QRCodeDataException) {
+            throw new InvalidArgumentException('This client config is too long for a QR code.');
+        }
     }
 }

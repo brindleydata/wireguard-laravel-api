@@ -104,6 +104,7 @@ class WireGuard extends Controller
             'forward' => 'nullable|boolean',
             'nat' => 'nullable|boolean',
             'up' => 'nullable|boolean',
+            'move_peers' => 'nullable|boolean',  // with a new address: peers keep their host number in it
         ]);
 
         // Only the fields that were sent. For most a null says nothing; for these it is a value:
@@ -158,13 +159,14 @@ class WireGuard extends Controller
             'ip' => 'nullable|string',          // tunnel address (server AllowedIPs + client Address)
             'dns' => 'nullable|string',         // client config DNS; null: the link's default
             'allowed_ips' => 'nullable|string', // client config AllowedIPs (routes); null: the link's default
+            'keepalive' => 'nullable|integer|min:0|max:65535', // client config keepalive; null: the link's default
             'name' => 'nullable|string',        // a label; null removes it
             'enabled' => 'nullable|boolean',    // false takes the peer off the interface
             'networks' => 'nullable|string',    // networks behind the peer; null removes them
         ]);
 
         $params = array_filter($data, fn ($v) => $v !== null);
-        foreach (['name', 'networks', 'dns', 'allowed_ips'] as $field) {
+        foreach (['name', 'networks', 'dns', 'allowed_ips', 'keepalive'] as $field) {
             if ($request->exists($field)) {
                 $params[$field] = $data[$field] ?? null;
             }

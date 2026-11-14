@@ -13,6 +13,11 @@ class Server
     /** The code this process (an Octane worker: for its whole life) booted with. */
     protected static ?string $runningCode = null;
 
+    /** Seconds a healthy answer is good for. */
+    protected const HEALTHY_FOR = 5;
+
+    protected int $healthyUntil = 0;
+
     public function __construct(
         protected OsDriver $os,
     ) {}
@@ -88,10 +93,25 @@ class Server
         return function_exists('posix_getpwuid') ? (posix_getpwuid(posix_geteuid())['name'] ?? '') : get_current_user();
     }
 
-    /** Whether the API can do its job: the root helper is installed, current and allowed by sudo. */
+    /**
+     * Whether the API can do its job: the root helper is installed, current and allowed by sudo.
+     *
+     * /health is public and asking means running sudo, so a healthy answer is kept for a few
+     * seconds (by this instance: an Octane worker). An unhealthy one never is: once the cause is
+     * fixed, the next request says so.
+     */
     public function healthy(): bool
     {
-        return $this->os->helperStatus()['state'] === 'ok';
+        if (time() < $this->healthyUntil) {
+            return true;
+        }
+
+        $healthy = $this->os->helperStatus()['state'] === 'ok';
+        if ($healthy) {
+            $this->healthyUntil = time() + self::HEALTHY_FOR;
+        }
+
+        return $healthy;
     }
 
     public function interfaces(): array

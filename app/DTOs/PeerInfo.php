@@ -14,6 +14,8 @@ class PeerInfo
      * @param  int|null  $latest_handshake  Unix time; null when it never happened
      * @param  string|null  $networks  networks behind the peer (site-to-site): its server-side
      *                                 AllowedIPs besides its tunnel addresses
+     * @param  string|null  $dns  the peer's own client settings, each null where it follows its
+     *                            link: DNS, keepalive, and ($client_allowed_ips) what it routes
      */
     public function __construct(
         public readonly string $public_key,
@@ -28,7 +30,20 @@ class PeerInfo
         public readonly ?string $name = null,
         public readonly bool $enabled = true,
         public readonly ?string $networks = null,
+        public readonly ?string $dns = null,
+        public readonly ?int $keepalive = null,
+        public readonly ?string $client_allowed_ips = null,
     ) {}
+
+    /**
+     * What the peer's client config gets instead of its link's defaults.
+     *
+     * @return array{dns: ?string, keepalive: ?int, allowed_ips: ?string}
+     */
+    public function clientSettings(): array
+    {
+        return ['dns' => $this->dns, 'keepalive' => $this->keepalive, 'allowed_ips' => $this->client_allowed_ips];
+    }
 
     /** Null while the link is down: there is nothing to know. */
     public function connected(?int $now = null): ?bool
@@ -49,6 +64,7 @@ class PeerInfo
             'preshared_key' => $this->preshared_key,
             'allowed_ips' => $this->allowed_ips,
             'networks' => $this->networks,
+            'client' => $this->clientSettings(),
             'endpoint' => $this->endpoint,
             'latest_handshake_at' => $this->latest_handshake === null ? null : gmdate('Y-m-d\TH:i:s\Z', $this->latest_handshake),
             'connected' => $this->connected(),

@@ -171,6 +171,9 @@ class WireGuard
      *
      * A change that needs the link (re)started is undone when the link then doesn't start: the
      * previous config goes back and a link that was running runs again.
+     *
+     * A new `address` in another subnet needs `move_peers`: each peer then keeps its host number
+     * there (10.0.0.5 → 10.1.0.5), and every client needs its new config.
      */
     public function updateLink(string $name, array $params): InterfaceInfo
     {
@@ -181,7 +184,10 @@ class WireGuard
             $this->validator->validatePort((int) $params['port']);
         }
         if (isset($params['address'])) {
-            $params['address'] = $this->validator->linkAddress(str_contains($params['address'], '/') ? $params['address'] : $params['address'].'/24');
+            // Without a mask it keeps the link's own, known under the lock
+            str_contains($params['address'], '/')
+                ? $params['address'] = $this->validator->linkAddress($params['address'])
+                : $this->validator->validateIpAddress($params['address']);
         }
         // Format only: the full check needs the link's IPv4 address, read under the lock
         if (isset($params['address6']) && ! in_array($params['address6'], ['', 'none', 'auto'], true)) {
@@ -202,6 +208,9 @@ class WireGuard
             }
             $this->assertManaged($name, $content);
             $meta = ConfigBuilder::parseMetadata($content);
+            if (isset($params['address']) && ! str_contains($params['address'], '/')) {
+                $params['address'] = $this->validator->linkAddress($params['address'].'/'.(explode('/', $meta['address'] ?? '', 2)[1] ?? '24'));
+            }
 
             // IPv6: a new value (null removes it), else the current one, checked against the IPv4 address
             $address = $params['address'] ?? $meta['address'] ?? '';
@@ -219,8 +228,10 @@ class WireGuard
                     $changed6 ? $address6 : null,
                 );
             }
+            // Peers stay where they are unless told to move along with the link
+            $moved_from = isset($params['address']) && ! empty($params['move_peers']) ? ($meta['address'] ?? null) : null;
             if (isset($params['address']) || $changed6) {
-                $this->assertPeersFit($name, $address, $address6);
+                $this->assertPeersFit($name, $address, $address6, $moved_from);
             }
 
             $iface = $this->runtimeInterface($name);
@@ -264,8 +275,8 @@ class WireGuard
 
             // Rewrite while the interface still exists: a running link's peers are read from it.
             // Peers' IPv6 addresses mirror their IPv4 host number, so they move with the addresses.
-            $this->rewriteConf($name, $iface, $overrides, $readdress && ($address6 !== null || $current6 !== null)
-                ? fn (array $peers) => $this->readdressPeers($peers, $address, $address6, $current6)
+            $this->rewriteConf($name, $iface, $overrides, $readdress && ($address6 !== null || $current6 !== null || $moved_from !== null)
+                ? fn (array $peers) => $this->readdressPeers($peers, $address, $address6, $current6, $moved_from)
                 : null, $content);
 
             try {
@@ -291,7 +302,7 @@ class WireGuard
             if ($changed6 || array_intersect(['port', 'dns', 'keepalive', 'allowed_ips', 'address'], array_keys($params)) !== []) {
                 $current_meta = $this->os->parseConfig($name) ?? [];
                 foreach ($link->peers as $peer) {
-                    $this->refreshClientConfig($link, $peer->public_key, $meta, $current_meta);
+                    $this->refreshClientConfig($link, $peer->public_key, $peer->allowed_ips, $peer->clientSettings(), $current_meta);
                 }
             }
 
@@ -344,7 +355,8 @@ class WireGuard
             ];
 
             if ($iface !== null && $networks === []) {
-                // Piped through stdin so the preshared key never touches the disk
+                // On stdin: the preshared key is never on a command line (the helper keeps it in a
+                // private temp file only while it checks it)
                 $this->os->addPeer($iface, $this->peerSection($peer));
             }
             $this->rewriteConf($link_name, $iface, peers: fn (array $peers) => $this->putPeer($peers, $peer), content: $conf);
@@ -385,13 +397,19 @@ class WireGuard
             }
             $conf = $this->managedConf($link_name);
 
+            // wg-quick routed the networks behind it when the link started, and only a restart
+            // takes those routes away again (as when updatePeer() changes them)
+            $reroute = $iface !== null && $target->enabled && $target->networks !== null;
             // A disabled peer isn't on the interface
-            if ($iface !== null && $target->enabled) {
+            if ($iface !== null && $target->enabled && ! $reroute) {
                 $this->os->removePeer($iface, $pubkey);
             }
             $this->rewriteConf($link_name, $iface, peers: fn (array $peers) => array_values(
                 array_filter($peers, fn (array $p) => $p['public_key'] !== $pubkey),
             ), content: $conf);
+            if ($reroute) {
+                $this->restartOrRevert($link_name, $conf);
+            }
 
             $this->os->deleteClientConfig($link_name, self::pubkeyToSafe($pubkey));
         });
@@ -415,9 +433,10 @@ class WireGuard
      * Change a peer.
      *
      * - `ip` moves its tunnel address: the server-side AllowedIPs and the client config's Address.
-     * - `dns` and `allowed_ips` only change what its client config hands out (per-peer overrides of
-     *   the link's client defaults), just like `allowed_ips` on a link. null (or '') removes the
-     *   override: the peer gets the link's default again.
+     * - `dns`, `allowed_ips` and `keepalive` only change what its client config hands out: the
+     *   peer's own values instead of the link's client defaults, just like `allowed_ips` on a
+     *   link. They are stored with the peer in the link config. null (or '') takes one out: the
+     *   peer follows its link again.
      * - `name` labels it (null or '' removes the label).
      * - `enabled` false takes it off the interface but keeps its keys, address and client config.
      * - `networks` are routed to it (site-to-site; null or '' removes them). wg-quick sets up the
@@ -454,7 +473,6 @@ class WireGuard
                 throw new NotFoundException("Client config not found for peer: {$pubkey}");
             }
 
-            $changes = array_intersect_key($params, array_flip(['dns', 'allowed_ips']));
             $old_networks = IpAllocator::networksOf($target->allowed_ips, $link->address6);
             $networks = $params['networks'] ?? $old_networks;
             $allowed_ips = $target->allowed_ips;
@@ -465,7 +483,6 @@ class WireGuard
                     $bare_ip = $this->validator->peerAddress($params['ip']);
                     $others = array_filter($link->peers, fn (PeerInfo $p) => $p->public_key !== $pubkey);
                     $this->validator->validateNewPeerIp($bare_ip, $link->address, array_map(fn (PeerInfo $p) => $p->allowed_ips, $others), $link->address6);
-                    $changes['ip'] = $bare_ip;
                 }
                 if ($bare_ip === null) {
                     throw new InvalidArgumentException("Peer {$pubkey} has no IPv4 tunnel address; give it one with `ip`.");
@@ -482,49 +499,63 @@ class WireGuard
                 'name' => array_key_exists('name', $params) ? $params['name'] : $target->name,
                 'enabled' => $enabled,
             ];
+            // Its own client settings, where given (param => peer field): null takes one out
+            foreach (['dns' => 'dns', 'keepalive' => 'keepalive', 'allowed_ips' => 'client_allowed_ips'] as $param => $field) {
+                if (array_key_exists($param, $params)) {
+                    $peer[$field] = $params[$param] === null ? null : (string) $params[$param];
+                }
+            }
 
             // Live changes, unless the routed networks change: then the link restarts with the config
             $reroute = $iface !== null && ($target->enabled ? $old_networks : []) != ($enabled ? $networks : []);
-            if ($iface !== null && ! $reroute) {
-                if ($target->enabled && ! $enabled) {
-                    $this->os->removePeer($iface, $pubkey);
-                } elseif (! $target->enabled && $enabled) {
-                    $this->os->addPeer($iface, $this->peerSection($peer));
-                } elseif ($enabled && $allowed_ips !== $target->allowed_ips) {
-                    $this->os->setPeerAllowedIps($iface, $pubkey, $allowed_ips);
-                }
+            $live = $iface !== null && ! $reroute;
+            if ($live && ! $target->enabled && $enabled) {
+                $this->os->addPeer($iface, $this->peerSection($peer));
+            } elseif ($live && $target->enabled && $enabled && $allowed_ips !== $target->allowed_ips) {
+                $this->os->setPeerAllowedIps($iface, $pubkey, $allowed_ips);
             }
-            $this->rewriteConf($link_name, $iface, peers: fn (array $peers) => $this->putPeer($peers, $peer), content: $conf);
+            $saved = $this->rewriteConf($link_name, $iface, peers: fn (array $peers) => $this->putPeer($peers, $peer), content: $conf);
+            if ($live && $target->enabled && ! $enabled) {
+                // Off the interface only now: the config is rewritten from the live peers, and a
+                // peer that isn't among them any more would lose its place and what is saved with it
+                $this->os->removePeer($iface, $pubkey);
+            }
             if ($reroute) {
                 $this->restartOrRevert($link_name, $conf);
             }
 
+            // The peer as it is saved now (a running interface without a config saves nothing)
+            $stored = array_find($saved, fn (array $p) => $p['public_key'] === $pubkey)
+                ?? [...['dns' => $target->dns, 'keepalive' => $target->keepalive, 'client_allowed_ips' => $target->client_allowed_ips], ...$peer];
+            $updated = $this->peerInfo($stored, $link->address6);
+
             // A peer change leaves the link's metadata as it is
-            $meta = ConfigBuilder::parseMetadata($conf ?? '');
-            $client_config = $this->refreshClientConfig($link, $pubkey, $meta, $meta, $changes, $client_content);
-            $client = $this->configBuilder->parseClientConfig($client_config);
+            $client_config = $this->refreshClientConfig($link, $pubkey, $allowed_ips, $updated->clientSettings(), ConfigBuilder::parseMetadata($conf ?? ''), $client_content);
 
             return new PeerInfo(
                 public_key: $pubkey,
-                preshared_key: $client['PresharedKey'] ?? $target->preshared_key,
+                preshared_key: $this->configBuilder->parseClientConfig($client_config)['PresharedKey'] ?? $target->preshared_key,
                 allowed_ips: $allowed_ips,
                 client_config: $client_config,
                 name: $peer['name'],
                 enabled: $enabled,
                 networks: $networks === [] ? null : implode(', ', $networks),
+                dns: $updated->dns,
+                keepalive: $updated->keepalive,
+                client_allowed_ips: $updated->client_allowed_ips,
             );
         });
     }
 
     /**
-     * Re-render a peer's stored client config for the link's current settings.
+     * Re-render a peer's stored client config. Only its keys come from the stored one: its tunnel
+     * address is the one in the link config ($allowed_ips), and everything else is the link's
+     * settings ($meta) unless the peer has its own ($own: dns, keepalive, allowed_ips).
+     * Returns null when the peer has no stored client config (added elsewhere).
      *
-     * A value that differs from the link default in force when the config was written
-     * ($previous_meta) is a per-peer override and is kept. $changes (ip, dns, allowed_ips)
-     * replace values; a null dns or allowed_ips removes that override, so the link default
-     * applies. Returns null when the peer has no stored client config (added elsewhere).
+     * @param  array{dns?: ?string, keepalive?: int|string|null, allowed_ips?: ?string}  $own
      */
-    protected function refreshClientConfig(InterfaceInfo $link, string $pubkey, array $previous_meta, array $current_meta, array $changes = [], ?string $content = null): ?string
+    protected function refreshClientConfig(InterfaceInfo $link, string $pubkey, ?string $allowed_ips, array $own, array $meta, ?string $content = null): ?string
     {
         $safe = self::pubkeyToSafe($pubkey);
         $content ??= $this->os->readClientConfig($link->name, $safe);
@@ -533,25 +564,56 @@ class WireGuard
         }
 
         $client = $this->configBuilder->parseClientConfig($content);
-        $previous = $this->configBuilder->clientDefaults($previous_meta);
-        $override = fn (string $field, string $key): ?string => array_key_exists($field, $changes)
-            ? ($changes[$field] === null ? null : (string) $changes[$field])
-            : (isset($client[$key]) && $client[$key] !== $previous[$field] ? $client[$key] : null);
-
         $config = $this->configBuilder->buildClientConfig(
             $link,
             $client['PrivateKey'],
-            $changes['ip'] ?? $client['Address'],
+            IpAllocator::tunnelIp($allowed_ips) ?? $client['Address'],
             $pubkey,
             $client['PresharedKey'],
-            dns_override: $override('dns', 'DNS'),
-            allowed_ips_override: $override('allowed_ips', 'AllowedIPs'),
-            metadata: $current_meta,
-            keepalive_override: $override('keepalive', 'PersistentKeepalive'),
+            dns_override: $own['dns'] ?? null,
+            allowed_ips_override: $own['allowed_ips'] ?? null,
+            metadata: $meta,
+            keepalive_override: isset($own['keepalive']) ? (string) $own['keepalive'] : null,
         );
         $this->os->writeClientConfig($link->name, $safe, $config);
 
         return $config;
+    }
+
+    /**
+     * Peers of a config from before a peer's own client settings were stored with it (format 1).
+     * Back then they only showed in its client config: whatever that has and its link doesn't
+     * hand out was the peer's own, so it is recorded as such. Once: the config is then written
+     * in the current format, and nothing is ever inferred again.
+     *
+     * @param  array  $meta  the link's metadata the client configs were written with
+     * @param  callable(string): ?string  $client  a peer's stored client config, by public key
+     */
+    protected function adoptClientSettings(array $meta, array $peers, callable $client): array
+    {
+        $defaults = $this->configBuilder->clientDefaults($meta);
+        $same = fn (string $a, string $b) => str_replace(' ', '', $a) === str_replace(' ', '', $b);
+
+        foreach ($peers as $i => $peer) {
+            if (! KeyManager::isKey($peer['public_key']) || ($content = $client($peer['public_key'])) === null) {
+                continue;
+            }
+
+            $stored = $this->configBuilder->parseClientConfig($content);
+            foreach (['dns' => 'DNS', 'keepalive' => 'PersistentKeepalive', 'allowed_ips' => 'AllowedIPs'] as $setting => $key) {
+                $field = $setting === 'allowed_ips' ? 'client_allowed_ips' : $setting;
+                if (isset($peer[$field]) || ! isset($stored[$key]) || $same($stored[$key], $defaults[$setting])) {
+                    continue;
+                }
+                try {
+                    $peers[$i][$field] = (string) $this->validateSettings([$setting => $stored[$key]])[$setting];
+                } catch (InvalidArgumentException) {
+                    // Not a value the app would have written: the peer follows its link
+                }
+            }
+        }
+
+        return $peers;
     }
 
     /**
@@ -670,6 +732,11 @@ class WireGuard
 
         return $this->withLock($name, function () use ($name, $plan, $clients, $up, $replace) {
             ['meta' => $meta, 'address' => $address, 'address6' => $address6, 'peers' => $peers] = $plan;
+            $clients = array_filter($clients, 'is_string');
+            // A backup from before peers' own client settings were stored with them
+            if ((int) ($meta['format'] ?? 1) < ConfigBuilder::FORMAT) {
+                $peers = $this->adoptClientSettings($meta, $peers, fn (string $pubkey) => $clients[self::pubkeyToSafe($pubkey)] ?? null);
+            }
 
             $exists = in_array($name, $this->listLinks(), true);
             if ($exists && ! $replace) {
@@ -719,14 +786,13 @@ class WireGuard
                 $this->os->deleteClientConfigDir($name);
             }
 
-            // The backup's metadata are the defaults its client configs were written with
+            // Client configs: the backup's keys, rendered for this server
             $link = $this->getLinkFromConfig($name);
             $current_meta = ConfigBuilder::parseMetadata($content);
-            $keys = array_column($peers, 'public_key');
             $restored = 0;
-            foreach ($clients as $safe => $client) {
-                $pubkey = self::safeToPubkey((string) $safe);
-                if (in_array($pubkey, $keys, true) && $this->refreshClientConfig($link, $pubkey, $meta, $current_meta, [], $client) !== null) {
+            foreach ($link->peers as $peer) {
+                $client = KeyManager::isKey($peer->public_key) ? ($clients[self::pubkeyToSafe($peer->public_key)] ?? null) : null;
+                if ($client !== null && $this->refreshClientConfig($link, $peer->public_key, $peer->allowed_ips, $peer->clientSettings(), $current_meta, $client) !== null) {
                     $restored++;
                 }
             }
@@ -1084,14 +1150,16 @@ class WireGuard
     }
 
     /**
-     * Peers with their IPv6 tunnel address moved to the link's new addresses: the mirrored /128 of
-     * the old prefix is replaced (or dropped); other allowed IPs stay.
+     * Peers with their tunnel addresses for the link's new addresses. The IPv6 one mirrors the
+     * IPv4 host number in the link's prefix, so the mirrored /128 of the old prefix is replaced
+     * (or dropped). The IPv4 one stays, unless the peers move along with the link ($moved_from,
+     * its old address): then each keeps its host number in the new subnet. Other allowed IPs stay.
      *
      * @param  list<array{public_key: string, allowed_ips: string}>  $peers
      */
-    protected function readdressPeers(array $peers, string $address, ?string $address6, ?string $old_address6): array
+    protected function readdressPeers(array $peers, string $address, ?string $address6, ?string $old_address6, ?string $moved_from = null): array
     {
-        return array_map(function (array $peer) use ($address, $address6, $old_address6) {
+        return array_map(function (array $peer) use ($address, $address6, $old_address6, $moved_from) {
             $ip = IpAllocator::tunnelIp($peer['allowed_ips']);
             if ($ip === null) {
                 return $peer;
@@ -1099,35 +1167,59 @@ class WireGuard
 
             $others = array_filter(array_map('trim', explode(',', $peer['allowed_ips'])), fn (string $entry) => $entry !== "{$ip}/32"
                 && ! ($old_address6 !== null && str_ends_with($entry, '/128') && IpAllocator::overlaps($entry, $old_address6)));
+            $ip = $moved_from === null ? $ip : $this->movedIp($ip, $moved_from, $address);
 
             return array_merge($peer, ['allowed_ips' => implode(', ', [IpAllocator::peerAllowedIps($ip, $address, $address6), ...$others])]);
         }, $peers);
     }
 
     /**
-     * A link's addresses can only move where its peers' tunnel addresses still fit: inside the
-     * IPv4 subnet, and not mirrored onto the link's own IPv6 address.
+     * A peer's address when it moves along with its link: the same host number in the new subnet.
      */
-    protected function assertPeersFit(string $name, string $address, ?string $address6 = null): void
+    protected function movedIp(string $ip, string $from, string $to): string
     {
-        [$link_ip] = explode('/', $address, 2);
+        $host = IpAllocator::hostIndex($ip, $from)
+            ?? throw new InvalidArgumentException("Peer {$ip} is not inside the link's address {$from}, so it can't move along. Give it an address in it first (its `ip`).");
+
+        try {
+            return IpAllocator::hostAt($to, $host);
+        } catch (InvalidArgumentException) {
+            throw new InvalidArgumentException("Peer {$ip} can't move along: its host number {$host} doesn't fit {$to}.");
+        }
+    }
+
+    /**
+     * A link's addresses can only change where its peers' tunnel addresses still fit: inside the
+     * IPv4 subnet, on a host address that isn't the link's, and not mirrored onto the link's own
+     * IPv6 address. With $moved_from (the link's old address) the peers move along first.
+     */
+    protected function assertPeersFit(string $name, string $address, ?string $address6 = null, ?string $moved_from = null): void
+    {
+        [$link_ip, $mask] = explode('/', $address, 2);
         $link_ip6 = $address6 === null ? null : explode('/', $address6, 2)[0];
+        $network = ip2long($link_ip) & ((-1 << (32 - (int) $mask)) & 0xFFFFFFFF);
+        $unusable = (int) $mask <= 30 ? [$network, $network | ((1 << (32 - (int) $mask)) - 1)] : [];
 
         foreach ($this->getLink($name)?->peers ?? [] as $peer) {
             $ip = IpAllocator::tunnelIp($peer->allowed_ips);
             if ($ip === null) {
                 continue;
             }
-            if ($ip === $link_ip || ! $this->validator->ipInRange($ip, $address)) {
-                throw new InvalidArgumentException("Peer {$ip} would not fit the new address {$address}. Move the peer first (its `ip`).");
+            if ($moved_from !== null) {
+                $ip = $this->movedIp($ip, $moved_from, $address);
+            } elseif (! $this->validator->ipInRange($ip, $address)) {
+                throw new InvalidArgumentException("Peer {$ip} would not fit the new address {$address}. To move the link's peers along (each keeps its host number, and every client needs its new config), pass move_peers (--move-peers).");
+            }
+            if ($ip === $link_ip || in_array(ip2long($ip), $unusable, true)) {
+                throw new InvalidArgumentException("Peer {$ip} would not fit the new address {$address}: that is the link's own, the network or the broadcast address. Move the peer first (its `ip`).");
             }
             if ($address6 !== null && IpAllocator::mirror($ip, $address, $address6) === $link_ip6) {
                 throw new InvalidArgumentException("Peer {$ip} would get the link's IPv6 address {$link_ip6}. Move the peer first (its `ip`).");
             }
-            foreach (array_filter(array_map('trim', explode(',', (string) $peer->networks))) as $network) {
+            foreach (array_filter(array_map('trim', explode(',', (string) $peer->networks))) as $network_behind) {
                 foreach (array_filter([$address, $address6]) as $own) {
-                    if (IpAllocator::overlaps($network, $own)) {
-                        throw new InvalidArgumentException("{$own} would overlap {$network}, routed to peer {$ip}.");
+                    if (IpAllocator::overlaps($network_behind, $own)) {
+                        throw new InvalidArgumentException("{$own} would overlap {$network_behind}, routed to peer {$ip}.");
                     }
                 }
             }
@@ -1142,23 +1234,28 @@ class WireGuard
      * Peers come from the live interface when $iface is given (the source of truth after
      * `wg addconf` / `wg set`), otherwise from the file itself. $peers can transform that list.
      * $content is the config, when the caller has read it already.
+     *
+     * @return list<array> the peers as they were written (empty: no .conf)
      */
-    protected function rewriteConf(string $name, ?string $iface, array $overrides = [], ?Closure $peers = null, ?string $content = null): void
+    protected function rewriteConf(string $name, ?string $iface, array $overrides = [], ?Closure $peers = null, ?string $content = null): array
     {
         $content ??= $this->os->readConfig($name);
         if ($content === null) {
-            return; // A running interface that no .conf manages
+            return []; // A running interface that no .conf manages
         }
 
         $parsed = $this->configBuilder->parseConfContent($content);
         $saved = $this->confPeers($parsed['peers']);
+        // An older config: what its peers have of their own is still only in their client configs
+        if ((int) ($parsed['metadata']['format'] ?? 1) < ConfigBuilder::FORMAT) {
+            $saved = $this->adoptClientSettings($parsed['metadata'], $saved, fn (string $pubkey) => $this->os->readClientConfig($name, self::pubkeyToSafe($pubkey)));
+        }
         $current = $iface !== null ? $this->livePeers($this->dumpPeers($iface), $saved) : $saved;
+        $written = $peers !== null ? $peers($current) : $current;
 
-        $this->os->writeConfig($name, $this->buildConf(
-            $parsed['interface'],
-            array_merge($parsed['metadata'], $overrides),
-            $peers !== null ? $peers($current) : $current,
-        ));
+        $this->os->writeConfig($name, $this->buildConf($parsed['interface'], array_merge($parsed['metadata'], $overrides), $written));
+
+        return $written;
     }
 
     /**
@@ -1292,9 +1389,12 @@ class WireGuard
             $peer = [
                 'public_key' => $section['PublicKey'] ?? '',
                 'allowed_ips' => $section['AllowedIPs'] ?? '',
-                'name' => $section['name'] ?? null,
                 'enabled' => ! ($section['disabled'] ?? false),
             ];
+            // Its label and own client settings: comments in its section
+            foreach (array_keys(ConfigBuilder::PEER_SETTINGS) as $field) {
+                $peer[$field] = $section[$field] ?? null;
+            }
             if (! empty($section['PresharedKey'])) {
                 $peer['preshared_key'] = $section['PresharedKey'];
             }
@@ -1319,12 +1419,16 @@ class WireGuard
             name: $peer['name'] ?? null,
             enabled: $peer['enabled'] ?? true,
             networks: $networks === [] ? null : implode(', ', $networks),
+            dns: $peer['dns'] ?? null,
+            keepalive: isset($peer['keepalive']) ? (int) $peer['keepalive'] : null,
+            client_allowed_ips: $peer['client_allowed_ips'] ?? null,
         );
     }
 
     /**
-     * Peers of a running link: the live ones (from `wg show dump`), with their names from the
-     * config, plus the disabled ones (only in the config), in the config's order.
+     * Peers of a running link: the live ones (from `wg show dump`), with what only the config
+     * knows of them (name, own client settings), plus the disabled ones (only in the config), in
+     * the config's order.
      *
      * @param  list<array>  $live
      * @param  list<array>  $saved  from confPeers()
@@ -1335,7 +1439,7 @@ class WireGuard
         $peers = [];
         foreach ($saved as $peer) {
             if (isset($live[$peer['public_key']])) {
-                $peers[] = [...$live[$peer['public_key']], 'name' => $peer['name'] ?? null, 'enabled' => true];
+                $peers[] = [...$live[$peer['public_key']], ...array_intersect_key($peer, ConfigBuilder::PEER_SETTINGS), 'enabled' => true];
                 unset($live[$peer['public_key']]);
             } elseif (! $peer['enabled']) {
                 $peers[] = $peer;

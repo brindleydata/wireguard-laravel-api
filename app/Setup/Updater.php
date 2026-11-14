@@ -30,12 +30,15 @@ class Updater
         return $this->git($ctx, 'fetch --quiet --tags --prune --force origin') !== null;
     }
 
-    /** The newest release tag (vX.Y.Z), or null when there is none. */
+    /**
+     * The newest release tag (vX.Y.Z), or null when there is none. Pre-releases (v1.2.0-rc1)
+     * don't count: git sorts them above the release they lead up to. `--to=` still takes one.
+     */
     public function latestRelease(Context $ctx): ?string
     {
-        $tags = $this->git($ctx, "tag --list 'v[0-9]*' --sort=-v:refname");
+        $tags = (string) $this->git($ctx, "tag --list 'v[0-9]*' --sort=-v:refname");
 
-        return $tags === null || $tags === '' ? null : explode("\n", $tags)[0];
+        return array_find(explode("\n", $tags), fn (string $tag) => preg_match('/^v\d+(\.\d+)*$/', $tag) === 1);
     }
 
     /** The commit a ref (tag, branch, sha) points to, or null when it doesn't exist. */
@@ -70,6 +73,30 @@ class Updater
     public function composerInstall(Context $ctx): bool
     {
         return $this->shell->interactive('composer install --no-dev --optimize-autoloader --no-interaction --quiet --working-dir='.escapeshellarg($ctx->app())) === 0;
+    }
+
+    /**
+     * Run $command (Steps\Server::replaceFrankenPhp()) to fetch the current FrankenPHP release.
+     * True when the binary changed, false when it was current already, null when the download
+     * failed and the installed one is still there.
+     */
+    public function refreshFrankenPhp(Context $ctx, string $command): ?bool
+    {
+        $binary = $ctx->app('frankenphp');
+        $before = is_file($binary) ? hash_file('sha256', $binary) : null;
+
+        if ($this->shell->interactive($command) !== 0 || ! is_file($binary)) {
+            return null;
+        }
+        clearstatcache(true, $binary);
+
+        return hash_file('sha256', $binary) !== $before;
+    }
+
+    /** A new FrankenPHP binary only runs after a restart: a reload keeps the old process. */
+    public function restartApi(): bool
+    {
+        return $this->shell->interactive('sudo systemctl restart wgla') === 0;
     }
 
     /** Run `wg:update --finish` with the code now on disk, in a new process. */

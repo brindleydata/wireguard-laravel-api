@@ -31,7 +31,7 @@ This needs PHP 8.5+ with `sodium`, `mbstring` and `dom`, Composer and git. The i
 | sudo rule | One line, checked with `visudo` |
 | AppArmor | Ubuntu 26.04+: lets the `wg-quick` hooks run the helper |
 | `wgla` | The [CLI](#cli) shortcut in `/usr/local/bin` |
-| API server | Octane + FrankenPHP as a systemd service, with Let's Encrypt, your own certificate, or plain HTTP behind a proxy, on any port |
+| API server | Octane + FrankenPHP as a systemd service, with Let's Encrypt, your own certificate, or plain HTTP behind a proxy, on any port. FrankenPHP's admin API takes local port 2019, or the next free one when something else has it (`--admin-port=`) |
 | Health | The web user can use the helper, and the API answers |
 
 [^ra]: Where the kernel itself learns the IPv6 route from router advertisements (`accept_ra = 1`), forwarding would make it drop them, so that interface gets `accept_ra = 2`. netplan/networkd and NetworkManager aren't affected.
@@ -55,7 +55,7 @@ wgla update --to=v1.4.0         # a specific release, also an older one
 wgla update --branch=master     # a branch, for testing
 ```
 
-It runs as the deploy user and shows the changelog and any change to the root helper, checks out the release, reinstalls what changed and reloads the API without dropping connections. If anything fails, it goes back to the previous version.
+It runs as the deploy user and shows the changelog and any change to the root helper, checks out the release, reinstalls what changed and reloads the API without dropping connections. It also fetches the current FrankenPHP release each time, and restarts the API (briefly) when that changed. If anything fails, it goes back to the previous version.
 
 After deploying another way (`git pull`, rsync), run `wgla install`. It notices that the API runs old code and reloads it.
 
@@ -69,11 +69,12 @@ wgla links                               link names
 wgla link wg0                            a link and its peers
 wgla link:create wg0 10.0.0.1/24 --address6=auto --forward=true --nat=true
 wgla link:update wg0 --port=51821 --up=false     (--address6=none: IPv4 only; --dns="": the default again)
+wgla link:update wg0 --address=10.1.0.1/24 --move-peers    another subnet, peers keep their host number
 wgla link:delete wg0
 wgla link:peers wg0                      peers: names, state, live stats
 wgla peer:create wg0 --name=laptop --qr  the new client config, also as a QR code
 wgla peer wg0 <pubkey> [--qr]            the client config again
-wgla peer:update wg0 <pubkey> --enabled=false    (--name --ip --networks --dns --allowed-ips)
+wgla peer:update wg0 <pubkey> --enabled=false    (--name --ip --networks --dns --allowed-ips --keepalive)
 wgla peer:delete wg0 <pubkey>
 wgla backup [file|-]                     encrypted backup of every link
 wgla restore <file|->
@@ -91,25 +92,25 @@ Every route except `GET /health` needs the `api-key` header. `{pubkey}` is the p
 | `GET /links` | Link names |
 | `POST /link` | `name`, `ip` (CIDR), and optionally `address6`, `port`, `ifout`, `dns`, `keepalive`, `allowed_ips`, `forward`, `nat`, `up` |
 | `GET /link/{name}` | The link and its peers |
-| `PATCH /link/{name}` | Any of the above, with `address` instead of `ip`. `null` removes `address6`, and takes the link's own `dns`, `keepalive` or `allowed_ips` out, back to the default |
+| `PATCH /link/{name}` | Any of the above, with `address` instead of `ip`, and `move_peers` to move the peers along to another subnet. `null` removes `address6`, and takes the link's own `dns`, `keepalive` or `allowed_ips` out, back to the default |
 | `DELETE /link/{name}` | |
-| `GET /link/{link}/peers` | Peers with `name`, `enabled`, `networks` and live stats: `endpoint`, `latest_handshake_at`, `connected` (a handshake within 3 minutes), `transfer_rx`, `transfer_tx`. The stats are `null` while the peer isn't on the interface |
+| `GET /link/{link}/peers` | Peers with `name`, `enabled`, `networks`, `client` (the `dns`, `keepalive` and `allowed_ips` of their own, `null` where they follow the link) and live stats: `endpoint`, `latest_handshake_at`, `connected` (a handshake within 3 minutes), `transfer_rx`, `transfer_tx`. The stats are `null` while the peer isn't on the interface |
 | `POST /link/{link}/peers` | Optionally `ip`, `name`, `networks`. Returns the keys and the client config |
-| `PATCH /link/{link}/peer/{pubkey}` | `ip`, `name`, `enabled`, `networks`, and the client config's `dns` and `allowed_ips`. `null` removes a name or networks, and takes the peer's own `dns` or `allowed_ips` out, back to the link's |
+| `PATCH /link/{link}/peer/{pubkey}` | `ip`, `name`, `enabled`, `networks`, and the client config's `dns`, `allowed_ips` and `keepalive`. `null` removes a name or networks, and takes one of the peer's own client settings out, back to the link's |
 | `DELETE /link/{link}/peer/{pubkey}` | |
 | `GET /link/{link}/peer/{pubkey}/config` | The client config |
 | `GET /link/{link}/peer/{pubkey}/qr` | The client config as a QR code (`image/svg+xml`), for the WireGuard apps |
 
-Errors are `{"error": "…"}`: `403` (API key), `404`, `409` (port, subnet or name taken), `422` (invalid input), `500` (a system command failed; the message says why).
+Errors are `{"error": "…"}`: `403` (API key), `404`, `409` (port, subnet or name taken), `422` (invalid input; with `errors` per field when a field has the wrong type), `500` (a system command failed; the message says why).
 
 ### Links and peers
 
-- **Addresses.** A link has an IPv4 subnet and optionally an IPv6 prefix: its address is a host in the subnet (not the network or broadcast address, and never a `/0`), and `address6` is an address such as `fd12:3456:789a::1/64`, `auto` for a random private /64, or `null` to remove it. A peer gets the next free IPv4 address unless you give one, and the same host number in the prefix (`10.0.0.5` → `fd12:3456:789a::5`). Moving a peer or the link moves both.
+- **Addresses.** A link has an IPv4 subnet and optionally an IPv6 prefix: its address is a host in the subnet (not the network or broadcast address, and never a `/0`), and `address6` is an address such as `fd12:3456:789a::1/64`, `auto` for a random private /64, or `null` to remove it. A peer gets the next free IPv4 address unless you give one, and the same host number in the prefix (`10.0.0.5` → `fd12:3456:789a::5`). Moving a peer moves both. A link can grow or shrink around its peers; moving it to another subnet needs `move_peers`, which keeps every peer's host number there (`10.0.0.5` → `10.1.0.5`), and every client then needs its new config.
 - **Peers** can have a `name`, a label of up to 64 characters. Names don't have to be unique, and peers are still addressed by public key. A disabled peer (`enabled: false`) is off the interface but keeps its keys, address and client config. In the link config it's a commented-out `[Peer]` section.
-- **Networks behind a peer** (`networks`, site-to-site), such as a branch office LAN, are routed to that peer. They can't overlap the link's addresses, other peers or other links, and a default route is refused. The peer's client config needs `allowed_ips` for whatever it should reach, and the link needs `forward` for traffic between networks. Changing a peer's networks restarts a running link, because wg-quick sets up the routes. Peers reconnect by themselves when they next send traffic or a keepalive.
+- **Networks behind a peer** (`networks`, site-to-site), such as a branch office LAN, are routed to that peer. They can't overlap the link's addresses, other peers or other links, and a default route is refused. The peer's client config needs `allowed_ips` for whatever it should reach, and the link needs `forward` for traffic between networks. Changing a peer's networks, or removing such a peer, restarts a running link, because wg-quick sets up the routes. Peers reconnect by themselves when they next send traffic or a keepalive.
 - **No clashes.** Links can't share a listen port, overlap subnets or prefixes, or take the name of an existing interface. Without `port`, a free random one is picked.
 - **Forwarding and NAT** are per link and cover both families. On Linux each link has an nftables table, `inet wg_<link>`, and NAT only masquerades the link's own subnet and prefix. On macOS each link has a pf anchor, `wg/<link>`. Where Docker or ufw drop forwarded traffic, the helper adds tagged accepts to iptables and ip6tables. firewalld isn't handled.
-- **Client configs** are stored, and re-rendered when the link's port, addresses or client defaults change. A peer's own `dns` and `allowed_ips` are kept. Clients of a dual-stack link also route `::/0` by default.
+- **Client configs** are stored, and re-rendered when the link's port, addresses or client settings change. Three settings come from the nearest place that has them: the peer's own, else its link's, else the fixed default (DNS `8.8.8.8`, keepalive `25`, all traffic through the tunnel: `0.0.0.0/0`, plus `::/0` on a dual-stack link). A link's and a peer's own are kept in the link config, next to the peer's name.
 - **A change the link doesn't start with is undone.** A new port or address, or networks behind a peer, restart a running link. If it then doesn't come up (the port is taken, wg-quick can't add a route), the previous config goes back, the link runs again as it did, and the request fails with the reason.
 - **Configs written by hand.** Any config in the WireGuard directory is listed and shown, and can be deleted. One that only uses what the app writes too is managed like the app's own. One with more (`MTU`, `Table`, hooks of its own, a peer's `Endpoint`, comments) is never changed, because the app regenerates configs whole and would drop those: changes answer `409` and name what is in the way.
 - The server's private key is never returned.
@@ -126,7 +127,7 @@ A backup holds every link with its keys and client configs, encrypted with your 
 ## Security
 
 - Everything that needs root goes through `bin/wgla-helper`, installed root-owned. It's all the sudo rule allows: `www-data ALL=(root) NOPASSWD: /usr/local/sbin/wgla-helper`. The rule has no wildcards, so `sudo-rs` (Ubuntu 25.10+) takes it too.
-- The helper takes a fixed set of commands and validates every argument. It only writes configs the app would generate, and the only hooks it allows are its own firewall commands.
+- The helper takes a fixed set of commands and validates every argument. It only writes configs the app would generate, the only hooks it allows are its own firewall commands, and those only set up rules for the link's own interface.
 - The app refuses to use a helper that differs from the bundled one, and `wg:install` reinstalls it.
 - `wgla` is installed root-owned, with the app's path and users written into it. It only switches to the web user or the deploy user (with `sudo`) and runs `artisan`.
 - Updates are never unattended, because they install code that runs as root.
@@ -139,5 +140,4 @@ In `.env` (see `.env.example`):
 |----------|---|
 | `API_KEY` | The API secret. Without it, every route but `/health` returns `403` |
 | `WIREGUARD_HOSTNAME` | The endpoint in client configs. Default: the machine's FQDN, otherwise its public IPv4 |
-| `WIREGUARD_DNS`, `WIREGUARD_KEEPALIVE`, `WIREGUARD_ALLOWED_IPS` | Client config defaults (`8.8.8.8`, `25`, `0.0.0.0/0`), which links and peers can override |
 | `WIREGUARD_HELPER` | Where the root helper is installed (default `/usr/local/sbin/wgla-helper`) |

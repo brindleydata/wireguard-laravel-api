@@ -82,13 +82,12 @@ class Shell
 
     protected function bind(string $command, array $bindings): string
     {
-        // Sort by key length descending so :name_long isn't partially matched by :name
-        uksort($bindings, fn ($a, $b) => strlen($b) - strlen($a));
-
-        foreach ($bindings as $key => $value) {
-            $command = str_replace(':'.$key, escapeshellarg($value), $command);
-        }
-
-        return $command;
+        // One pass over the template: a bound value that happens to contain ":name" is never
+        // bound again (that would put the second value outside the quotes of the first)
+        return preg_replace_callback(
+            '/:([A-Za-z_][A-Za-z0-9_]*)/',
+            fn (array $m) => array_key_exists($m[1], $bindings) ? escapeshellarg((string) $bindings[$m[1]]) : $m[0],
+            $command,
+        );
     }
 }

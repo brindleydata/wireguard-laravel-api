@@ -40,7 +40,11 @@ class WgPeerCreate extends WgCommand
             $this->line($peer->client_config);
             if ($this->option('qr')) {
                 $this->line('');
-                $this->line(app(QrCode::class)->terminal($peer->client_config));
+                try {
+                    $this->line(app(QrCode::class)->terminal($peer->client_config));
+                } catch (\InvalidArgumentException $e) {
+                    $this->warn($e->getMessage()); // the peer exists all the same
+                }
             }
         }
 

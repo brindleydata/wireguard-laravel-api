@@ -15,7 +15,7 @@ set -euo pipefail
 umask 077
 IFS=$' \t\n'
 
-VERSION=5
+VERSION=6
 SELF=$0
 MAX_SIZE=1048576
 
@@ -124,6 +124,7 @@ validate_meta() {
         address6) valid_cidr6 "$value" ;;
         ifout) [[ $value =~ $re_ifname ]] ;;
         forward | nat | up) valid_bool "$value" ;;
+        format) [[ $value =~ ^[0-9]{1,3}$ ]] ;;
         dns) [[ $value =~ $re_dns ]] ;;
         keepalive) valid_keepalive "$value" ;;
         allowed_ips) [[ $value =~ $re_ips ]] ;;
@@ -135,7 +136,8 @@ validate_meta() {
 valid_peer_name() { [ -n "$1" ] && [ "${#1}" -le 256 ] && [[ $1 != *[[:cntrl:]]* ]]; }
 
 # A wg-quick config may only contain what the app writes. A disabled peer is a commented-out
-# [Peer] section (wg-quick ignores it); peers may carry a "# name = …" label.
+# [Peer] section (wg-quick ignores it); peers may carry a "# name = …" label and client settings
+# of their own ("# dns = …", "# keepalive = …", "# allowed_ips = …"), checked like the link's.
 validate_conf() {
     local section='' line key value re='^([A-Za-z]+) = (.+)$' disabled='^# ([A-Za-z]+ = .+)$'
     while IFS= read -r line || [ -n "$line" ]; do
@@ -154,6 +156,12 @@ validate_conf() {
             '# name = '*)
                 if [ "$section" = peer ] || [ "$section" = disabled ]; then
                     valid_peer_name "${line#'# name = '}" || die "invalid peer name: $line"
+                    continue
+                fi
+                ;;
+            '# dns = '* | '# keepalive = '* | '# allowed_ips = '*)
+                if [ "$section" = peer ] || [ "$section" = disabled ]; then
+                    validate_meta "$line"
                     continue
                 fi
                 ;;
@@ -444,6 +452,14 @@ case "$command" in
     # Firewall (also called by the PostUp/PostDown hooks)
     firewall-up)
         args 2 $# "$command"; name_arg "$1"; iface_arg "$2"
+        # Only for the link's own interface: forward accepts for any other one (eth0, docker0)
+        # would open what the host's firewall closed
+        own=$1
+        if [ "$OS" = Darwin ]; then
+            own=''
+            if [ -f "$RUN_DIR/$1.name" ]; then own=$(head -n 1 "$RUN_DIR/$1.name"); fi
+        fi
+        [ "$2" = "$own" ] || die "$2 is not the interface of link $1"
         firewall_state "$1"
         if [ "$OS" = Darwin ]; then firewall_up_darwin "$1" "$2"; else firewall_up_linux "$1" "$2"; fi
         ;;

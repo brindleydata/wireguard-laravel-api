@@ -8,6 +8,8 @@ use Illuminate\Foundation\Application;
 use Illuminate\Foundation\Configuration\Exceptions;
 use Illuminate\Foundation\Configuration\Middleware;
 use Illuminate\Support\Env;
+use Illuminate\Validation\ValidationException;
+use Symfony\Component\HttpKernel\Exception\HttpExceptionInterface;
 use Symfony\Component\HttpKernel\Exception\NotFoundHttpException;
 
 // .env values stay out of the process environment (no putenv). FrankenPHP keeps that environment
@@ -45,5 +47,15 @@ return Application::configure(basePath: dirname(__DIR__))
         // Still reported to the log (with the command line for CommandFailedException)
         $exceptions->render(function (SystemException $e) {
             return response()->json(['error' => $e->getMessage()], 500);
+        });
+
+        // The same shape for what the framework refuses itself. A request that fails its field
+        // rules also lists every message per field.
+        $exceptions->render(function (ValidationException $e) {
+            return response()->json(['error' => $e->validator->errors()->first(), 'errors' => $e->errors()], $e->status);
+        });
+
+        $exceptions->render(function (HttpExceptionInterface $e) {
+            return response()->json(['error' => $e->getMessage() ?: 'Request refused.'], $e->getStatusCode(), $e->getHeaders());
         });
     })->create();

@@ -13,6 +13,7 @@ use App\Setup\Steps\Server;
 use App\Setup\Steps\Shortcut;
 use App\Setup\Steps\Sudoers;
 use App\Setup\Steps\WebUser;
+use App\Setup\Updater;
 use Symfony\Component\Process\Process;
 use Tests\Fakes\CommandFailed;
 use Tests\Fakes\FakeShell;
@@ -486,6 +487,7 @@ it('reloads a running API that still serves the code from before a deploy', func
     $shell = (new FakeShell)
         ->on('systemctl is-enabled wgla', fn () => 'enabled')
         ->on('systemctl is-active wgla', fn () => 'active')
+        ->on(':bin version', fn () => 'FrankenPHP v99.0.0 PHP 8.5.0 Caddy v2.10.0')
         ->on("curl -s --max-time 3 -w '\\n%{http_code}' -H @- :url", fn (array $b, ?string $input) => $b['url'] === 'http://127.0.0.1:8080/status' && $input === "api-key: secret\n"
             ? match ($running) {
                 'older code' => json_encode(['app' => ['code' => 'older0000000000']])."\n200",
@@ -544,3 +546,124 @@ it('saves answers in .env and reads them back on the next run', function () {
         ->and($again->answer('forward'))->toBe('false')
         ->and($again->answer('port'))->toBe('9443', 'Options win over saved answers');
 });
+
+// ─── The API server: admin port, FrankenPHP ─────────────────────────
+
+/** A server step that finds the given local ports taken. */
+function serverStepWithPortsTaken(FakeShell $shell, array $taken): Server
+{
+    return new class($shell, $taken) extends Server
+    {
+        public function __construct(FakeShell $shell, private array $taken)
+        {
+            parent::__construct($shell);
+        }
+
+        protected function portFree(int $port): bool
+        {
+            return ! in_array($port, $this->taken, true);
+        }
+    };
+}
+
+it('gives FrankenPHP\'s admin API a port of its own', function (array $taken, array $answers, string $port) {
+    $ctx = setupContext(answers: ['tls' => 'http', 'bind' => '127.0.0.1', 'port' => '2020', ...$answers]);
+    $step = serverStepWithPortsTaken(new FakeShell, $taken);
+
+    $step->after($ctx);
+
+    expect($ctx->answer('admin_port'))->toBe($port)
+        ->and($step->unit($ctx))->toContain("--port=2020 --admin-port={$port} ");
+})->with([
+    'the usual one when it is free' => [[], [], '2019'],
+    // A Caddy reverse proxy on the same host has 2019; 2020 is the API itself here
+    'the next free one otherwise' => [[2019], [], '2021'],
+    'the one given by hand' => [[2019], ['admin_port' => '2500'], '2500'],
+]);
+
+it('keeps the admin port the installed service has', function () {
+    $ctx = setupContext(answers: ['tls' => 'http', 'bind' => '127.0.0.1', 'port' => '8080']);
+    mkdir(dirname($ctx->system(Server::UNIT)), 0755, true);
+    file_put_contents($ctx->system(Server::UNIT), 'ExecStart=/usr/bin/php artisan octane:start --port=8080 --admin-port=2019 --caddyfile=x');
+
+    // 2019 is "taken": by this very service. A re-run or an update must not move it.
+    $step = serverStepWithPortsTaken(new FakeShell, [2019]);
+    $step->after($ctx);
+
+    expect($ctx->answer('admin_port'))->toBe('2019');
+});
+
+it('replaces a FrankenPHP that is older than Octane needs, and restarts the API with it', function () {
+    $ctx = setupContext(answers: ['tls' => 'http', 'bind' => '127.0.0.1', 'port' => '8080']);
+    touch($ctx->app('frankenphp'));
+    chmod($ctx->app('frankenphp'), 0755);
+    $shell = (new FakeShell)
+        ->on('systemctl is-enabled wgla', fn () => 'enabled')
+        ->on('systemctl is-active wgla', fn () => 'active')
+        ->on(':bin version', fn () => 'FrankenPHP v1.0.0 PHP 8.5.0 Caddy v2.8.0 h1:abc');
+    $step = new Server($shell);
+    mkdir(dirname($ctx->system(Server::UNIT)), 0755, true);
+    file_put_contents($ctx->system(Server::UNIT), $step->unit($ctx));
+
+    expect($step->check($ctx))->toHaveCount(1)
+        ->and($step->check($ctx)[0])->toStartWith('FrankenPHP 1.0.0 is older than this version of Octane needs (')
+        ->and(array_map(fn ($action) => $action->command, $step->plan($ctx)))->toBe([$step->replaceFrankenPhp($ctx), 'sudo systemctl restart wgla'])
+        ->and($step->replaceFrankenPhp($ctx))->toContain('mv frankenphp frankenphp.old', 'octane:install --server=frankenphp --no-interaction', 'mv -f frankenphp.old frankenphp');
+});
+
+it('keeps the installed FrankenPHP when the new one cannot be fetched', function () {
+    $ctx = setupContext();
+    file_put_contents($ctx->app('frankenphp'), 'old binary');
+    chmod($ctx->app('frankenphp'), 0755);
+    file_put_contents($ctx->app('artisan'), "<?php exit(1); // the download fails\n");
+    $step = new Server(new FakeShell);
+    $command = str_replace("'/usr/bin/php'", escapeshellarg(PHP_BINARY), $step->replaceFrankenPhp($ctx));
+
+    $process = Process::fromShellCommandline($command);
+    $process->run();
+
+    expect($process->getExitCode())->toBe(1)
+        ->and(file_get_contents($ctx->app('frankenphp')))->toBe('old binary')
+        ->and(file_exists($ctx->app('frankenphp.old')))->toBeFalse();
+
+    // And takes the new one when the download works
+    file_put_contents($ctx->app('artisan'), "<?php file_put_contents(__DIR__.'/frankenphp', 'new binary'); chmod(__DIR__.'/frankenphp', 0755);\n");
+    $process = Process::fromShellCommandline($command);
+    $process->run();
+
+    expect($process->getExitCode())->toBe(0, $process->getErrorOutput())
+        ->and(file_get_contents($ctx->app('frankenphp')))->toBe('new binary')
+        ->and(file_exists($ctx->app('frankenphp.old')))->toBeFalse();
+});
+
+it('tells an update whether FrankenPHP changed', function (?string $downloaded, int $exit, ?bool $changed) {
+    $ctx = setupContext();
+    file_put_contents($ctx->app('frankenphp'), 'release 1');
+    $shell = (new FakeShell)->onInteractive(function () use ($ctx, $downloaded, $exit) {
+        if ($downloaded !== null) {
+            file_put_contents($ctx->app('frankenphp'), $downloaded);
+        }
+
+        return $exit;
+    });
+
+    expect((new Updater($shell))->refreshFrankenPhp($ctx, 'fetch it'))->toBe($changed)
+        ->and($shell->interactive)->toBe(['fetch it']);
+})->with([
+    'a new release' => ['release 2', 0, true],
+    'the same release' => ['release 1', 0, false],
+    'a failed download' => [null, 1, null],
+]);
+
+it('takes the newest release, not a pre-release, as the latest', function (string $tags, ?string $latest) {
+    $ctx = setupContext();
+    // As `git tag --sort=-v:refname` lists them: a pre-release above the release it leads up to
+    $shell = (new FakeShell)->on("git -C :app tag --list 'v[0-9]*' --sort=-v:refname", fn () => $tags);
+
+    expect((new Updater($shell))->latestRelease($ctx))->toBe($latest);
+})->with([
+    ["v1.1.0-rc1\nv1.1.0-beta\nv1.1.0\nv1.0.0", 'v1.1.0'],
+    ["v2.0.0-rc1\nv1.4.2", 'v1.4.2'],
+    ['v1.0.0-rc1', null],
+    ['', null],
+]);

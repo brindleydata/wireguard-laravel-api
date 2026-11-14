@@ -10,6 +10,26 @@ class ConfigBuilder
     /** Header of a disabled peer's section: the whole section is commented out. */
     public const DISABLED_PEER = '# [Peer] disabled';
 
+    /**
+     * What a client config gets unless its link or the peer says otherwise: all traffic through
+     * the tunnel, a public resolver, and a keepalive that holds NAT mappings open. Fixed on
+     * purpose: a default that could change would change what every stored client config means.
+     */
+    public const DEFAULT_DNS = '8.8.8.8';
+
+    public const DEFAULT_KEEPALIVE = 25;
+
+    public const DEFAULT_ALLOWED_IPS = '0.0.0.0/0';
+
+    /**
+     * Version of the link config format, written as `# format = …`. Since 2 a peer's own client
+     * settings are stored in its section; before, they only showed in its client config.
+     */
+    public const FORMAT = 2;
+
+    /** What a peer's section holds as comments (peer field => comment key): its label and client settings. */
+    public const PEER_SETTINGS = ['name' => 'name', 'dns' => 'dns', 'keepalive' => 'keepalive', 'client_allowed_ips' => 'allowed_ips'];
+
     public function __construct(
         protected array $config,
         protected OsDriver $os,
@@ -27,6 +47,7 @@ class ConfigBuilder
         $lines[] = '# forward = '.($forward ? 'true' : 'false');
         $lines[] = '# nat = '.($nat ? 'true' : 'false');
         $lines[] = '# up = '.($up ? 'true' : 'false');
+        $lines[] = '# format = '.self::FORMAT;
         if ($dns !== null) {
             $lines[] = "# dns = {$dns}";
         }
@@ -40,15 +61,17 @@ class ConfigBuilder
         // Interface section from OS driver
         $lines[] = $this->os->interfaceSection($address6 === null ? $address : "{$address}, {$address6}", $privkey, $port, $ifout, $forward, $nat);
 
-        // Peer sections. A disabled peer is commented out, so wg-quick doesn't load it; its name is
-        // a comment either way.
+        // Peer sections. A disabled peer is commented out, so wg-quick doesn't load it; its name
+        // and its own client settings are comments either way.
         foreach ($peers as $peer) {
             $disabled = ($peer['enabled'] ?? true) === false;
             $prefix = $disabled ? '# ' : '';
             $lines[] = '';
             $lines[] = $disabled ? self::DISABLED_PEER : '[Peer]';
-            if (($peer['name'] ?? null) !== null) {
-                $lines[] = "# name = {$peer['name']}";
+            foreach (self::PEER_SETTINGS as $field => $key) {
+                if (($peer[$field] ?? null) !== null) {
+                    $lines[] = "# {$key} = {$peer[$field]}";
+                }
             }
             $lines[] = "{$prefix}PublicKey = {$peer['public_key']}";
             if (! empty($peer['preshared_key'])) {
@@ -61,26 +84,20 @@ class ConfigBuilder
     }
 
     /**
-     * Client config values a link hands out unless a peer overrides them: the link's own metadata
-     * (dns, keepalive, allowed_ips), falling back to the global WIREGUARD_* defaults.
+     * Client config values a link hands out unless a peer has its own: the link's metadata (dns,
+     * keepalive, allowed_ips), else the fixed defaults.
      *
-     * A dual-stack link sends all IPv6 traffic through the tunnel too: when the global default
-     * routes all IPv4 (0.0.0.0/0) and names no IPv6, ::/0 is added.
+     * A dual-stack link without allowed_ips of its own sends all IPv6 traffic through the tunnel
+     * too: ::/0 next to 0.0.0.0/0.
      *
      * @return array{dns: string, keepalive: string, allowed_ips: string}
      */
     public function clientDefaults(array $metadata): array
     {
-        $allowed_ips = (string) ($metadata['allowed_ips'] ?? $this->config['allowed_ips'] ?? '0.0.0.0/0');
-        if (! isset($metadata['allowed_ips']) && isset($metadata['address6'])
-            && in_array('0.0.0.0/0', array_map('trim', explode(',', $allowed_ips)), true) && ! str_contains($allowed_ips, ':')) {
-            $allowed_ips .= ', ::/0';
-        }
-
         return [
-            'dns' => (string) ($metadata['dns'] ?? $this->config['default_dns'] ?? '8.8.8.8'),
-            'keepalive' => (string) ($metadata['keepalive'] ?? $this->config['default_keepalive'] ?? 25),
-            'allowed_ips' => $allowed_ips,
+            'dns' => (string) ($metadata['dns'] ?? self::DEFAULT_DNS),
+            'keepalive' => (string) ($metadata['keepalive'] ?? self::DEFAULT_KEEPALIVE),
+            'allowed_ips' => (string) ($metadata['allowed_ips'] ?? self::DEFAULT_ALLOWED_IPS.(isset($metadata['address6']) ? ', ::/0' : '')),
         ];
     }
 
@@ -168,8 +185,9 @@ class ConfigBuilder
 
                 continue;
             }
-            if (in_array($current_section, ['peer', 'disabled'], true) && preg_match('/^#\s*name\s*=\s*(.+)$/', $trimmed, $matches)) {
-                $peers[count($peers) - 1]['name'] = trim($matches[1]);
+            // A peer's label and own client settings, comments in a live section too
+            if (in_array($current_section, ['peer', 'disabled'], true) && preg_match('/^#\s*(name|dns|keepalive|allowed_ips)\s*=\s*(.+)$/', $trimmed, $matches)) {
+                $peers[count($peers) - 1][array_search($matches[1], self::PEER_SETTINGS, true)] = trim($matches[2]);
 
                 continue;
             }

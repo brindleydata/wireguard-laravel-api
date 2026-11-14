@@ -26,7 +26,7 @@ trait AsksForPassphrase
             return $env;
         }
 
-        if (! $this->input->isInteractive()) {
+        if (! $this->interactive()) {
             $this->error('No passphrase: pass --passphrase-file= or set WGLA_BACKUP_PASSPHRASE.');
 
             return null;

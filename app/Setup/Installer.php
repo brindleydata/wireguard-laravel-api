@@ -31,6 +31,7 @@ class Installer
         'cert' => 'WGLA_SERVER_CERT',
         'key' => 'WGLA_SERVER_KEY',
         'bind' => 'WGLA_SERVER_BIND',
+        'admin_port' => 'WGLA_SERVER_ADMIN_PORT',
         'hostname' => 'WIREGUARD_HOSTNAME',
     ];
 
@@ -89,6 +90,12 @@ class Installer
             if ($value !== null) {
                 $ctx->answers[$answer] = $value;
             }
+        }
+
+        // Derived here, not only by the web-user step: wg:update and `wg:install --step=` don't
+        // run that step, and the service unit and .env need the group all the same
+        if (($web = $ctx->answer('web_user')) !== null) {
+            $ctx->answers['web_group'] = $this->shell->tryRun('id -gn :user', ['user' => (string) $web]) ?: (string) $web;
         }
 
         return $ctx;

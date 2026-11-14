@@ -288,3 +288,18 @@ it('exports the stored client config of each peer', function () {
         ->and($links['wg1']['up'])->toBeFalse()
         ->and(array_keys($links['wg0']['clients']))->toBe([KeyManager::pubkeyToSafe($peers['plain']->public_key), KeyManager::pubkeyToSafe($peers['custom']->public_key)]);
 });
+
+it('restores what peers had of their own from a backup made before that was stored with them', function () {
+    [$old, $peers] = backedUpServer('linux'); // one peer with its own DNS, 9.9.9.9
+    $payload = $old->backup->create();
+    $payload['links']['wg0']['conf'] = asFormat1($payload['links']['wg0']['conf']);
+    expect($payload['links']['wg0']['conf'])->not->toContain('9.9.9.9');
+    $new = new Rig('linux', hostname: 'new.example.test');
+
+    $new->backup->restore($payload, ['wg0' => 'restore']);
+
+    expect($new->host->conf('wg0'))->toContain("# format = 2\n", "# dns = 9.9.9.9\nPublicKey = {$peers['custom']->public_key}\n")
+        ->and($new->wg->getLink('wg0')->peers[0]->dns)->toBeNull()
+        ->and($new->wg->getPeerConfig('wg0', $peers['custom']->public_key))->toContain("DNS = 9.9.9.9\n", 'Endpoint = new.example.test:51820')
+        ->and($new->wg->getPeerConfig('wg0', $peers['plain']->public_key))->toContain("DNS = 8.8.8.8\n");
+});

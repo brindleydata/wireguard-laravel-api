@@ -222,3 +222,26 @@ it('goes back to the previous version when finishing fails', function () {
     expect($this->shell->interactive)->toContain("git -C '".base_path()."' checkout --quiet --detach 'old000'")
         ->toContain("'".PHP_BINARY."' '".base_path('artisan')."' wg:update --finish='bad222' --yes");
 });
+
+// ─── Answers ────────────────────────────────────────────────────────
+
+it('refuses a mistyped installer option', function (array $options, string $error) {
+    setupShell($this->shell);
+
+    $this->artisan('wg:install', ['--print' => true, ...$options])->expectsOutputToContain($error)->assertFailed();
+})->with([
+    [['--forward' => 'maybe'], '--forward must be true or false'],
+    [['--admin-port' => '2019a'], '--admin-port must be a whole number'],
+    [['--admin-port' => '70000'], '--admin-port must be a port number'],
+]);
+
+it('knows the web user\'s group in every command, not only after the web-user step', function () {
+    // wg:update and `wg:install --step=server` never run that step, and the service unit and
+    // .env need the group: "nobody" is in "nogroup", not in a group of its own name
+    setupShell($this->shell)->on('id -gn :user', fn (array $b) => $b['user'] === 'nobody' ? 'nogroup' : $b['user']);
+
+    $app = sys_get_temp_dir().'/wgla_no_app'; // no .env there: nothing saved from an earlier install
+
+    expect($this->installer->context(['web_user' => 'nobody'], $app)->webGroup())->toBe('nogroup')
+        ->and($this->installer->context([], $app)->webGroup())->toBe('deploy', 'No web user chosen yet: the deploy user itself');
+});

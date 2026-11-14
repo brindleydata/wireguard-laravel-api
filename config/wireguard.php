@@ -11,9 +11,6 @@ return [
 
     'ip_service' => env('IP_SERVICE', 'http://ifconfig.me/ip'),
     'hostname' => env('WIREGUARD_HOSTNAME'),
-    'default_dns' => env('WIREGUARD_DNS', '8.8.8.8'),
-    'default_keepalive' => (int) env('WIREGUARD_KEEPALIVE', 25),
-    'allowed_ips' => env('WIREGUARD_ALLOWED_IPS', '0.0.0.0/0'),
 
     'templates' => [
         // Client-side configuration template

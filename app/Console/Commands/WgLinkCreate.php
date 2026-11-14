@@ -13,9 +13,9 @@ class WgLinkCreate extends WgCommand
         {--address6= : IPv6 address and prefix too (e.g. fd12:3456:789a::1/64), or "auto" for a random private /64}
         {--port= : Listen port (random if omitted)}
         {--ifout= : Outbound network interface for NAT (auto-detected if omitted)}
-        {--dns= : DNS server for peers (default: WIREGUARD_DNS)}
-        {--keepalive= : Persistent keepalive interval in seconds (default: WIREGUARD_KEEPALIVE)}
-        {--allowed-ips= : Allowed IPs for peer configs (default: WIREGUARD_ALLOWED_IPS)}
+        {--dns= : DNS server for peers (default: 8.8.8.8)}
+        {--keepalive= : Persistent keepalive interval in seconds (default: 25)}
+        {--allowed-ips= : Allowed IPs for peer configs (default: all traffic, 0.0.0.0/0 and ::/0 with IPv6)}
         {--forward= : Enable or disable IP forwarding (true/false)}
         {--nat= : Enable or disable NAT masquerading (true/false)}
         {--up= : Start the interface after creation (true/false, default: true)}';
@@ -26,16 +26,17 @@ class WgLinkCreate extends WgCommand
     {
         $name = $this->argument('link');
         $ip = $this->argument('ip');
-        $port = $this->option('port') !== null ? (int) $this->option('port') : null;
         $ifout = $this->option('ifout');
         $dns = $this->option('dns');
-        $keepalive = in_array($this->option('keepalive'), [null, ''], true) ? null : (int) $this->option('keepalive');
         $allowed_ips = $this->option('allowed-ips');
-        $forward = $this->option('forward') !== null && filter_var($this->option('forward'), FILTER_VALIDATE_BOOLEAN);
-        $nat = $this->option('nat') !== null && filter_var($this->option('nat'), FILTER_VALIDATE_BOOLEAN);
-        $up = $this->option('up') === null || filter_var($this->option('up'), FILTER_VALIDATE_BOOLEAN);
 
         try {
+            $port = $this->number('port');
+            $keepalive = $this->option('keepalive') === '' ? null : $this->number('keepalive');
+            $forward = $this->flag('forward') ?? false;
+            $nat = $this->flag('nat') ?? false;
+            $up = $this->flag('up') ?? true;
+
             $link = $wg->createLink($name, $ip, $port, $ifout, $dns, $keepalive, $allowed_ips, $forward, $nat, $up, $this->option('address6'));
         } catch (\Throwable $e) {
             $this->error($e->getMessage());

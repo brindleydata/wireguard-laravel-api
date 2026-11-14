@@ -25,7 +25,7 @@ class WgRestore extends WgCommand
     public function handle(WireGuard $wg): int
     {
         $backup = app(Backup::class);
-        $interactive = $this->input->isInteractive();
+        $interactive = $this->interactive();
         $existing = $this->option('existing');
         if ($existing !== null && ! in_array($existing, ['skip', 'replace'], true)) {
             $this->error('--existing must be skip or replace.');

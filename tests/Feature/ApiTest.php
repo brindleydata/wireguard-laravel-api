@@ -1,5 +1,6 @@
 <?php
 
+use App\Http\Middleware\AuthenticateByApiKey;
 use App\Services\KeyManager;
 use App\Services\Server;
 use App\Services\Shell;
@@ -258,4 +259,94 @@ it('maps errors to status codes with a message', function () {
         ->assertJsonPath('error', 'Link does not exist: wg1');
 
     $this->deleteJson('/link/wg0', [], $this->auth)->assertOk();
+});
+
+it('answers every error as {"error": …}, whoever refuses the request', function () {
+    $this->getJson('/links')->assertForbidden()->assertExactJson(['error' => 'Access denied.']);
+    $this->putJson('/links', [], $this->auth)->assertStatus(405)->assertJsonStructure(['error'])->assertJsonMissingPath('message');
+    $this->getJson('/nope', $this->auth)->assertNotFound()->assertJsonStructure(['error']);
+
+    // A request that fails its field rules also says which fields
+    $this->postJson('/link', ['name' => 'wg0', 'port' => 'high'], $this->auth)
+        ->assertUnprocessable()
+        ->assertJsonPath('error', 'The ip field is required.')
+        ->assertJsonPath('errors.port.0', 'The port field must be an integer.')
+        ->assertJsonMissingPath('message');
+});
+
+it('has no public route but /health', function () {
+    $public = collect(app('router')->getRoutes())
+        ->reject(fn ($route) => in_array(AuthenticateByApiKey::class, $route->gatherMiddleware(), true))
+        ->map(fn ($route) => $route->uri())
+        ->values()->all();
+
+    // The framework's own would be /storage/{path}, for a disk this app doesn't serve
+    expect($public)->toBe(['health']);
+});
+
+it('asks the root helper about health once in a while, not for every request', function () {
+    $asked = fn () => count($this->host->shell->callsTo('sudo -n :helper version'));
+
+    $this->getJson('/health')->assertOk();
+    $this->getJson('/health')->assertOk();
+    $this->getJson('/health')->assertOk();
+    expect($asked())->toBe(1);
+
+    // /status is behind the API key and always asks
+    $this->host->shell->otherwise(fn () => '0');
+    $this->getJson('/status', $this->auth)->assertOk();
+    expect($asked())->toBe(2);
+});
+
+it('never keeps an unhealthy answer', function () {
+    $allowed = false;
+    $this->host->shell->on('sudo -n :helper version', function () use (&$allowed) {
+        return $allowed ? '1' : throw new CommandFailed('sudo: a password is required');
+    });
+
+    $this->getJson('/health')->assertStatus(503);
+    $allowed = true; // the sudo rule is fixed
+    $this->getJson('/health')->assertOk();
+});
+
+it('shows and changes a peer\'s own client settings, keepalive included', function () {
+    $this->postJson('/link', ['name' => 'wg0', 'ip' => '10.0.0.1/24', 'port' => 51820], $this->auth)->assertCreated();
+    $safe = KeyManager::pubkeyToSafe($this->postJson('/link/wg0/peers', [], $this->auth)
+        ->assertJsonPath('client', ['dns' => null, 'keepalive' => null, 'allowed_ips' => null])
+        ->json('public_key'));
+
+    $this->patchJson("/link/wg0/peer/{$safe}", ['dns' => '1.1.1.1', 'keepalive' => 0], $this->auth)
+        ->assertOk()
+        ->assertJsonPath('client', ['dns' => '1.1.1.1', 'keepalive' => 0, 'allowed_ips' => null])
+        ->assertJsonPath('client_config', fn (string $config) => str_contains($config, 'PersistentKeepalive = 0'));
+    $this->getJson('/link/wg0/peers', $this->auth)->assertJsonPath('0.client.keepalive', 0);
+
+    $this->patchJson("/link/wg0/peer/{$safe}", ['keepalive' => null], $this->auth)
+        ->assertJsonPath('client', ['dns' => '1.1.1.1', 'keepalive' => null, 'allowed_ips' => null]);
+    $this->patchJson("/link/wg0/peer/{$safe}", ['keepalive' => 70000], $this->auth)->assertUnprocessable();
+});
+
+it('moves a link to another subnet only with move_peers', function () {
+    $this->postJson('/link', ['name' => 'wg0', 'ip' => '10.0.0.1/24', 'port' => 51820], $this->auth)->assertCreated();
+    $this->postJson('/link/wg0/peers', ['ip' => '10.0.0.9'], $this->auth)->assertCreated();
+
+    $this->patchJson('/link/wg0', ['address' => '10.1.0.1/24'], $this->auth)
+        ->assertUnprocessable()
+        ->assertJsonPath('error', fn (string $error) => str_contains($error, 'pass move_peers (--move-peers)'));
+    $this->patchJson('/link/wg0', ['address' => '10.1.0.1/24', 'move_peers' => true], $this->auth)
+        ->assertOk()
+        ->assertJsonPath('address', '10.1.0.1/24')
+        ->assertJsonPath('peers.0.allowed_ips', '10.1.0.9/32');
+});
+
+it('answers 422 for a QR code of a config that is too long for one', function () {
+    $this->postJson('/link', ['name' => 'wg0', 'ip' => '10.0.0.1/24', 'port' => 51820], $this->auth)->assertCreated();
+    $safe = KeyManager::pubkeyToSafe($this->postJson('/link/wg0/peers', [], $this->auth)->json('public_key'));
+    $routes = implode(', ', array_map(fn (int $i) => "10.{$i}.0.0/16", range(1, 250)));
+    $this->patchJson("/link/wg0/peer/{$safe}", ['allowed_ips' => $routes], $this->auth)->assertOk();
+
+    $this->getJson("/link/wg0/peer/{$safe}/qr", $this->auth)
+        ->assertUnprocessable()
+        ->assertJsonPath('error', 'This client config is too long for a QR code.');
+    $this->getJson("/link/wg0/peer/{$safe}/config", $this->auth)->assertOk();
 });

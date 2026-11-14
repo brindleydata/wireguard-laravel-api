@@ -39,10 +39,11 @@ function appConf(string $os, bool $forward = true, bool $nat = true, ?string $ad
     return (new ConfigBuilder([], $driver))->buildConfFile(
         '10.0.0.1/24', $keys->genkey(), 51820, $os === 'Darwin' ? 'en0' : 'eth0',
         [
-            ['public_key' => $keys->pubkey($keys->genkey()), 'preshared_key' => $keys->genpsk(), 'allowed_ips' => '10.0.0.2/32', 'name' => "Ана's phone (#2)"],
+            ['public_key' => $keys->pubkey($keys->genkey()), 'preshared_key' => $keys->genpsk(), 'allowed_ips' => '10.0.0.2/32', 'name' => "Ана's phone (#2)",
+                'dns' => '10.0.0.1, corp.example.com', 'keepalive' => '0', 'client_allowed_ips' => '10.0.0.0/24, fd00::/64'],
             ['public_key' => $keys->pubkey($keys->genkey()), 'allowed_ips' => '10.0.0.3/32, fd00::3/128, 192.168.1.0/24'],
             // Disabled: commented out, so wg-quick doesn't load it
-            ['public_key' => $keys->pubkey($keys->genkey()), 'preshared_key' => $keys->genpsk(), 'allowed_ips' => '10.0.0.4/32', 'name' => 'old laptop', 'enabled' => false],
+            ['public_key' => $keys->pubkey($keys->genkey()), 'preshared_key' => $keys->genpsk(), 'allowed_ips' => '10.0.0.4/32', 'name' => 'old laptop', 'enabled' => false, 'dns' => '9.9.9.9'],
         ],
         '1.1.1.1, 8.8.8.8', 25, '0.0.0.0/0, ::/0', $forward, $nat, address6: $address6,
     )."\n";
@@ -90,7 +91,9 @@ it('stores exactly the link configs the app writes', function (string $os) {
         ->and($box->run(['conf-write', 'wg1'], $plain)['exit'])->toBe(0)
         ->and($box->run(['conf-write', 'wg2'], $dual)['exit'])->toBe(0)
         ->and($dual)->toContain("# address6 = fd12:3456:789a::1/64\n")->toContain("Address = 10.0.0.1/24, fd12:3456:789a::1/64\n")
-        ->and($hooked)->toContain("[Peer]\n# name = Ана's phone (#2)\nPublicKey = ")->toContain("# [Peer] disabled\n# name = old laptop\n# PublicKey = ")
+        ->and($hooked)->toContain("# up = true\n# format = 2\n")
+        ->toContain("[Peer]\n# name = Ана's phone (#2)\n# dns = 10.0.0.1, corp.example.com\n# keepalive = 0\n# allowed_ips = 10.0.0.0/24, fd00::/64\nPublicKey = ")
+        ->toContain("# [Peer] disabled\n# name = old laptop\n# dns = 9.9.9.9\n# PublicKey = ")
         ->and(file_get_contents("{$box->confDir}/wg0.conf"))->toBe($hooked)
         ->and(sprintf('%o', fileperms("{$box->confDir}/wg0.conf") & 0777))->toBe('600')
         ->and($box->run(['conf-read', 'wg0'])['stdout'])->toBe($hooked)
@@ -133,6 +136,12 @@ it('rejects anything else in a link config and keeps the saved one', function (s
     'a peer name before [Interface]' => ['/^/', "# name = me\n", 'metadata not allowed'],
     'a control character in a peer name' => ['/^# name = old laptop$/m', "# name = old\x1b[2Jlaptop", 'invalid peer name'],
     'an empty peer name' => ['/^# name = old laptop$/m', '# name = ', 'invalid peer name'],
+    'shell syntax in a peer\'s DNS' => ['/^# dns = 9\.9\.9\.9$/m', '# dns = 9.9.9.9;id', 'metadata not allowed'],
+    'a peer keepalive out of range' => ['/^# keepalive = 0$/m', '# keepalive = 70000', 'metadata not allowed'],
+    'a hostname in a peer\'s allowed IPs' => ['/^# allowed_ips = 10\.0\.0\.0\/24, fd00::\/64$/m', '# allowed_ips = example.com', 'metadata not allowed'],
+    'a link setting in a peer' => ['/^# name = old laptop$/m', "# name = old laptop\n# nat = true", 'not allowed in a link config: nat = true'],
+    'a peer setting in [Interface]' => ['/^ListenPort/m', "# keepalive = 5\nListenPort", 'comments are only allowed before [Interface]'],
+    'a format that is no number' => ['/^# format = .*$/m', '# format = two', 'metadata not allowed'],
     'a hook in a disabled peer' => ['/^# \[Peer\] disabled$/m', "# [Peer] disabled\n# PostUp = id", 'not allowed in a link config: PostUp = id'],
     'a bad key in a disabled peer' => ['/^(# PublicKey = ).*$/m', '$1not-a-key', 'not allowed in a link config: PublicKey = not-a-key'],
     'free text in a disabled peer' => ['/^# \[Peer\] disabled$/m', "# [Peer] disabled\n# remember to delete", 'malformed line in a disabled peer'],
@@ -364,6 +373,7 @@ it('leaves iptables and ip6tables alone when they are not installed', function (
 it('loads nat before pass rules into the link pf anchor', function () {
     $box = new HelperSandbox('Darwin');
     $box->writeConf('wg0', appConf('Darwin'));
+    file_put_contents("{$box->runDir}/wg0.name", "utun5\n"); // wg-quick records it before PostUp
 
     $run = $box->run(['firewall-up', 'wg0', 'utun5']);
 
@@ -377,6 +387,7 @@ it('loads nat before pass rules into the link pf anchor', function () {
 it('adds an IPv6 nat rule to the pf anchor of a dual-stack link', function () {
     $box = new HelperSandbox('Darwin');
     $box->writeConf('wg0', appConf('Darwin', address6: 'fd12:3456:789a::1/64'));
+    file_put_contents("{$box->runDir}/wg0.name", "utun5\n");
 
     $run = $box->run(['firewall-up', 'wg0', 'utun5']);
 
@@ -387,10 +398,29 @@ it('adds an IPv6 nat rule to the pf anchor of a dual-stack link', function () {
         ->toBeAcceptedByPf();
 });
 
+it('installs rules for the link\'s own interface only', function (string $os, string $iface) {
+    $box = new HelperSandbox($os);
+    $box->writeConf('wg0', appConf($os));
+    file_put_contents("{$box->runDir}/wg0.name", "utun5\n");
+    $box->respond('iptables -S FORWARD', "-P FORWARD DROP\n-A FORWARD -j DOCKER-USER");
+
+    // Forward accepts for another interface would open what the host's firewall closed
+    $run = $box->run(['firewall-up', 'wg0', $iface]);
+
+    expect($run['exit'])->toBe(1)
+        ->and($run['stderr'])->toContain("{$iface} is not the interface of link wg0")
+        ->and($box->calls())->toBe([]);
+})->with([
+    'Linux: another interface' => ['Linux', 'docker0'],
+    'macOS: another utun' => ['Darwin', 'utun9'],
+    'macOS: the link name' => ['Darwin', 'wg0'],
+]);
+
 it('installs only the rules that are enabled', function (string $os, bool $forward, bool $nat) {
     $box = new HelperSandbox($os);
     $box->writeConf('wg0', appConf($os, $forward, $nat));
     $box->respond('iptables -S FORWARD', '-P FORWARD ACCEPT');
+    file_put_contents("{$box->runDir}/wg0.name", "utun5\n");
 
     $run = $box->run(['firewall-up', 'wg0', $os === 'Darwin' ? 'utun5' : 'wg0']);
     $rules = $box->stdin()[0];
@@ -410,8 +440,9 @@ it('clears the rules when forward and NAT are both off', function (string $os) {
     $box = new HelperSandbox($os);
     $box->writeConf('wg0', appConf($os, forward: false, nat: false));
     $box->respond('iptables -S FORWARD', '-P FORWARD ACCEPT');
+    file_put_contents("{$box->runDir}/wg0.name", "utun5\n");
 
-    $box->run(['firewall-up', 'wg0', 'wg0']);
+    $box->run(['firewall-up', 'wg0', $os === 'Darwin' ? 'utun5' : 'wg0']);
 
     expect($os === 'Darwin'
         ? $box->calls() === [['pfctl', '-a', 'wg/wg0', '-F', 'all']]

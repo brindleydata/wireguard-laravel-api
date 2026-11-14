@@ -25,7 +25,13 @@ class WgPeerShow extends WgCommand
         }
 
         if ($this->option('qr')) {
-            $this->line(app(QrCode::class)->terminal($config));
+            try {
+                $this->line(app(QrCode::class)->terminal($config));
+            } catch (\InvalidArgumentException $e) {
+                $this->error($e->getMessage());
+
+                return Command::FAILURE;
+            }
 
             return Command::SUCCESS;
         }

@@ -7,6 +7,7 @@ use App\Services\WireGuard;
 use App\Setup\Context;
 use App\Setup\Installer;
 use App\Setup\Step;
+use App\Setup\Steps\Server;
 use App\Setup\Updater;
 use Illuminate\Console\Command;
 
@@ -16,8 +17,9 @@ use function Laravel\Prompts\confirm;
  * Update the app to a release, in two stages:
  *
  * 1. With the running (old) code: check out the release and install its dependencies.
- * 2. In a new process with the new code (`--finish`): bring the root helper, sudo rule and
- *    service up to date, reload the API, check its health.
+ * 2. In a new process with the new code (`--finish`): fetch the current FrankenPHP, bring the
+ *    root helper, sudo rule and service up to date, reload the API (restart it when FrankenPHP
+ *    changed), check its health.
  *
  * If stage 2 fails, the previous version is checked out again and finished the same way.
  */
@@ -47,7 +49,7 @@ class WgUpdate extends WgCommand
         $installer = app(Installer::class);
         $updater = app(Updater::class);
         $yes = (bool) $this->option('yes');
-        $interactive = ! $yes && $this->input->isInteractive();
+        $interactive = ! $yes && $this->interactive();
         $ctx = $installer->context();
 
         if ($ctx->deployUser === 'root') {
@@ -57,7 +59,7 @@ class WgUpdate extends WgCommand
         }
 
         if ($this->option('finish') !== null) {
-            return $this->finish($installer, $ctx, $interactive, $yes) ? Command::SUCCESS : Command::FAILURE;
+            return $this->finish($installer, $updater, $ctx, $interactive, $yes) ? Command::SUCCESS : Command::FAILURE;
         }
 
         if (! $updater->isCheckout($ctx)) {
@@ -154,7 +156,7 @@ class WgUpdate extends WgCommand
     }
 
     /** Stage 2, running the new code: helper, sudo rule, service, reload, health. */
-    protected function finish(Installer $installer, Context $ctx, bool $interactive, bool $yes): bool
+    protected function finish(Installer $installer, Updater $updater, Context $ctx, bool $interactive, bool $yes): bool
     {
         if (! $installer->sudoReady($interactive)) {
             $this->error('This needs sudo.');
@@ -163,10 +165,31 @@ class WgUpdate extends WgCommand
         }
 
         $steps = array_filter($installer->steps(), fn (Step $step) => in_array($step->key(), self::STEPS, true) && $step->applies($ctx));
+
+        // The web server is not part of the release: every update brings its current version
+        $server = array_find($steps, fn (Step $step) => $step instanceof Server);
+        $new_server = false;
+        if ($server !== null && is_file($ctx->app('frankenphp'))) {
+            $this->line('→ Fetching the current FrankenPHP');
+            $new_server = $updater->refreshFrankenPhp($ctx, $server->replaceFrankenPhp($ctx));
+            if ($new_server === null) {
+                $this->warn('  That failed. The installed FrankenPHP stays; the next update tries again.');
+            }
+        }
+
         foreach ($steps as $step) {
+            // After the service step (its unit may have changed too), before the health check
+            if ($new_server && $step->key() === 'health') {
+                $this->line('→ Restarting the API with the new FrankenPHP');
+                if (! $updater->restartApi()) {
+                    return false;
+                }
+            }
+
             if (! $this->answer($step, $ctx, $interactive)) {
                 return false;
             }
+            $step->after($ctx);
             $installer->save($ctx);
             // (The server step reloads the API: it still runs the old code.)
 
