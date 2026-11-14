@@ -94,6 +94,26 @@ it('restores every link on another server, re-rendered for it', function (string
     'Linux to macOS' => ['linux', 'mac'],
 ]);
 
+it('restores a dual-stack link with its IPv6 prefix and peer addresses', function (string $to) {
+    $old = new Rig('linux');
+    $old->wg->createLink('wg0', '10.0.0.1/24', 51820, nat: true, address6: 'fd12::1/64');
+    $peer = $old->wg->addPeer('wg0');
+    $payload = $old->backup->create();
+    $new = new Rig($to, hostname: 'new.example.test');
+
+    $new->backup->restore($payload, ['wg0' => 'restore']);
+
+    expect($new->wg->getLink('wg0')->address6)->toBe('fd12::1/64')
+        ->and($new->host->confPeers('wg0'))->toBe([$peer->public_key => '10.0.0.2/32, fd12::2/128'])
+        ->and($new->host->firewall['wg0']['nat6'])->toBe('fd12::1/64')
+        ->and($new->wg->getPeerConfig('wg0', $peer->public_key))->toContain('Address = 10.0.0.2/32, fd12::2/128', 'AllowedIPs = 0.0.0.0/0, ::/0');
+
+    // A server whose link already uses an overlapping prefix can't take it
+    $taken = new Rig($to);
+    $taken->wg->createLink('wg5', '10.5.0.1/24', 51825, address6: 'fd12::5/64');
+    expect($taken->backup->clashes($payload, 'wg0'))->toBe(['prefix fd12::1/64 overlaps wg5 (fd12::5/64)']);
+})->with(['Linux' => 'linux', 'macOS' => 'mac']);
+
 it("falls back to this server's outbound interface when the old one doesn't exist here", function () {
     [$old] = backedUpServer('mac'); // NAT out of en0
     $new = new Rig('linux');

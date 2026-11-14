@@ -18,6 +18,7 @@ class InterfaceInfo
         public readonly bool $up = true,
         public readonly array $peers = [],
         public readonly ?string $interface = null, // OS interface while running (utunN on macOS)
+        public readonly ?string $address6 = null,  // IPv6 address and prefix of a dual-stack link
     ) {}
 
     public function toArray(): array
@@ -28,6 +29,7 @@ class InterfaceInfo
             'public_key' => $this->public_key,
             'listen_port' => $this->listen_port,
             'address' => $this->address,
+            'address6' => $this->address6,
             'ifout' => $this->ifout,
             'forward' => $this->forward,
             'nat' => $this->nat,

@@ -54,6 +54,7 @@ class WireGuard extends Controller
         $data = $request->validate([
             'name' => 'required|string|max:15',
             'ip' => 'required|string',
+            'address6' => 'nullable|string',  // IPv6 address and prefix, or "auto"
             'port' => 'nullable|integer|min:1|max:65535',
             'ifout' => 'nullable|string|max:15',
             'dns' => 'nullable|string',
@@ -75,6 +76,7 @@ class WireGuard extends Controller
             $data['forward'] ?? false,
             $data['nat'] ?? false,
             $data['up'] ?? true,
+            $data['address6'] ?? null,
         );
 
         return response()->json($link->toArray(), 201);
@@ -91,6 +93,7 @@ class WireGuard extends Controller
     {
         $data = $request->validate([
             'address' => 'nullable|string',
+            'address6' => 'nullable|string',  // IPv6 address and prefix, or "auto"; null removes it
             'port' => 'nullable|integer|min:1|max:65535',
             'ifout' => 'nullable|string|max:15',
             'dns' => 'nullable|string',
@@ -101,8 +104,12 @@ class WireGuard extends Controller
             'up' => 'nullable|boolean',
         ]);
 
-        // Filter out null values so only explicitly provided fields are passed
+        // Filter out null values so only explicitly provided fields are passed; a null address6
+        // is explicit too: it makes the link IPv4 only
         $params = array_filter($data, fn ($v) => $v !== null);
+        if ($request->exists('address6')) {
+            $params['address6'] = $data['address6'] ?? null;
+        }
 
         $link = $this->wg->updateLink($name, $params);
 

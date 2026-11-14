@@ -28,7 +28,7 @@ dataset('helper os', ['Linux' => 'Linux', 'macOS' => 'Darwin']);
 /**
  * A link config exactly as the app writes it (hooks naming the helper under test).
  */
-function appConf(string $os, bool $forward = true, bool $nat = true): string
+function appConf(string $os, bool $forward = true, bool $nat = true, ?string $address6 = null): string
 {
     $driver = $os === 'Darwin'
         ? new MacDriver(new FakeShell, HelperSandbox::path())
@@ -41,7 +41,7 @@ function appConf(string $os, bool $forward = true, bool $nat = true): string
             ['public_key' => $keys->pubkey($keys->genkey()), 'preshared_key' => $keys->genpsk(), 'allowed_ips' => '10.0.0.2/32'],
             ['public_key' => $keys->pubkey($keys->genkey()), 'allowed_ips' => '10.0.0.3/32, fd00::3/128'],
         ],
-        '1.1.1.1, 8.8.8.8', 25, '0.0.0.0/0, ::/0', $forward, $nat,
+        '1.1.1.1, 8.8.8.8', 25, '0.0.0.0/0, ::/0', $forward, $nat, address6: $address6,
     )."\n";
 }
 
@@ -79,15 +79,18 @@ it('stores exactly the link configs the app writes', function (string $os) {
     $box = new HelperSandbox($os);
     $hooked = appConf($os);
     $plain = appConf($os, forward: false, nat: false);
+    $dual = appConf($os, address6: 'fd12:3456:789a::1/64');
 
     $run = $box->run(['conf-write', 'wg0'], $hooked);
 
     expect($run['exit'])->toBe(0, $run['stderr'])
         ->and($box->run(['conf-write', 'wg1'], $plain)['exit'])->toBe(0)
+        ->and($box->run(['conf-write', 'wg2'], $dual)['exit'])->toBe(0)
+        ->and($dual)->toContain("# address6 = fd12:3456:789a::1/64\n")->toContain("Address = 10.0.0.1/24, fd12:3456:789a::1/64\n")
         ->and(file_get_contents("{$box->confDir}/wg0.conf"))->toBe($hooked)
         ->and(sprintf('%o', fileperms("{$box->confDir}/wg0.conf") & 0777))->toBe('600')
         ->and($box->run(['conf-read', 'wg0'])['stdout'])->toBe($hooked)
-        ->and($box->run(['conf-list'])['stdout'])->toBe("wg0\nwg1\n")
+        ->and($box->run(['conf-list'])['stdout'])->toBe("wg0\nwg1\nwg2\n")
         ->and($box->calls())->toBe([]);
 })->with('helper os');
 
@@ -112,6 +115,10 @@ it('rejects anything else in a link config and keeps the saved one', function (s
     'SaveConfig' => ['/^ListenPort/m', "SaveConfig = true\nListenPort", 'not allowed in a link config: SaveConfig'],
     'an Endpoint on the server' => ['/^\[Peer\]$/m', "[Peer]\nEndpoint = 203.0.113.1:51820", 'not allowed in a link config: Endpoint'],
     'shell syntax in metadata' => ['/^# ifout = .*$/m', '# ifout = eth0;id', 'metadata not allowed'],
+    'shell syntax in an IPv6 address' => ['/^# address = .*$/m', "# address = 10.0.0.1/24\n# address6 = fd12::1/64;id", 'metadata not allowed'],
+    'a second IPv6 address' => ['/^Address = .*$/m', 'Address = 10.0.0.1/24, fd12::1/64, fd13::1/64', 'not allowed in a link config: Address'],
+    'an IPv6-only address' => ['/^Address = .*$/m', 'Address = fd12::1/64', 'not allowed in a link config: Address'],
+    'a malformed IPv6 address' => ['/^Address = .*$/m', 'Address = 10.0.0.1/24, fd12:::1/64', 'not allowed in a link config: Address'],
     'unknown metadata' => ['/^/', "# owner = me\n", 'metadata not allowed'],
     'a comment after [Interface]' => ['/^\[Peer\]$/m', "# note\n[Peer]", 'comments are only allowed before [Interface]'],
     'a second [Interface]' => ['/\z/', "[Interface]\n", '[Interface] must come first, once'],
@@ -137,6 +144,13 @@ it('adds a validated peer to a running interface', function () {
     expect($box->run(['peer-add', 'wg0'], $peer)['exit'])->toBe(0)
         ->and($box->calls())->toBe([['wg', 'addconf', 'wg0', '/dev/stdin']])
         ->and($box->stdin())->toBe([$peer]);
+});
+
+it('sets allowed IPs of both families in the form wg takes', function () {
+    $box = new HelperSandbox;
+
+    expect($box->run(['peer-ips', 'wg0', HELPER_TEST_KEY, '10.0.0.2/32, fd12::2/128'])['exit'])->toBe(0)
+        ->and($box->calls())->toBe([['wg', 'set', 'wg0', 'peer', HELPER_TEST_KEY, 'allowed-ips', '10.0.0.2/32,fd12::2/128']]);
 });
 
 it('rejects a peer with anything but keys and allowed IPs', function (string $extra) {
@@ -264,10 +278,38 @@ it('opens the iptables FORWARD chain when Docker or ufw drop forwarded traffic',
     ]);
 });
 
-it('leaves iptables alone when it is not installed', function () {
+it('masquerades the IPv6 prefix too on a dual-stack link', function () {
+    $box = new HelperSandbox('Linux');
+    $box->writeConf('wg0', appConf('Linux', address6: 'fd12:3456:789a::1/64'));
+    $box->respond('iptables -S FORWARD', '-P FORWARD ACCEPT');
+
+    $run = $box->run(['firewall-up', 'wg0', 'wg0']);
+
+    expect($run['exit'])->toBe(0, $run['stderr'])
+        ->and($box->stdin()[0])->toContain('chain postrouting { type nat hook postrouting priority 100; '
+            .'ip saddr 10.0.0.0/24 oifname "eth0" masquerade; ip6 saddr fd12:3456:789a::1/64 oifname "eth0" masquerade; }');
+});
+
+it('opens the ip6tables FORWARD chain too when it drops forwarded traffic', function () {
+    $box = new HelperSandbox('Linux');
+    $box->writeConf('wg0', appConf('Linux', address6: 'fd12:3456:789a::1/64'));
+    $box->respond('iptables -S FORWARD', '-P FORWARD ACCEPT');
+    $box->respond('ip6tables -S FORWARD', "-P FORWARD DROP\n-A FORWARD -i wg0 -m comment --comment \"wgla:wg0\" -j ACCEPT");
+
+    $box->run(['firewall-up', 'wg0', 'wg0']);
+
+    expect(array_values(array_filter($box->calls(), fn ($call) => $call[1] !== '-S' && str_contains($call[0], 'tables'))))->toBe([
+        ['ip6tables', '-D', 'FORWARD', '-i', 'wg0', '-m', 'comment', '--comment', 'wgla:wg0', '-j', 'ACCEPT'],
+        ['ip6tables', '-I', 'FORWARD', '1', '-o', 'wg0', '-m', 'comment', '--comment', 'wgla:wg0', '-j', 'ACCEPT'],
+        ['ip6tables', '-I', 'FORWARD', '1', '-i', 'wg0', '-m', 'comment', '--comment', 'wgla:wg0', '-j', 'ACCEPT'],
+    ]);
+});
+
+it('leaves iptables and ip6tables alone when they are not installed', function () {
     $box = new HelperSandbox('Linux');
     $box->writeConf('wg0', appConf('Linux'));
     $box->uninstall('iptables');
+    $box->uninstall('ip6tables');
 
     $run = $box->run(['firewall-up', 'wg0', 'wg0']);
 
@@ -285,6 +327,19 @@ it('loads nat before pass rules into the link pf anchor', function () {
         ->and($box->calls())->toBe([['pfctl', '-a', 'wg/wg0', '-f', '-'], ['pfctl', '-e']])
         ->and($box->stdin()[0])
         ->toBe("nat on en0 from 10.0.0.0/24 to any -> (en0)\npass in on utun5 all\npass out on utun5 all\n")
+        ->toBeAcceptedByPf();
+});
+
+it('adds an IPv6 nat rule to the pf anchor of a dual-stack link', function () {
+    $box = new HelperSandbox('Darwin');
+    $box->writeConf('wg0', appConf('Darwin', address6: 'fd12:3456:789a::1/64'));
+
+    $run = $box->run(['firewall-up', 'wg0', 'utun5']);
+
+    expect($run['exit'])->toBe(0, $run['stderr'])
+        ->and($box->stdin()[0])
+        ->toBe("nat on en0 from 10.0.0.0/24 to any -> (en0)\nnat on en0 inet6 from fd12:3456:789a::1/64 to any -> (en0)\n"
+            ."pass in on utun5 all\npass out on utun5 all\n")
         ->toBeAcceptedByPf();
 });
 

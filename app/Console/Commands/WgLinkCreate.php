@@ -10,6 +10,7 @@ class WgLinkCreate extends WgCommand
     protected $signature = 'wg:link:create
         {link : Interface name (max 15 chars)}
         {ip : VPN address in CIDR notation (e.g. 10.0.0.1/24)}
+        {--address6= : IPv6 address and prefix too (e.g. fd12:3456:789a::1/64), or "auto" for a random private /64}
         {--port= : Listen port (random if omitted)}
         {--ifout= : Outbound network interface for NAT (auto-detected if omitted)}
         {--dns= : DNS server for peers (default: WIREGUARD_DNS)}
@@ -35,7 +36,7 @@ class WgLinkCreate extends WgCommand
         $up = $this->option('up') === null || filter_var($this->option('up'), FILTER_VALIDATE_BOOLEAN);
 
         try {
-            $link = $wg->createLink($name, $ip, $port, $ifout, $dns, $keepalive, $allowed_ips, $forward, $nat, $up);
+            $link = $wg->createLink($name, $ip, $port, $ifout, $dns, $keepalive, $allowed_ips, $forward, $nat, $up, $this->option('address6'));
         } catch (\Throwable $e) {
             $this->error($e->getMessage());
 
@@ -46,6 +47,9 @@ class WgLinkCreate extends WgCommand
         $this->line("Public Key: {$link->public_key}");
         $this->line("Listen Port: {$link->listen_port}");
         $this->line("Address: {$link->address}");
+        if ($link->address6 !== null) {
+            $this->line("IPv6 Address: {$link->address6}");
+        }
 
         return Command::SUCCESS;
     }

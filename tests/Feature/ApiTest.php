@@ -3,6 +3,7 @@
 use App\Services\KeyManager;
 use App\Services\Server;
 use App\Services\Shell;
+use Illuminate\Support\Env;
 use Tests\Fakes\FakeHost;
 use Tests\Fakes\FakeShell;
 
@@ -71,6 +72,12 @@ it('reports the code it booted with in /status', function () {
         ->assertJsonPath('app.code', Server::codeFingerprint(base_path()));
 });
 
+it('keeps .env values out of the process environment, so a reload picks up changes', function () {
+    // FrankenPHP keeps the process environment across worker restarts (systemctl reload wgla),
+    // and dotenv never overwrites a variable that is already set
+    expect((new ReflectionProperty(Env::class, 'putenv'))->getValue())->toBeFalse();
+});
+
 it('shows only health publicly, and status and IP behind the API key', function () {
     $this->getJson('/health')->assertOk()->assertExactJson(['status' => 'ok']);
 
@@ -96,6 +103,27 @@ it('locks the API instead of opening it when no API key is set', function () {
     $this->getJson('/links')->assertForbidden();
     $this->getJson('/links', ['api-key' => ''])->assertForbidden();
     $this->getJson('/health')->assertOk(); // public routes still work
+});
+it('adds, shows and removes a link\'s IPv6 address', function () {
+    $this->postJson('/link', ['name' => 'wg0', 'ip' => '10.0.0.1/24', 'port' => 51820, 'address6' => 'fd12::1/64'], $this->auth)
+        ->assertCreated()
+        ->assertJsonPath('address6', 'fd12::1/64');
+    $this->postJson('/link/wg0/peers', [], $this->auth)
+        ->assertJsonPath('allowed_ips', '10.0.0.2/32, fd12::2/128');
+
+    // Leaving it out keeps it; null removes it
+    $this->patchJson('/link/wg0', ['dns' => '1.1.1.1'], $this->auth)->assertOk()->assertJsonPath('address6', 'fd12::1/64');
+    $this->patchJson('/link/wg0', ['address6' => null], $this->auth)
+        ->assertOk()
+        ->assertJsonPath('address6', null)
+        ->assertJsonPath('peers.0.allowed_ips', '10.0.0.2/32');
+
+    $this->patchJson('/link/wg0', ['address6' => 'auto'], $this->auth)
+        ->assertOk()
+        ->assertJsonPath('address6', fn (string $address6) => str_starts_with($address6, 'fd') && str_ends_with($address6, '::1/64'));
+    $this->patchJson('/link/wg0', ['address6' => 'fe80::1/64'], $this->auth)->assertUnprocessable();
+
+    $this->deleteJson('/link/wg0', [], $this->auth)->assertOk();
 });
 
 it('maps errors to status codes with a message', function () {

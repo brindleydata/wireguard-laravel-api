@@ -15,7 +15,7 @@ set -euo pipefail
 umask 077
 IFS=$' \t\n'
 
-VERSION=2
+VERSION=3
 SELF=$0
 MAX_SIZE=1048576
 
@@ -57,6 +57,7 @@ re_ifname='^[A-Za-z0-9_.-]{1,15}$'
 re_key='^[A-Za-z0-9+/]{42}[AEIMQUYcgkosw048]=$'
 re_safe_key='^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$'
 re_cidr4='^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})/([0-9]{1,2})$'
+re_cidr6='^[0-9a-fA-F:]{2,39}/([0-9]{1,3})$'
 re_ips='^[0-9A-Fa-f.:/]+(, ?[0-9A-Fa-f.:/]+)*$'
 re_dns='^[A-Za-z0-9.:-]+(, ?[A-Za-z0-9.:-]+)*$'
 re_number='^[0-9]{1,5}$'
@@ -65,6 +66,22 @@ valid_cidr4() {
     [[ $1 =~ $re_cidr4 ]] || return 1
     [ "${BASH_REMATCH[1]}" -le 255 ] && [ "${BASH_REMATCH[2]}" -le 255 ] &&
         [ "${BASH_REMATCH[3]}" -le 255 ] && [ "${BASH_REMATCH[4]}" -le 255 ] && [ "${BASH_REMATCH[5]}" -le 32 ]
+}
+# IPv6 address with prefix: hex and colons only (nft and pf mask host bits themselves), one ::
+valid_cidr6() {
+    [[ $1 =~ $re_cidr6 ]] && [ "${BASH_REMATCH[1]}" -le 128 ] || return 1
+    case "$1" in *:::* | *::*::*) return 1 ;; esac
+}
+# A link's Address line: IPv4, or IPv4 then IPv6
+valid_link_address() {
+    local re='^([^,]+), ([^,]+)$' v4 v6
+    if [[ $1 =~ $re ]]; then
+        # Copied first: each check runs its own regex, which replaces BASH_REMATCH
+        v4=${BASH_REMATCH[1]} v6=${BASH_REMATCH[2]}
+        valid_cidr4 "$v4" && valid_cidr6 "$v6"
+    else
+        valid_cidr4 "$1"
+    fi
 }
 valid_port() { [[ $1 =~ $re_number ]] && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]; }
 valid_keepalive() { [[ $1 =~ $re_number ]] && [ "$1" -le 65535 ]; }
@@ -95,11 +112,12 @@ read_input() {
 }
 
 validate_meta() {
-    local line=$1 re='^# ([a-z_]+) = (.+)$' key value
+    local line=$1 re='^# ([a-z][a-z0-9_]*) = (.+)$' key value
     [[ $line =~ $re ]] || die "malformed metadata comment: $line"
     key=${BASH_REMATCH[1]} value=${BASH_REMATCH[2]}
     case "$key" in
         address) valid_cidr4 "$value" ;;
+        address6) valid_cidr6 "$value" ;;
         ifout) [[ $value =~ $re_ifname ]] ;;
         forward | nat | up) valid_bool "$value" ;;
         dns) [[ $value =~ $re_dns ]] ;;
@@ -135,7 +153,7 @@ validate_conf() {
         [[ $line =~ $re ]] || die "malformed line: $line"
         key=${BASH_REMATCH[1]} value=${BASH_REMATCH[2]}
         case "$section:$key" in
-            interface:Address) valid_cidr4 "$value" ;;
+            interface:Address) valid_link_address "$value" ;;
             interface:PrivateKey) [[ $value =~ $re_key ]] ;;
             interface:ListenPort) valid_port "$value" ;;
             interface:PostUp) [ "$value" = "$(hook up)" ] || die "PostUp must be exactly: $(hook up)" ;;
@@ -207,38 +225,48 @@ firewall_state() {
     conf=$(conf_file "$1")
     [ -f "$conf" ] || die "no config for link $1"
     FORWARD=$(meta "$conf" forward) NAT=$(meta "$conf" nat) IFOUT=$(meta "$conf" ifout) ADDRESS=$(meta "$conf" address)
+    ADDRESS6=$(meta "$conf" address6)
     if ! valid_bool "${FORWARD:-false}" || ! valid_bool "${NAT:-false}"; then die "invalid forward/nat in $conf"; fi
     if [ "${NAT:-false}" = true ]; then
         [[ $IFOUT =~ $re_ifname ]] || die "invalid ifout in $conf"
         NETWORK=$(network_of "$ADDRESS")
+        if [ -n "$ADDRESS6" ]; then valid_cidr6 "$ADDRESS6" || die "invalid address6 in $conf"; fi
     fi
 }
 
 # Firewalls driven by iptables (Docker, ufw) drop forwarded traffic in their own FORWARD
-# chain, which an accept in our nftables table can't override. Add tagged accepts there too.
+# chain, which an accept in our nftables table can't override. Add tagged accepts there too,
+# for IPv4 (iptables) and IPv6 (ip6tables).
 iptables_forward() {
-    local link=$1 iface=$2 enable=$3 listing rule
-    command -v iptables > /dev/null 2>&1 || return 0
-    listing=$(iptables -S FORWARD 2> /dev/null) || return 0
+    local tool
+    for tool in iptables ip6tables; do
+        xtables_forward "$tool" "$@"
+    done
+}
+
+xtables_forward() {
+    local iptables=$1 link=$2 iface=$3 enable=$4 listing rule
+    command -v "$iptables" > /dev/null 2>&1 || return 0
+    listing=$("$iptables" -S FORWARD 2> /dev/null) || return 0
 
     # Remove our previous rules. They're rebuilt from their parts rather than re-using the listed
     # line: iptables -S quotes the comment ("wgla:wg0"), and listing text is never evaluated.
     local ours="^-A FORWARD -([io]) ([^ ]+) -m comment --comment \"?wgla:$link\"? -j ACCEPT\$"
     while IFS= read -r rule; do
         if [[ $rule =~ $ours ]]; then
-            iptables -D FORWARD "-${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" -m comment --comment "wgla:$link" -j ACCEPT
+            "$iptables" -D FORWARD "-${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" -m comment --comment "wgla:$link" -j ACCEPT
         fi
     done <<< "$listing"
 
     [ "$enable" = true ] || return 0
-    # Nothing in iptables drops forwarded traffic: leave it alone
-    [ "$(iptables -S FORWARD)" != '-P FORWARD ACCEPT' ] || return 0
-    iptables -I FORWARD 1 -o "$iface" -m comment --comment "wgla:$link" -j ACCEPT
-    iptables -I FORWARD 1 -i "$iface" -m comment --comment "wgla:$link" -j ACCEPT
+    # Nothing in this table drops forwarded traffic: leave it alone
+    [ "$("$iptables" -S FORWARD)" != '-P FORWARD ACCEPT' ] || return 0
+    "$iptables" -I FORWARD 1 -o "$iface" -m comment --comment "wgla:$link" -j ACCEPT
+    "$iptables" -I FORWARD 1 -i "$iface" -m comment --comment "wgla:$link" -j ACCEPT
 }
 
 firewall_up_linux() {
-    local link=$1 iface=$2 table="wg_$1"
+    local link=$1 iface=$2 table="wg_$1" nat6
     {
         # Creating then deleting makes the replace atomic and work whether or not it exists
         echo "table inet $table"
@@ -249,7 +277,9 @@ firewall_up_linux() {
                 echo "    chain forward { type filter hook forward priority 0; iifname \"$iface\" accept; oifname \"$iface\" accept; }"
             fi
             if [ "${NAT:-false}" = true ]; then
-                echo "    chain postrouting { type nat hook postrouting priority 100; ip saddr $NETWORK oifname \"$IFOUT\" masquerade; }"
+                nat6=''
+                if [ -n "$ADDRESS6" ]; then nat6=" ip6 saddr $ADDRESS6 oifname \"$IFOUT\" masquerade;"; fi
+                echo "    chain postrouting { type nat hook postrouting priority 100; ip saddr $NETWORK oifname \"$IFOUT\" masquerade;$nat6 }"
             fi
             echo "}"
         fi
@@ -267,6 +297,7 @@ firewall_up_darwin() {
     # pf rejects a ruleset whose translation (nat) rules come after filter (pass) rules
     if [ "${NAT:-false}" = true ]; then
         rules="nat on $IFOUT from $NETWORK to any -> ($IFOUT)"$'\n'
+        if [ -n "$ADDRESS6" ]; then rules="${rules}nat on $IFOUT inet6 from $ADDRESS6 to any -> ($IFOUT)"$'\n'; fi
     fi
     if [ "${FORWARD:-false}" = true ]; then
         rules="${rules}pass in on $iface all"$'\n'"pass out on $iface all"$'\n'
@@ -317,7 +348,8 @@ case "$command" in
         ;;
     peer-ips)
         args 3 $# "$command"; iface_arg "$1"; key_arg "$2"; ips_arg "$3"
-        wg set "$1" peer "$2" allowed-ips "$3"
+        # wg takes the list without spaces ("10.0.0.2/32,fd12::2/128")
+        wg set "$1" peer "$2" allowed-ips "${3// /}"
         ;;
 
     # Link configs

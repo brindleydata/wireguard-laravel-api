@@ -108,7 +108,7 @@ class Backup
     /**
      * What's in a backup, per link.
      *
-     * @return array<string, array{port: int, address: string, up: bool, peers: int, clients: int}>
+     * @return array<string, array{port: int, address: string, address6: ?string, up: bool, peers: int, clients: int}>
      */
     public function links(array $payload): array
     {
@@ -117,7 +117,8 @@ class Backup
             $parsed = $this->configBuilder->parseConfContent($link['conf']);
             $links[$name] = [
                 'port' => (int) ($parsed['interface']['ListenPort'] ?? 0),
-                'address' => $parsed['metadata']['address'] ?? $parsed['interface']['Address'] ?? '',
+                'address' => $parsed['metadata']['address'] ?? trim(explode(',', $parsed['interface']['Address'] ?? '')[0]),
+                'address6' => $parsed['metadata']['address6'] ?? null,
                 'up' => (bool) ($link['up'] ?? false),
                 'peers' => count($parsed['peers']),
                 'clients' => count($link['clients']),
@@ -137,7 +138,7 @@ class Backup
     {
         $link = $this->links($payload)[$name];
 
-        return $this->wg->findClashes($name, $link['port'], $link['address'], $ignore);
+        return $this->wg->findClashes($name, $link['port'], $link['address'], $ignore, $link['address6']);
     }
 
     /**

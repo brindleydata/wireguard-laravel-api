@@ -20,7 +20,7 @@ return [
         'client' => <<<'CONF'
 [Interface]
 PrivateKey = {privkey}
-Address = {ip}/32
+Address = {address}
 DNS = {dns}
 
 [Peer]

@@ -12,11 +12,14 @@ class ConfigBuilder
         protected OsDriver $os,
     ) {}
 
-    public function buildConfFile(string $address, string $privkey, int $port, string $ifout, array $peers = [], ?string $dns = null, ?int $keepalive = null, ?string $allowed_ips = null, bool $forward = false, bool $nat = false, bool $up = true): string
+    public function buildConfFile(string $address, string $privkey, int $port, string $ifout, array $peers = [], ?string $dns = null, ?int $keepalive = null, ?string $allowed_ips = null, bool $forward = false, bool $nat = false, bool $up = true, ?string $address6 = null): string
     {
         // Metadata comments (address and ifout always written)
         $lines = [];
         $lines[] = "# address = {$address}";
+        if ($address6 !== null) {
+            $lines[] = "# address6 = {$address6}";
+        }
         $lines[] = "# ifout = {$ifout}";
         $lines[] = '# forward = '.($forward ? 'true' : 'false');
         $lines[] = '# nat = '.($nat ? 'true' : 'false');
@@ -32,7 +35,7 @@ class ConfigBuilder
         }
 
         // Interface section from OS driver
-        $lines[] = $this->os->interfaceSection($address, $privkey, $port, $ifout, $forward, $nat);
+        $lines[] = $this->os->interfaceSection($address6 === null ? $address : "{$address}, {$address6}", $privkey, $port, $ifout, $forward, $nat);
 
         // Peer sections
         foreach ($peers as $peer) {
@@ -52,15 +55,34 @@ class ConfigBuilder
      * Client config values a link hands out unless a peer overrides them: the link's own metadata
      * (dns, keepalive, allowed_ips), falling back to the global WIREGUARD_* defaults.
      *
+     * A dual-stack link sends all IPv6 traffic through the tunnel too: when the global default
+     * routes all IPv4 (0.0.0.0/0) and names no IPv6, ::/0 is added.
+     *
      * @return array{dns: string, keepalive: string, allowed_ips: string}
      */
     public function clientDefaults(array $metadata): array
     {
+        $allowed_ips = (string) ($metadata['allowed_ips'] ?? $this->config['allowed_ips'] ?? '0.0.0.0/0');
+        if (! isset($metadata['allowed_ips']) && isset($metadata['address6'])
+            && in_array('0.0.0.0/0', array_map('trim', explode(',', $allowed_ips)), true) && ! str_contains($allowed_ips, ':')) {
+            $allowed_ips .= ', ::/0';
+        }
+
         return [
             'dns' => (string) ($metadata['dns'] ?? $this->config['default_dns'] ?? '8.8.8.8'),
             'keepalive' => (string) ($metadata['keepalive'] ?? $this->config['default_keepalive'] ?? 25),
-            'allowed_ips' => (string) ($metadata['allowed_ips'] ?? $this->config['allowed_ips'] ?? '0.0.0.0/0'),
+            'allowed_ips' => $allowed_ips,
         ];
+    }
+
+    /**
+     * The client's Address line: its IPv4 /32, plus the mirrored IPv6 /128 on a dual-stack link.
+     */
+    public function clientAddress(InterfaceInfo $link, string $ip): string
+    {
+        return $link->address6 === null
+            ? "{$ip}/32"
+            : "{$ip}/32, ".IpAllocator::mirror($ip, $link->address, $link->address6).'/128';
     }
 
     public function buildClientConfig(InterfaceInfo $link, string $privkey, string $ip, string $pubkey, string $psk, ?string $dns_override = null, ?string $allowed_ips_override = null, ?array $metadata = null, ?string $keepalive_override = null): string
@@ -80,13 +102,18 @@ class ConfigBuilder
                 $endpoint_host = $this->os->publicIpv4($ip_service) ?? $hostname;
             }
         }
-        $endpoint = "{$endpoint_host}:{$link->listen_port}";
+        // An IPv6 literal needs brackets before the port
+        $endpoint = filter_var($endpoint_host, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6)
+            ? "[{$endpoint_host}]:{$link->listen_port}"
+            : "{$endpoint_host}:{$link->listen_port}";
+        $address = $this->clientAddress($link, $ip);
 
         $template = $this->config['templates']['client'] ?? null;
         if ($template !== null) {
+            // {address}: the Address value (both families); {ip}: the bare IPv4 tunnel address
             return str_replace(
-                ['{privkey}', '{pubkey}', '{psk}', '{subnets}', '{keepalive}', '{dns}', '{endpoint}', '{ip}'],
-                [$privkey, $link->public_key, $psk, $allowed_ips, $keepalive, $dns, $endpoint, $ip],
+                ['{privkey}', '{pubkey}', '{psk}', '{subnets}', '{keepalive}', '{dns}', '{endpoint}', '{address}', '{ip}'],
+                [$privkey, $link->public_key, $psk, $allowed_ips, $keepalive, $dns, $endpoint, $address, $ip],
                 $template,
             );
         }
@@ -94,7 +121,7 @@ class ConfigBuilder
         return implode("\n", [
             '[Interface]',
             "PrivateKey = {$privkey}",
-            "Address = {$ip}/32",
+            "Address = {$address}",
             "DNS = {$dns}",
             '',
             '[Peer]',
@@ -201,7 +228,8 @@ class ConfigBuilder
                     $result[$key] = $value;
                 }
                 if ($section === 'interface' && $key === 'Address') {
-                    $result['Address'] = explode('/', $value, 2)[0];
+                    // The IPv4 tunnel address; the IPv6 one is derived from it
+                    $result['Address'] = IpAllocator::tunnelIp($value) ?? explode('/', $value, 2)[0];
                 }
                 if ($section === 'peer' && in_array($key, ['PresharedKey', 'AllowedIPs', 'PersistentKeepalive'], true)) {
                     $result[$key] = $value;

@@ -54,3 +54,27 @@ it('bounds keepalive and outbound interface names', function () {
         ->and(fn () => $validator->validateOutboundInterface('eth0 eth1'))->toThrow(InvalidArgumentException::class)
         ->and(fn () => $validator->validateOutboundInterface('a$(id)'))->toThrow(InvalidArgumentException::class);
 });
+
+it('takes a link IPv6 address in canonical form', function (string $given, string $address, string $canonical) {
+    expect((new WireGuardValidator)->address6($given, $address))->toBe($canonical);
+})->with([
+    'unique local' => ['fd12:3456:789a::1/64', '10.0.0.1/24', 'fd12:3456:789a::1/64'],
+    'upper case, zeros written out' => ['FD12:3456:789A:0000::0001/64', '10.0.0.1/24', 'fd12:3456:789a::1/64'],
+    'global unicast' => ['2001:db8:1::1/64', '10.0.0.1/24', '2001:db8:1::1/64'],
+    'a small prefix that still fits' => ['fd12::1/120', '10.0.0.1/24', 'fd12::1/120'],
+]);
+
+it('rejects IPv6 addresses a link cannot use', function (string $cidr, string $error) {
+    expect(fn () => (new WireGuardValidator)->address6($cidr, '10.0.0.1/16'))->toThrow(InvalidArgumentException::class, $error);
+})->with([
+    'no prefix' => ['fd12::1', 'Invalid IPv6 address'],
+    'IPv4' => ['10.0.0.1/24', 'Invalid IPv6 address'],
+    'IPv4-mapped' => ['::ffff:10.0.0.1/96', 'Invalid IPv6 address'],
+    'link-local' => ['fe80::1/64', 'neither a unique local'],
+    'loopback' => ['::1/64', 'neither a unique local'],
+    'multicast' => ['ff02::1/64', 'neither a unique local'],
+    'the prefix itself' => ['fd12::/64', 'is the prefix itself'],
+    'a /127' => ['fd12::1/127', 'prefix length'],
+    'too small for the IPv4 subnet' => ['fd12::1/120', 'too small for 10.0.0.1/16'],
+    'a line break' => ["fd12::1/64\nPostUp = id", 'Invalid IPv6 address'],
+]);

@@ -27,7 +27,7 @@ case "$(env_get WGLA_SERVER_TLS)" in
 esac
 
 ART=(sudo -u "$WEB" php "$APP/artisan")
-PASS=0; FAIL=0
+PASS=0; FAIL=0; SKIP=0
 # Run an artisan command as the web user; when it fails, show why on stderr (its output is often discarded)
 cli() {
     local out status
@@ -47,16 +47,18 @@ as_web() { sudo -u "$WEB" "$@"; }
 api() { curl -s "${CURL_OPTS[@]}" -o /tmp/wgla-e2e-body -w '%{http_code}' -H "api-key: $API_KEY" -H 'Content-Type: application/json' "$@"; }
 
 FORWARD_POLICY=$(iptables -S FORWARD 2>/dev/null | sed -n 's/^-P FORWARD //p')
+FORWARD6_POLICY=$(ip6tables -S FORWARD 2>/dev/null | sed -n 's/^-P FORWARD //p')
 cleanup() {
     for link in e2e0 e2e1 e2e2; do "${ART[@]}" wg:link:delete "$link" > /dev/null 2>&1; done
     ip netns del e2e-client 2>/dev/null; ip netns del e2e-far 2>/dev/null
     ip link del e2e-h 2>/dev/null; ip link del e2e-fh 2>/dev/null
     [ -n "$FORWARD_POLICY" ] && iptables -P FORWARD "$FORWARD_POLICY"
+    [ -n "$FORWARD6_POLICY" ] && ip6tables -P FORWARD "$FORWARD6_POLICY"
     rm -f /tmp/wgla-e2e-*
 }
 trap cleanup EXIT
 cleanup
-iptables -P FORWARD ACCEPT 2>/dev/null
+iptables -P FORWARD ACCEPT 2>/dev/null; ip6tables -P FORWARD ACCEPT 2>/dev/null
 
 step "What $WEB can and can't do as root"
 check "only the helper is allowed" "! as_web sudo -n cat /etc/shadow"
@@ -70,24 +72,27 @@ check "the API reports the helper ok" "[ \"\$(api $URL/status)\" = 200 ] && grep
 check "/health is public and ok" "[ \"\$(curl -s ${CURL_OPTS[*]} -o /dev/null -w '%{http_code}' $URL/health)\" = 200 ]"
 check "/status needs the API key" "[ \"\$(curl -s ${CURL_OPTS[*]} -o /dev/null -w '%{http_code}' $URL/status)\" = 403 ]"
 
-step "A link with forward + NAT, out to a third network"
+step "A dual-stack link with forward + NAT, out to a third network"
 ip netns add e2e-far
 ip link add e2e-fh type veth peer name e2e-fn
 ip link set e2e-fn netns e2e-far
-ip addr add 10.98.0.1/24 dev e2e-fh; ip link set e2e-fh up
-ip netns exec e2e-far sh -c 'ip addr add 10.98.0.2/24 dev e2e-fn; ip link set e2e-fn up; ip link set lo up'
-cli wg:link:create e2e0 10.80.0.1/24 --port=51880 --forward=true --nat=true --ifout=e2e-fh > /dev/null
+ip addr add 10.98.0.1/24 dev e2e-fh; ip -6 addr add fd98::1/64 dev e2e-fh nodad; ip link set e2e-fh up
+ip netns exec e2e-far sh -c 'ip addr add 10.98.0.2/24 dev e2e-fn; ip -6 addr add fd98::2/64 dev e2e-fn nodad; ip link set e2e-fn up; ip link set lo up'
+cli wg:link:create e2e0 10.80.0.1/24 --address6=fd80::1/64 --port=51880 --forward=true --nat=true --ifout=e2e-fh > /dev/null
 check "running as a systemd unit" "wg show interfaces | grep -qw e2e0 && systemctl is-active -q wg-quick@e2e0"
 check "config is 0600 root" "[ \"\$(stat -c %a:%U /etc/wireguard/e2e0.conf)\" = 600:root ]"
 check "hooks call the helper" "grep -qx 'PostUp = $HELPER firewall-up %i %i' /etc/wireguard/e2e0.conf"
 check "nftables: forward rules" "nft list table inet wg_e2e0 | grep -q 'iifname \"e2e0\" accept'"
 check "nftables: NAT only for the VPN subnet" "nft list table inet wg_e2e0 | grep -q 'ip saddr 10.80.0.0/24 oifname \"e2e-fh\" masquerade'"
+check "nftables: NAT66 only for the VPN prefix" "nft list table inet wg_e2e0 | grep -q 'ip6 saddr fd80::/64 oifname \"e2e-fh\" masquerade'"
+check "IPv6 forwarding is on (wg:install)" "[ \"\$(sysctl -n net.ipv6.conf.all.forwarding)\" = 1 ]"
 
 step "A peer, and a real handshake from a client namespace"
 PEER=$(cli wg:peer:create e2e0 | peer_key)
 CLIENT=/etc/wireguard/clients/e2e0/$(safe "$PEER").conf
 check "peer live and saved" "wg show e2e0 allowed-ips | grep -q \"$PEER.*10.80.0.2/32\" && grep -q \"PublicKey = $PEER\" /etc/wireguard/e2e0.conf"
 check "client config is 0600" "[ \"\$(stat -c %a \"$CLIENT\")\" = 600 ]"
+check "the peer's IPv6 address mirrors its IPv4 one" "wg show e2e0 allowed-ips | grep -q \"$PEER.*10.80.0.2/32 fd80::2/128\" && grep -qx 'Address = 10.80.0.2/32, fd80::2/128' \"$CLIENT\""
 ip netns add e2e-client
 ip link add e2e-h type veth peer name e2e-c
 ip link set e2e-c netns e2e-client
@@ -98,27 +103,37 @@ ip netns exec e2e-client ip link add e2ec0 type wireguard
 # profiles only let wg and wg-quick open files under /etc/wireguard, so no `wg-quick strip` of a copy
 grep -vE '^(Address|DNS) =' "$CLIENT" | sed 's/^Endpoint = .*/Endpoint = 10.99.0.1:51880/' \
     | ip netns exec e2e-client wg setconf e2ec0 /dev/stdin
-ip netns exec e2e-client sh -c 'ip addr add 10.80.0.2/32 dev e2ec0; ip link set e2ec0 up; ip route add 10.80.0.0/24 dev e2ec0; ip route add 10.98.0.0/24 dev e2ec0'
+ip netns exec e2e-client sh -c 'ip addr add 10.80.0.2/32 dev e2ec0; ip -6 addr add fd80::2/128 dev e2ec0 nodad; ip link set e2ec0 up
+    ip route add 10.80.0.0/24 dev e2ec0; ip route add 10.98.0.0/24 dev e2ec0; ip -6 route add fd80::/64 dev e2ec0; ip -6 route add fd98::/64 dev e2ec0'
 check "the client reaches the server through the tunnel" "ip netns exec e2e-client ping -c1 -W3 10.80.0.1"
 check "and the far network (forward + NAT)" "ip netns exec e2e-client ping -c1 -W3 10.98.0.2"
+check "over IPv6 too" "ip netns exec e2e-client ping -6 -c1 -W3 fd80::1"
+check "and the far network over IPv6 (forward + NAT66)" "ip netns exec e2e-client ping -6 -c1 -W3 fd98::2"
 check "the API shows the peer connected, from its endpoint, with traffic" "[ \"\$(api $URL/link/e2e0/peers)\" = 200 ] && grep -q '\"connected\":true' /tmp/wgla-e2e-body && grep -q '\"endpoint\":\"10.99.0.2:' /tmp/wgla-e2e-body && grep -q '\"transfer_rx\":[1-9]' /tmp/wgla-e2e-body"
 
 step "A FORWARD DROP policy like Docker or ufw set"
-iptables -P FORWARD DROP
-cli wg:link:update e2e0 --forward=false > /dev/null
-cli wg:link:update e2e0 --forward=true > /dev/null
-check "the helper added two tagged iptables accepts" "[ \"\$(iptables -S FORWARD | grep -c wgla:e2e0)\" = 2 ]"
-check "forwarding works through the DROP policy" "ip netns exec e2e-client ping -c1 -W3 10.98.0.2"
-systemctl restart wg-quick@e2e0
-check "a restart (PostUp) restores them without duplicates" "[ \"\$(iptables -S FORWARD | grep -c wgla:e2e0)\" = 2 ]"
-check "the client reconnects to the restarted server" "for i in \$(seq 25); do ip netns exec e2e-client ping -c1 -W1 10.98.0.2 && break; done"
-cli wg:link:update e2e0 --forward=false > /dev/null
-check "turning forward off removes them" "! iptables -S FORWARD | grep -q wgla:e2e0"
-iptables -P FORWARD ACCEPT
+# Docker and ufw bring iptables; a host without it has nothing that drops forwarded traffic
+if command -v iptables > /dev/null; then
+    iptables -P FORWARD DROP; ip6tables -P FORWARD DROP
+    cli wg:link:update e2e0 --forward=false > /dev/null
+    cli wg:link:update e2e0 --forward=true > /dev/null
+    check "the helper added two tagged accepts to iptables and ip6tables" "[ \"\$(iptables -S FORWARD | grep -c wgla:e2e0)\" = 2 ] && [ \"\$(ip6tables -S FORWARD | grep -c wgla:e2e0)\" = 2 ]"
+    check "forwarding works through the DROP policy" "ip netns exec e2e-client ping -c1 -W3 10.98.0.2"
+    check "... over IPv6 too" "ip netns exec e2e-client ping -6 -c1 -W3 fd98::2"
+    systemctl restart wg-quick@e2e0
+    check "a restart (PostUp) restores them without duplicates" "[ \"\$(iptables -S FORWARD | grep -c wgla:e2e0)\" = 2 ] && [ \"\$(ip6tables -S FORWARD | grep -c wgla:e2e0)\" = 2 ]"
+    check "the client reconnects to the restarted server" "for i in \$(seq 25); do ip netns exec e2e-client ping -c1 -W1 10.98.0.2 && break; done"
+    cli wg:link:update e2e0 --forward=false > /dev/null
+    check "turning forward off removes them" "! iptables -S FORWARD | grep -q wgla:e2e0 && ! ip6tables -S FORWARD | grep -q wgla:e2e0"
+    iptables -P FORWARD ACCEPT; ip6tables -P FORWARD ACCEPT
+else
+    echo "  skip no iptables on this host"; SKIP=$((SKIP + 6))
+fi
 
 step "Clashes"
 check "the same port is refused" "! \"\${ART[@]}\" wg:link:create e2e1 10.81.0.1/24 --port=51880"
 check "an overlapping subnet is refused" "! \"\${ART[@]}\" wg:link:create e2e1 10.80.0.129/25 --port=51881"
+check "an overlapping IPv6 prefix is refused" "! \"\${ART[@]}\" wg:link:create e2e1 10.81.0.1/24 --port=51881 --address6=fd80::abcd/64"
 check "nothing was written" "[ ! -e /etc/wireguard/e2e1.conf ]"
 
 step "Peers on a stopped link"
@@ -149,13 +164,14 @@ check "the link is gone" "! wg show interfaces | grep -qw e2e0 && [ ! -e /etc/wi
 check "restore it" "\"\${ART[@]}\" wg:restore - --passphrase-file=/tmp/wgla-e2e-pass --existing=skip --yes --no-interaction < /tmp/wgla-e2e.backup"
 check "same keys, running again" "[ \"\$(wg show e2e0 public-key)\" = \"$KEY0\" ] && systemctl is-active -q wg-quick@e2e0"
 check "the client's existing config connects again" "for i in \$(seq 25); do ip netns exec e2e-client ping -c1 -W1 10.80.0.1 && break; done"
+check "... over IPv6 too" "ip netns exec e2e-client ping -6 -c1 -W3 fd80::1"
 
 step "Delete everything"
 cli wg:link:delete e2e0 > /dev/null
-check "no e2e links, configs, units or rules left" "! wg show interfaces | grep -q e2e && [ -z \"\$(find /etc/wireguard -name 'e2e*.conf')\" ] && ! nft list tables | grep -q wg_e2e && ! iptables -S FORWARD | grep -q wgla:e2e"
+check "no e2e links, configs, units or rules left" "! wg show interfaces | grep -q e2e && [ -z \"\$(find /etc/wireguard -name 'e2e*.conf')\" ] && ! nft list tables | grep -q wg_e2e && ! iptables -S FORWARD | grep -q wgla:e2e && ! ip6tables -S FORWARD | grep -q wgla:e2e"
 
 echo
-echo "RESULT: $PASS passed, $FAIL failed"
+echo "RESULT: $PASS passed, $FAIL failed, $SKIP skipped"
 if [ "$FAIL" -ne 0 ]; then
     echo; echo "=== wg-quick journal (failed run)"
     journalctl -u 'wg-quick@e2e*' -n 60 --no-pager -o cat 2>&1 | sed 's/^/  | /'

@@ -28,7 +28,7 @@ class FakeHost
     /** @var array<string, array{link: ?string, private_key: string, port: int, address: string, peers: array<string, array{psk: ?string, allowed_ips: string}>}> */
     public array $interfaces = [];
 
-    /** @var array<string, array{forward: bool, nat: bool}> live firewall state per link */
+    /** @var array<string, array{forward: bool, nat: bool, nat6?: string}> live firewall state per link (nat6: the masqueraded IPv6 prefix) */
     public array $firewall = [];
 
     /** @var list<string> */
@@ -143,7 +143,8 @@ class FakeHost
         });
         $helper('peer-ips :iface :pubkey :ips', function (array $b) {
             $this->requireInterface($b['iface']);
-            $this->interfaces[$b['iface']]['peers'][$b['pubkey']]['allowed_ips'] = $b['ips'];
+            // The helper hands wg the list without spaces
+            $this->interfaces[$b['iface']]['peers'][$b['pubkey']]['allowed_ips'] = str_replace(' ', '', $b['ips']);
 
             return '';
         });
@@ -219,7 +220,9 @@ class FakeHost
         $lines = ["{$interface['private_key']}\t{$public_key}\t{$interface['port']}\toff"];
         foreach ($interface['peers'] as $pubkey => $peer) {
             $stats = $peer['stats'] ?? ['endpoint' => '(none)', 'handshake' => 0, 'rx' => 0, 'tx' => 0];
-            $lines[] = implode("\t", [$pubkey, $peer['psk'] ?? '(none)', $stats['endpoint'], $peer['allowed_ips'], $stats['handshake'], $stats['rx'], $stats['tx'], 'off']);
+            // As wg prints them: comma-separated, no spaces
+            $allowed_ips = str_replace(' ', '', $peer['allowed_ips']);
+            $lines[] = implode("\t", [$pubkey, $peer['psk'] ?? '(none)', $stats['endpoint'], $allowed_ips, $stats['handshake'], $stats['rx'], $stats['tx'], 'off']);
         }
 
         return implode("\n", $lines);
@@ -234,6 +237,9 @@ class FakeHost
     {
         $meta = $this->parse($this->conf($link) ?? $this->fail("no config for link {$link}"))['meta'];
         $state = ['forward' => ($meta['forward'] ?? 'false') === 'true', 'nat' => ($meta['nat'] ?? 'false') === 'true'];
+        if ($state['nat'] && isset($meta['address6'])) {
+            $state['nat6'] = $meta['address6'];
+        }
 
         if ($state['forward'] || $state['nat']) {
             $this->firewall[$link] = $state;
@@ -344,9 +350,13 @@ class FakeHost
         $this->shell
             ->on('ip address show dev :ifname', function (array $b) {
                 $interface = $this->requireInterface($b['ifname']);
+                $lines = ["7: {$b['ifname']}: <POINTOPOINT,NOARP,UP,LOWER_UP> mtu 1420", '    link/none'];
+                foreach (array_map('trim', explode(',', $interface['address'])) as $address) {
+                    $family = str_contains($address, ':') ? 'inet6' : 'inet';
+                    $lines[] = "    {$family} {$address} scope global {$b['ifname']}";
+                }
 
-                return "7: {$b['ifname']}: <POINTOPOINT,NOARP,UP,LOWER_UP> mtu 1420\n"
-                    ."    link/none\n    inet {$interface['address']} scope global {$b['ifname']}";
+                return implode("\n", $lines);
             })
             ->on('ip link show', function () {
                 $lines = ['1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536', '2: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500'];
@@ -364,11 +374,17 @@ class FakeHost
     {
         $this->shell
             ->on('ifconfig :ifname', function (array $b) {
-                [$ip, $mask] = explode('/', $this->requireInterface($b['ifname'])['address']);
+                $addresses = array_map('trim', explode(',', $this->requireInterface($b['ifname'])['address']));
+                [$ip, $mask] = explode('/', $addresses[0]);
                 $hex = sprintf('0x%08x', (0xFFFFFFFF << (32 - (int) $mask)) & 0xFFFFFFFF);
-
-                return "{$b['ifname']}: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1420\n"
+                $output = "{$b['ifname']}: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1420\n"
                     ."\tinet {$ip} --> {$ip} netmask {$hex}";
+                if (isset($addresses[1])) {
+                    [$ip6, $prefix] = explode('/', $addresses[1]);
+                    $output .= "\n\tinet6 {$ip6} prefixlen {$prefix}";
+                }
+
+                return $output;
             })
             ->on('ifconfig -l', fn () => implode(' ', ['lo0', 'en0', ...array_keys($this->interfaces)]))
             ->on('route -n get default 2>/dev/null', fn () => "   route to: default\ndestination: default\n  interface: en0");

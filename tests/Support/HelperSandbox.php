@@ -17,7 +17,7 @@ use Symfony\Component\Process\Process;
  */
 final class HelperSandbox
 {
-    private const STUBS = ['wg', 'wg-quick', 'nft', 'iptables', 'systemctl', 'pfctl'];
+    private const STUBS = ['wg', 'wg-quick', 'nft', 'iptables', 'ip6tables', 'systemctl', 'pfctl'];
 
     public readonly string $dir;
 
@@ -48,6 +48,8 @@ final class HelperSandbox
         foreach (self::STUBS as $stub) {
             $this->addStub($stub);
         }
+        // Like a host where nothing in ip6tables drops forwarded traffic (tests change it as needed)
+        $this->respond('ip6tables -S FORWARD', '-P FORWARD ACCEPT');
     }
 
     public static function isRoot(): bool

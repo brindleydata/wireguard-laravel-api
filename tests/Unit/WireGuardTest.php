@@ -249,6 +249,10 @@ it('rejects invalid settings before running anything', function (array $settings
     'malformed allowed_ips' => [['allowed_ips' => '10.0.0.0/33']],
     'keepalive out of range' => [['keepalive' => 70000]],
     'ifout with shell syntax' => [['ifout' => 'eth0;id']],
+    'a link-local IPv6 address' => [['address6' => 'fe80::1/64']],
+    'an IPv6 prefix without an address' => [['address6' => 'fd12:3456:789a::/64']],
+    'an IPv6 address with a line break' => [['address6' => "fd12::1/64\nPostUp = id"]],
+    'an IPv6 prefix too small for the IPv4 subnet' => [['address6' => 'fd12::1/124']],
 ]);
 
 it('only accepts a free single host in the subnet as a peer address', function (string $os, string $ip) {
@@ -372,4 +376,113 @@ it('treats creating an existing link as a conflict', function () {
 
     expect(fn () => $rig->wg->createLink('wg0', '10.0.1.1/24', 51821))
         ->toThrow(ConflictException::class, 'Link already exists: wg0');
+});
+
+// ─── IPv6 ───────────────────────────────────────────────────────────
+
+it('gives peers of a dual-stack link their IPv4 host number in the IPv6 prefix', function (string $os) {
+    $rig = new Rig($os);
+
+    $link = $rig->wg->createLink('wg0', '10.0.0.1/24', 51820, nat: true, address6: 'FD12:3456:789A::1/64');
+
+    expect($link->address6)->toBe('fd12:3456:789a::1/64')
+        ->and($rig->host->conf('wg0'))->toContain("# address6 = fd12:3456:789a::1/64\n", "Address = 10.0.0.1/24, fd12:3456:789a::1/64\n")
+        ->and($rig->host->firewall['wg0'])->toBe(['forward' => false, 'nat' => true, 'nat6' => 'fd12:3456:789a::1/64']);
+
+    $peer = $rig->wg->addPeer('wg0');
+
+    expect($peer->allowed_ips)->toBe('10.0.0.2/32, fd12:3456:789a::2/128')
+        ->and($rig->host->confPeers('wg0'))->toBe([$peer->public_key => '10.0.0.2/32, fd12:3456:789a::2/128'])
+        ->and($rig->wg->getLink('wg0')->peers[0]->allowed_ips)->toBe('10.0.0.2/32, fd12:3456:789a::2/128')
+        ->and($peer->client_config)->toContain("Address = 10.0.0.2/32, fd12:3456:789a::2/128\n", "AllowedIPs = 0.0.0.0/0, ::/0\n");
+
+    $rig->wg->updatePeer('wg0', $peer->public_key, ['ip' => '10.0.0.9']);
+
+    expect($rig->host->runtimePeers('wg0'))->toBe([$peer->public_key => '10.0.0.9/32,fd12:3456:789a::9/128'])
+        ->and($rig->host->confPeers('wg0'))->toBe([$peer->public_key => '10.0.0.9/32, fd12:3456:789a::9/128'])
+        ->and($rig->wg->getPeerConfig('wg0', $peer->public_key))->toContain("Address = 10.0.0.9/32, fd12:3456:789a::9/128\n");
+})->with('os');
+
+it('adds and removes IPv6 on an existing link, moving its peers along', function (string $os, bool $up) {
+    $rig = new Rig($os);
+    $rig->wg->createLink('wg0', '10.0.0.1/24', 51820, nat: true, up: $up);
+    $plain = $rig->wg->addPeer('wg0');
+    $custom = $rig->wg->addPeer('wg0');
+    $rig->wg->updatePeer('wg0', $custom->public_key, ['allowed_ips' => '10.0.0.0/24']);
+
+    $link = $rig->wg->updateLink('wg0', ['address6' => 'fd12::1/64']);
+
+    expect($link->address6)->toBe('fd12::1/64')
+        ->and($link->up)->toBe($up)
+        ->and($rig->host->confPeers('wg0'))->toBe([
+            $plain->public_key => '10.0.0.2/32, fd12::2/128',
+            $custom->public_key => '10.0.0.3/32, fd12::3/128',
+        ])
+        ->and($rig->wg->getPeerConfig('wg0', $plain->public_key))->toContain("Address = 10.0.0.2/32, fd12::2/128\n", "AllowedIPs = 0.0.0.0/0, ::/0\n")
+        ->and($rig->wg->getPeerConfig('wg0', $custom->public_key))->toContain("Address = 10.0.0.3/32, fd12::3/128\n", "AllowedIPs = 10.0.0.0/24\n");
+    if ($up) {
+        expect($rig->host->runtimePeers('wg0'))->toBe([
+            $plain->public_key => '10.0.0.2/32, fd12::2/128',
+            $custom->public_key => '10.0.0.3/32, fd12::3/128',
+        ])->and($rig->host->firewall['wg0']['nat6'])->toBe('fd12::1/64');
+    }
+
+    $link = $rig->wg->updateLink('wg0', ['address6' => null]);
+
+    expect($link->address6)->toBeNull()
+        ->and($rig->host->conf('wg0'))->not->toContain('fd12')
+        ->and($rig->host->confPeers('wg0'))->toBe([$plain->public_key => '10.0.0.2/32', $custom->public_key => '10.0.0.3/32'])
+        ->and($rig->wg->getPeerConfig('wg0', $plain->public_key))->toContain("Address = 10.0.0.2/32\n", "AllowedIPs = 0.0.0.0/0\n")
+        ->and($rig->wg->getPeerConfig('wg0', $custom->public_key))->toContain("AllowedIPs = 10.0.0.0/24\n");
+    if ($up) {
+        expect($rig->host->firewall['wg0'])->not->toHaveKey('nat6');
+    }
+})->with('os')->with(['running' => true, 'stopped' => false]);
+
+it('moves peer IPv6 addresses with the IPv4 subnet', function () {
+    $rig = new Rig('linux');
+    $rig->wg->createLink('wg0', '10.0.1.1/24', 51820, address6: 'fd12::1/64');
+    $peer = $rig->wg->addPeer('wg0', '10.0.1.5');
+
+    // 10.0.1.5 is host 5 of 10.0.1.0/24 but host 261 of 10.0.0.0/23
+    $rig->wg->updateLink('wg0', ['address' => '10.0.0.1/23']);
+
+    expect($rig->host->confPeers('wg0'))->toBe([$peer->public_key => '10.0.1.5/32, fd12::105/128'])
+        ->and($rig->wg->getPeerConfig('wg0', $peer->public_key))->toContain('Address = 10.0.1.5/32, fd12::105/128');
+});
+
+it('picks a random private /64 for address6=auto', function () {
+    $rig = new Rig('linux');
+
+    $link = $rig->wg->createLink('wg0', '10.0.0.1/24', 51820, address6: 'auto');
+
+    expect($link->address6)->toMatch('/^fd[0-9a-f]{2}:[0-9a-f]{1,4}:[0-9a-f]{1,4}::1\/64$/')
+        ->and($rig->wg->createLink('wg1', '10.1.0.1/24', 51821, address6: 'auto')->address6)->not->toBe($link->address6);
+});
+
+it('keeps peers off the link\'s own IPv6 address', function () {
+    $rig = new Rig('linux');
+    $rig->wg->createLink('wg0', '10.0.0.1/24', 51820, address6: 'fd12::2/64');
+
+    expect($rig->wg->addPeer('wg0')->allowed_ips)->toBe('10.0.0.3/32, fd12::3/128', 'Host 2 is the link\'s')
+        ->and(fn () => $rig->wg->addPeer('wg0', '10.0.0.2'))->toThrow(InvalidArgumentException::class, "would get the link's own IPv6 address")
+        ->and(fn () => $rig->wg->updateLink('wg0', ['address6' => 'fd12::3/64']))->toThrow(InvalidArgumentException::class, "Peer 10.0.0.3 would get the link's IPv6 address");
+});
+
+it('refuses overlapping IPv6 prefixes and prefixes too small for the IPv4 subnet', function () {
+    $rig = new Rig('linux');
+    $rig->wg->createLink('wg0', '10.0.0.1/24', 51820, address6: 'fd12::1/64');
+
+    expect(fn () => $rig->wg->createLink('wg1', '10.1.0.1/24', 51821, address6: 'fd12::abcd/64'))->toThrow(ConflictException::class, 'Prefix fd12::abcd/64 overlaps link wg0')
+        ->and(fn () => $rig->wg->createLink('wg1', '10.1.0.1/24', 51821, address6: 'fd12::1/48'))->toThrow(ConflictException::class, 'overlaps link wg0')
+        ->and(fn () => $rig->wg->updateLink('wg0', ['address' => '10.0.0.1/8', 'address6' => 'fd13::1/120']))->toThrow(InvalidArgumentException::class, 'too small')
+        ->and(fn () => $rig->wg->updateLink('wg0', ['address' => '10.0.0.1/16']))->not->toThrow(Throwable::class)
+        ->and($rig->wg->createLink('wg1', '10.1.0.1/24', 51821, address6: 'fd13::1/64')->address6)->toBe('fd13::1/64');
+});
+
+it('brackets an IPv6 endpoint in client configs', function () {
+    $rig = new Rig('linux', '2001:db8::10');
+    $rig->wg->createLink('wg0', '10.0.0.1/24', 51820);
+
+    expect($rig->wg->addPeer('wg0')->client_config)->toContain("Endpoint = [2001:db8::10]:51820\n");
 });

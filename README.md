@@ -4,7 +4,7 @@ Stateless REST API and CLI for managing WireGuard VPN interfaces and peers. Buil
 
 ## Requirements
 
-- Linux with systemd (production; the installer automates Debian/Ubuntu via apt) or macOS with Homebrew (development)
+- Linux with systemd (production; the installer automates Debian/Ubuntu via apt, and CI installs and tests it on Ubuntu 24.04 and 26.04) or macOS with Homebrew (development)
 - PHP 8.5+ with the `sodium`, `mbstring` and `dom` extensions, Composer and git
 - `wireguard-tools`; on Linux `nftables` (`iptables` too if Docker or ufw manage the firewall); on macOS `wireguard-go`, Homebrew's bash and `pfctl`
 - IP forwarding enabled (if using forward/NAT features)
@@ -29,7 +29,7 @@ php artisan wg:install
 2. **Web server user:** default `www-data`. The API runs as this user, never as root.
 3. **File ownership:** the code stays owned by the deploy user and read-only for the web user, and only `storage/` is writable by it. A compromised web process can't change the code it runs.
 4. **`.env`:** generates `APP_KEY` and `API_KEY`, and sets the hostname clients connect to. `.env` is readable only by the web user's group.
-5. **IP forwarding.**
+5. **IP forwarding:** IPv4, and IPv6 where the kernel has it. If the kernel itself learns the server's IPv6 route from router advertisements (`accept_ra = 1`, e.g. Debian's ifupdown with SLAAC), IPv6 forwarding would make it ignore them, so that interface gets `accept_ra = 2`. systemd-networkd (netplan) and NetworkManager handle router advertisements themselves and aren't affected.
 6. **pf anchors** (macOS only).
 7. **The root helper** (see below).
 8. **The sudo rule:** one line, checked with `visudo` before it's installed.
@@ -81,7 +81,7 @@ Run it as the deploy user. It refuses to overwrite local changes to the code. Be
 1. checks out the release and runs `composer install --no-dev`;
 2. in a fresh process with the new code, reinstalls the helper if it changed, updates the sudo rule, the AppArmor rule and the service, reloads the API without dropping connections, and runs the health check.
 
-If you deploy code another way, such as a plain `git pull` or rsync, run `php artisan wg:install` afterwards. It notices that the API still runs the old code and reloads it. (The API reports the code it booted with, and the wizard compares that with what's on disk.)
+If you deploy code another way, such as a plain `git pull` or rsync, run `php artisan wg:install` afterwards. It notices that the API still runs the old code and reloads it. (The API reports the code it booted with, and the wizard compares that with what's on disk.) If you changed `API_KEY`, the running API rejects the new key, so the wizard restarts it instead.
 
 If any of that fails, it goes back to the previous version by itself. Updates are never unattended: an update installs code that runs as root. The release it ends up on is what `/status` reports as the version.
 
@@ -106,8 +106,8 @@ What a restore does:
 
 ## Firewall notes
 
-- **Rules per link.** `forward` and `nat` are per-link rules. Linux uses an nftables table `inet wg_<link>`, and NAT only masquerades the link's own subnet. macOS uses a pf anchor `wg/<link>`.
-- **Docker and ufw.** These drop forwarded traffic in iptables' `FORWARD` chain, which an nftables accept can't override. When that chain drops anything, the helper also adds two `ACCEPT` rules there, tagged `wgla:<link>`.
+- **Rules per link.** `forward` and `nat` are per-link rules, for both IPv4 and IPv6. Linux uses an nftables table `inet wg_<link>`, and NAT only masquerades the link's own subnet and IPv6 prefix. macOS uses a pf anchor `wg/<link>`.
+- **Docker and ufw.** These drop forwarded traffic in the `FORWARD` chain of iptables (and ip6tables), which an nftables accept can't override. When that chain drops anything, the helper also adds two `ACCEPT` rules there, tagged `wgla:<link>`.
 - **firewalld.** It isn't handled. Add the WireGuard interface to a zone that allows forwarding.
 
 ## Configuration
@@ -120,7 +120,7 @@ All settings are in `.env` — see `.env.example`. Key options:
 | `WIREGUARD_HOSTNAME` | Endpoint hostname for client configs (auto-detected if empty) |
 | `WIREGUARD_DNS` | Default DNS for client configs (default: `8.8.8.8`) |
 | `WIREGUARD_KEEPALIVE` | Default PersistentKeepalive seconds (default: `25`) |
-| `WIREGUARD_ALLOWED_IPS` | Default AllowedIPs for clients (default: `0.0.0.0/0`) |
+| `WIREGUARD_ALLOWED_IPS` | Default AllowedIPs for clients (default: `0.0.0.0/0`; dual-stack links add `::/0` when it routes all IPv4 and names no IPv6) |
 | `WIREGUARD_HELPER` | Installed path of the root helper (default: `/usr/local/sbin/wgla-helper`) |
 
 ## API
@@ -154,19 +154,33 @@ Peers of a running link include live stats from WireGuard. All of these are `nul
 | `connected` | Whether that handshake was within the last 3 minutes |
 | `transfer_rx`, `transfer_tx` | Bytes received from and sent to the peer since the link started |
 
+### IPv6
+
+A link always has an IPv4 subnet (`ip` when creating it, `address` when updating it). It can also get an IPv6 prefix, `address6`:
+
+- `"address6": "fd12:3456:789a::1/64"` gives the link that address. It must be a unique local (`fc00::/7`) or global unicast (`2000::/3`) address, and the prefix must hold every IPv4 host number (any `/64` does).
+- `"address6": "auto"` picks a random private /64 (RFC 4193). The link's address in it ends in its IPv4 host number, e.g. `::1` for `10.0.0.1/24`.
+- `"address6": null` in `PATCH /link/{name}` makes the link IPv4-only again. Leaving the field out keeps it.
+
+Peers don't get a separate IPv6 address. They get their IPv4 host number in the prefix: `10.0.0.5` in `10.0.0.0/24` becomes `fd12:3456:789a::5`, so a peer's `allowed_ips` is `10.0.0.5/32, fd12:3456:789a::5/128`, and its client config's `Address` has both. Moving a peer (`ip`) moves both, and changing the link's addresses moves every peer along. Peers never get the link's own IPv6 address. `forward` and `nat` cover IPv6 traffic too (NAT66 for the prefix), and clients of a dual-stack link route `::/0` through the tunnel by default.
+
+If `WIREGUARD_HOSTNAME` is an IPv6 address, client configs write it as `[address]:port`.
+
+### Peers
+
 Updating a peer (`PATCH /link/{link}/peer/{pubkey}`) accepts:
 
 | Field | Effect |
 |-------|--------|
-| `ip` | Moves the peer to another address in the link subnet: server-side AllowedIPs and the client config's `Address` |
+| `ip` | Moves the peer to another address in the link subnet: server-side AllowedIPs and the client config's `Address` (its IPv6 address moves along) |
 | `dns` | DNS in the peer's client config |
 | `allowed_ips` | AllowedIPs (routes) in the peer's client config. The server side is unchanged |
 
-When a link's `port`, `dns`, `keepalive` or `allowed_ips` change, the stored client configs of its peers are regenerated. Per-peer `dns`/`allowed_ips` overrides are kept.
+When a link's `port`, `address`, `address6`, `dns`, `keepalive` or `allowed_ips` change, the stored client configs of its peers are regenerated. Per-peer `dns`/`allowed_ips` overrides are kept.
 
 Link responses include the OS `interface` the link runs as (`utunN` on macOS), and never the server's private key.
 
-A link can't reuse another link's listen port or overlap its subnet, and can't be named after an existing network interface. Without `port`, a free random port is picked.
+A link can't reuse another link's listen port or overlap its subnet or IPv6 prefix, and can't be named after an existing network interface. Without `port`, a free random port is picked.
 
 Errors are JSON `{"error": "..."}`: `403` for a missing or wrong API key (also when `API_KEY` is unset), `404` for an unknown link or peer, `409` for a conflict (existing link, port, subnet or interface name), `422` for invalid input, and `500` when a system command fails (the message includes its error output).
 
@@ -179,8 +193,8 @@ php artisan wg:update            # Update to the latest release (as the deploy u
 php artisan wg:status            # System status
 php artisan wg:links             # List interfaces
 php artisan wg:link {name}       # Show interface details
-php artisan wg:link:create       # Create interface
-php artisan wg:link:update       # Update interface
+php artisan wg:link:create       # Create interface (--address6=fd12:3456:789a::1/64 or auto for IPv6 too)
+php artisan wg:link:update       # Update interface (--address6=none removes IPv6)
 php artisan wg:link:delete       # Delete interface
 php artisan wg:link:peers        # List peers
 php artisan wg:peer:create       # Create peer

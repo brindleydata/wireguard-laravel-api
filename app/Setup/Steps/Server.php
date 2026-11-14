@@ -88,8 +88,10 @@ class Server extends Step
             $problems[] = 'The wgla service is not installed, or its settings changed';
         } elseif (! $this->running()) {
             $problems[] = 'The wgla service is not enabled and running';
-        } elseif ($this->stale($ctx)) {
+        } elseif (($stale = $this->staleness($ctx)) === 'code') {
             $problems[] = 'The API still runs the code from before the last deploy';
+        } elseif ($stale === 'key') {
+            $problems[] = "The API doesn't take the API key in .env: it still runs with its old settings";
         }
 
         if ($ctx->answer('tls') === 'cert' && $ctx->separateWebUser()) {
@@ -121,8 +123,14 @@ class Server extends Step
             ];
         }
 
-        // Octane reloads its workers without dropping connections
-        return $this->stale($ctx) ? [...$actions, Action::command('Reload the API with the code on disk', 'sudo systemctl reload wgla')] : $actions;
+        return match ($this->staleness($ctx)) {
+            // Octane reloads its workers without dropping connections
+            'code' => [...$actions, Action::command('Reload the API with the code on disk', 'sudo systemctl reload wgla')],
+            // A restart picks up new settings even on a server started before .env stayed out of
+            // the process environment (bootstrap/app.php), where a reload would keep the old ones
+            'key' => [...$actions, Action::command('Restart the API with the settings on disk', 'sudo systemctl restart wgla')],
+            default => $actions,
+        };
     }
 
     public function manual(Context $ctx): string
@@ -143,22 +151,34 @@ class Server extends Step
     }
 
     /**
-     * Whether the API serves different code than what's on disk: it reports the fingerprint it
-     * booted with in /status. Unknown (API not answering, no key) counts as not stale.
+     * Whether the API serves something other than what's on disk: 'code' when /status reports
+     * another fingerprint than the code's (it reports the one it booted with), 'key' when it
+     * rejects the API key in .env (it started with another one). Null when it's current, or
+     * unknown (API not answering, no key).
      */
-    protected function stale(Context $ctx): bool
+    protected function staleness(Context $ctx): ?string
     {
         $key = (new EnvFile($ctx->app('.env')))->get('API_KEY');
         if (! $key) {
-            return false;
+            return null;
         }
 
         [$url, $options] = $this->localUrl($ctx);
         // The key goes in on stdin, not on the command line where other users could see it
-        $body = $this->shell->tryRun(trim("curl -s --max-time 3 {$options}").' -H @- :url', ['url' => "{$url}/status"], "api-key: {$key}\n");
-        $running = $body === null ? null : (json_decode($body, true)['app']['code'] ?? null);
+        // -w: the status code on a line of its own after the body (curl expands the \n)
+        $output = $this->shell->tryRun(trim("curl -s --max-time 3 {$options}").' -w \'\n%{http_code}\' -H @- :url', ['url' => "{$url}/status"], "api-key: {$key}\n");
+        if ($output === null) {
+            return null;
+        }
 
-        return $running !== null && $running !== ServerService::codeFingerprint($ctx->app());
+        $lines = explode("\n", $output);
+        $status = array_pop($lines);
+        if ($status === '403') {
+            return 'key';
+        }
+        $running = json_decode(implode("\n", $lines), true)['app']['code'] ?? null;
+
+        return $running !== null && $running !== ServerService::codeFingerprint($ctx->app()) ? 'code' : null;
     }
 
     /** The systemd unit for the current answers. */

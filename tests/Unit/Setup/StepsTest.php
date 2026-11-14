@@ -170,15 +170,65 @@ it('never installs a sudo rule that visudo rejects', function (bool $valid) {
 
 // ─── IP forwarding and pf ───────────────────────────────────────────
 
+/** A Linux host's forwarding state: null for IPv6 means the kernel has no IPv6. */
+function forwardingShell(string $ipv4, ?string $ipv6, ?string $acceptRa = null): FakeShell
+{
+    return (new FakeShell)
+        ->on('sysctl -n net.ipv4.ip_forward', fn () => $ipv4)
+        ->on('sysctl -n net.ipv6.conf.all.forwarding', fn () => $ipv6 ?? throw new CommandFailed('sysctl: cannot stat /proc/sys/net/ipv6'))
+        ->on('ip -6 route show default', fn () => $acceptRa === null ? '' : 'default via fe80::1 dev eth0 proto ra metric 100 expires 1795sec pref medium')
+        ->on('cat :file', fn (array $b) => $b['file'] === '/proc/sys/net/ipv6/conf/eth0/accept_ra' ? $acceptRa : throw new CommandFailed('No such file'));
+}
+
 it('turns IP forwarding on persistently on Linux, only when links route traffic', function () {
     $ctx = setupContext(answers: ['forward' => true]);
-    $step = new Forwarding((new FakeShell)->on('sysctl -n net.ipv4.ip_forward', fn () => '0'));
+    $step = new Forwarding(forwardingShell('0', null));
 
     expect($step->check($ctx))->toBe(['IP forwarding is off', 'IP forwarding is not kept across reboots'])
-        ->and($step->plan($ctx)[0]->command)->toContain("sudo tee '{$ctx->system('/etc/sysctl.d/99-wireguard.conf')}'");
+        ->and($step->plan($ctx)[0]->command)->toBe("printf '%s\\n' 'net.ipv4.ip_forward=1' | sudo tee '{$ctx->system('/etc/sysctl.d/99-wireguard.conf')}' > /dev/null && sudo sysctl --system > /dev/null");
 
     $ctx->answers['forward'] = false;
     expect($step->check($ctx))->toBe([]);
+});
+
+it('turns IPv6 forwarding on too where the kernel has IPv6', function () {
+    $ctx = setupContext(answers: ['forward' => true]);
+    mkdir($ctx->system('/etc/sysctl.d'));
+    file_put_contents($ctx->system('/etc/sysctl.d/99-wireguard.conf'), "net.ipv4.ip_forward=1\n");
+
+    // The IPv6 route comes from router advertisements that systemd-networkd handles (accept_ra 0)
+    $step = new Forwarding(forwardingShell('1', '0', acceptRa: '0'));
+
+    expect($step->check($ctx))->toBe(['IPv6 forwarding is off', 'IPv6 forwarding is not kept across reboots'])
+        ->and($step->plan($ctx)[0]->command)->toStartWith("printf '%s\\n' 'net.ipv4.ip_forward=1' 'net.ipv6.conf.all.forwarding=1' | sudo tee");
+
+    file_put_contents($ctx->system('/etc/sysctl.d/99-wireguard.conf'), "net.ipv4.ip_forward = 1\nnet.ipv6.conf.all.forwarding = 1\n");
+    expect((new Forwarding(forwardingShell('1', '1', acceptRa: '0')))->check($ctx))->toBe([]);
+});
+
+it('keeps router advertisements on the IPv6 uplink where the kernel handles them', function () {
+    $ctx = setupContext(answers: ['forward' => true]);
+    mkdir($ctx->system('/etc/sysctl.d'));
+    $step = new Forwarding(forwardingShell('1', '0', acceptRa: '1'));
+
+    expect($step->check($ctx))->toContain('eth0 learns its IPv6 route from router advertisements, which IPv6 forwarding would turn off')
+        ->and($step->plan($ctx)[0]->command)->toContain("'net.ipv6.conf.all.forwarding=1' 'net/ipv6/conf/eth0/accept_ra=2' | sudo tee");
+
+    // Applied: accept_ra is 2 now, and later plans keep the line
+    file_put_contents($ctx->system('/etc/sysctl.d/99-wireguard.conf'), "net.ipv4.ip_forward=1\nnet.ipv6.conf.all.forwarding=1\nnet/ipv6/conf/eth0/accept_ra=2\n");
+    $applied = new Forwarding(forwardingShell('1', '1', acceptRa: '2'));
+    expect($applied->check($ctx))->toBe([])
+        ->and($applied->plan($ctx)[0]->command)->toContain("'net/ipv6/conf/eth0/accept_ra=2'");
+});
+
+it('turns IPv6 forwarding on with IPv4 on macOS', function () {
+    $ctx = setupContext('mac', answers: ['forward' => true]);
+    $step = new Forwarding((new FakeShell)
+        ->on('sysctl -n net.inet.ip.forwarding', fn () => '0')
+        ->on('sysctl -n net.inet6.ip6.forwarding', fn () => '0'));
+
+    expect($step->check($ctx))->toBe(['IP forwarding is off', 'IPv6 forwarding is off'])
+        ->and($step->plan($ctx)[0]->command)->toBe('sudo sysctl -w net.inet.ip.forwarding=1 net.inet6.ip6.forwarding=1');
 });
 
 it('adds the pf anchors where pf accepts them, also repairing the old appended ones', function (string $pfConf) {
@@ -334,7 +384,7 @@ it('wants the service installed, enabled and running', function () {
     expect($step->check($ctx))->toBe(['The wgla service is not installed, or its settings changed'], 'A changed answer re-renders the unit');
 });
 
-it('reloads a running API that still serves the code from before a deploy', function (bool $stale) {
+it('reloads a running API that still serves the code from before a deploy', function (string $running, array $problems, array $plan) {
     $ctx = setupContext(answers: ['tls' => 'http', 'bind' => '127.0.0.1', 'port' => '8080']);
     touch($ctx->app('frankenphp'));
     chmod($ctx->app('frankenphp'), 0755);
@@ -343,17 +393,25 @@ it('reloads a running API that still serves the code from before a deploy', func
     $shell = (new FakeShell)
         ->on('systemctl is-enabled wgla', fn () => 'enabled')
         ->on('systemctl is-active wgla', fn () => 'active')
-        ->on('curl -s --max-time 3 -H @- :url', fn (array $b, ?string $input) => $b['url'] === 'http://127.0.0.1:8080/status' && $input === "api-key: secret\n"
-            ? json_encode(['app' => ['code' => $stale ? 'older0000000000' : $onDisk]])
+        ->on("curl -s --max-time 3 -w '\\n%{http_code}' -H @- :url", fn (array $b, ?string $input) => $b['url'] === 'http://127.0.0.1:8080/status' && $input === "api-key: secret\n"
+            ? match ($running) {
+                'older code' => json_encode(['app' => ['code' => 'older0000000000']])."\n200",
+                'another key' => json_encode(['error' => 'Unauthorized'])."\n403",
+                default => json_encode(['app' => ['code' => $onDisk]])."\n200",
+            }
             : throw new CommandFailed);
     $step = new Server($shell);
     mkdir(dirname($ctx->system(Server::UNIT)), 0755, true);
     file_put_contents($ctx->system(Server::UNIT), $step->unit($ctx));
 
-    expect($step->check($ctx))->toBe($stale ? ['The API still runs the code from before the last deploy'] : [])
-        ->and(array_map(fn ($action) => $action->command, $step->plan($ctx)))->toBe($stale ? ['sudo systemctl reload wgla'] : [])
+    expect($step->check($ctx))->toBe($problems)
+        ->and(array_map(fn ($action) => $action->command, $step->plan($ctx)))->toBe($plan)
         ->and(implode(' ', array_column($shell->calls, 'bound')))->not->toContain('secret', 'The key never goes on a command line');
-})->with(['after a deploy' => true, 'up to date' => false]);
+})->with([
+    'after a deploy' => ['older code', ['The API still runs the code from before the last deploy'], ['sudo systemctl reload wgla']],
+    'after a new API key' => ['another key', ["The API doesn't take the API key in .env: it still runs with its old settings"], ['sudo systemctl restart wgla']],
+    'up to date' => ['current', [], []],
+]);
 
 it('fingerprints the code by content, not by timestamps', function () {
     $ctx = setupContext();

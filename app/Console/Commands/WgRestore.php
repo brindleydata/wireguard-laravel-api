@@ -93,7 +93,7 @@ class WgRestore extends WgCommand
         }
 
         $this->table(['Link', 'Action', 'Address', 'Port', 'Peers', 'Was up'], array_map(fn (string $name) => [
-            $name, $choices[$name], $links[$name]['address'], $links[$name]['port'], $links[$name]['peers'], $links[$name]['up'] ? 'yes' : 'no',
+            $name, $choices[$name], implode(', ', array_filter([$links[$name]['address'], $links[$name]['address6']])), $links[$name]['port'], $links[$name]['peers'], $links[$name]['up'] ? 'yes' : 'no',
         ], array_keys($links)));
 
         if (! in_array('restore', $choices, true) && ! in_array('replace', $choices, true)) {

@@ -2,6 +2,7 @@
 
 namespace App\Validation;
 
+use App\Services\IpAllocator;
 use InvalidArgumentException;
 
 /**
@@ -64,6 +65,37 @@ class WireGuardValidator
         if ((int) $mask < 0 || (int) $mask > 32) {
             throw new InvalidArgumentException("Invalid CIDR mask: {$mask}");
         }
+    }
+
+    /**
+     * A link's IPv6 address and prefix (fd12:3456:789a::1/64), next to its IPv4 $address. Returns
+     * it in canonical form. It must be unique local (fc00::/7) or global unicast (2000::/3), not
+     * the prefix itself, and leave room for every IPv4 host number (peers mirror theirs into it).
+     */
+    public function address6(string $cidr, string $address): string
+    {
+        if (! preg_match('#^([0-9A-Fa-f:]+)/(\d{1,3})$#', $cidr, $m) || ! filter_var($m[1], FILTER_VALIDATE_IP, FILTER_FLAG_IPV6)) {
+            throw new InvalidArgumentException("Invalid IPv6 address with prefix (e.g. fd12:3456:789a::1/64): {$cidr}");
+        }
+
+        $prefix = (int) $m[2];
+        $ip = inet_ntop(inet_pton($m[1]));
+        if ($prefix < 1 || $prefix > 126) {
+            throw new InvalidArgumentException("Invalid IPv6 prefix length: /{$prefix}");
+        }
+        if (! IpAllocator::overlaps($ip, 'fc00::/7') && ! IpAllocator::overlaps($ip, '2000::/3')) {
+            throw new InvalidArgumentException("{$ip} is neither a unique local (fc00::/7) nor a global unicast (2000::/3) address");
+        }
+        if (IpAllocator::networkCidr("{$ip}/{$prefix}") === "{$ip}/{$prefix}") {
+            throw new InvalidArgumentException("{$ip}/{$prefix} is the prefix itself; give the link an address in it (e.g. ::1)");
+        }
+
+        $v4_host_bits = 32 - (int) (explode('/', $address, 2)[1] ?? 32);
+        if (128 - $prefix < $v4_host_bits) {
+            throw new InvalidArgumentException("IPv6 prefix /{$prefix} is too small for {$address}: peers mirror their IPv4 host number into it");
+        }
+
+        return "{$ip}/{$prefix}";
     }
 
     public function validatePort(int $port): void
@@ -129,9 +161,10 @@ class WireGuardValidator
     }
 
     /**
-     * @param  array  $existing_ips  Tunnel addresses of the other peers (with or without /32 suffix)
+     * @param  array  $existing_ips  AllowedIPs of the other peers (their tunnel address comes first)
+     * @param  string|null  $address6  the link's IPv6 address: a peer can't mirror onto it
      */
-    public function validateNewPeerIp(string $ip, string $interface_address, array $existing_ips): void
+    public function validateNewPeerIp(string $ip, string $interface_address, array $existing_ips, ?string $address6 = null): void
     {
         $this->validateIpAddress($ip);
 
@@ -154,9 +187,15 @@ class WireGuardValidator
         }
 
         foreach ($existing_ips as $existing) {
-            $existing_clean = explode('/', $existing, 2)[0];
-            if ($existing_clean === $ip) {
+            if (IpAllocator::tunnelIp($existing) === $ip) {
                 throw new InvalidArgumentException("Peer with IP {$ip} already exists.");
+            }
+        }
+
+        if ($address6 !== null) {
+            [$link_ip6] = explode('/', $address6, 2);
+            if (IpAllocator::mirror($ip, $interface_address, $address6) === $link_ip6) {
+                throw new InvalidArgumentException("Peer IP {$ip} would get the link's own IPv6 address ({$link_ip6}).");
             }
         }
     }

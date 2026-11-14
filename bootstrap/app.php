@@ -7,7 +7,12 @@ use App\Http\Middleware\ForceJsonResponse;
 use Illuminate\Foundation\Application;
 use Illuminate\Foundation\Configuration\Exceptions;
 use Illuminate\Foundation\Configuration\Middleware;
+use Illuminate\Support\Env;
 use Symfony\Component\HttpKernel\Exception\NotFoundHttpException;
+
+// .env values stay out of the process environment (no putenv). FrankenPHP keeps that environment
+// across worker restarts, so `systemctl reload wgla` would otherwise keep serving the old values.
+Env::disablePutenv();
 
 return Application::configure(basePath: dirname(__DIR__))
     ->withRouting(

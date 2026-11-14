@@ -54,9 +54,9 @@ class WireGuard
 
     // ─── IP allocation (delegates to IpAllocator) ───────────────────
 
-    public function findAvailableIp(string $interface_address, array $existing_peers): string
+    public function findAvailableIp(string $interface_address, array $existing_peers, ?string $address6 = null): string
     {
-        return $this->ipAllocator->findAvailableIp($interface_address, $existing_peers);
+        return $this->ipAllocator->findAvailableIp($interface_address, $existing_peers, $address6);
     }
 
     // ─── Link operations ──────────────────────────────────────────────
@@ -83,7 +83,11 @@ class WireGuard
         return $this->loadLink($name, $this->runtimeInterface($name));
     }
 
-    public function createLink(string $name, string $ip, ?int $port = null, ?string $ifout = null, ?string $dns = null, ?int $keepalive = null, ?string $allowed_ips = null, bool $forward = false, bool $nat = false, bool $up = true): InterfaceInfo
+    /**
+     * @param  string|null  $address6  IPv6 address and prefix for a dual-stack link, or 'auto' for a
+     *                                 random unique local /64
+     */
+    public function createLink(string $name, string $ip, ?int $port = null, ?string $ifout = null, ?string $dns = null, ?int $keepalive = null, ?string $allowed_ips = null, bool $forward = false, bool $nat = false, bool $up = true, ?string $address6 = null): InterfaceInfo
     {
         $this->validator->validateInterfaceName($name);
 
@@ -92,9 +96,11 @@ class WireGuard
         } else {
             $this->validator->validateIpAddress($ip);
         }
+        $address = str_contains($ip, '/') ? $ip : "{$ip}/24";
+        $address6 = $this->resolveAddress6($address6, $address);
         $this->validateSettings(['dns' => $dns, 'keepalive' => $keepalive, 'allowed_ips' => $allowed_ips, 'ifout' => $ifout]);
 
-        return $this->withLock($name, function () use ($name, $ip, $port, $ifout, $dns, $keepalive, $allowed_ips, $forward, $nat, $up) {
+        return $this->withLock($name, function () use ($name, $address, $address6, $port, $ifout, $dns, $keepalive, $allowed_ips, $forward, $nat, $up) {
             if (in_array($name, $this->listLinks(), true)) {
                 throw new ConflictException("Link already exists: {$name}");
             }
@@ -108,15 +114,14 @@ class WireGuard
             }
 
             $ifout = $ifout ?? $this->os->defaultOutboundInterface();
-            $address = str_contains($ip, '/') ? $ip : "{$ip}/24";
 
             $others = $this->otherLinks($name);
             $port = $port ?? $this->freePort($others);
             $this->validator->validatePort($port);
-            $this->assertNoClash($port, $address, $others);
+            $this->assertNoClash($port, $address, $others, $address6);
             $privkey = $this->keys->genkey();
 
-            $content = $this->configBuilder->buildConfFile($address, $privkey, $port, $ifout, [], $dns, $keepalive, $allowed_ips, $forward, $nat, $up);
+            $content = $this->configBuilder->buildConfFile($address, $privkey, $port, $ifout, [], $dns, $keepalive, $allowed_ips, $forward, $nat, $up, $address6);
             $this->os->writeConfig($name, $content);
 
             if ($up) {
@@ -181,6 +186,10 @@ class WireGuard
                 $params['address'] .= '/24';
             }
         }
+        // Format only: the full check needs the link's IPv4 address, read under the lock
+        if (isset($params['address6']) && ! in_array($params['address6'], ['', 'none', 'auto'], true)) {
+            $this->validator->address6((string) $params['address6'], '0.0.0.0/32');
+        }
         $this->validateSettings($params);
         if (isset($params['ifout'])) {
             $system_interfaces = $this->os->networkInterfaces();
@@ -195,15 +204,24 @@ class WireGuard
                 throw new NotFoundException("Link does not exist: {$name}");
             }
 
-            if (isset($params['port']) || isset($params['address'])) {
+            // IPv6: a new value (null removes it), else the current one, checked against the IPv4 address
+            $address = $params['address'] ?? $meta['address'] ?? '';
+            $current6 = $meta['address6'] ?? null;
+            $address6 = array_key_exists('address6', $params)
+                ? $this->resolveAddress6($params['address6'], $address)
+                : ($current6 === null ? null : $this->validator->address6($current6, $address));
+            $changed6 = $address6 !== $current6;
+
+            if (isset($params['port']) || isset($params['address']) || $changed6) {
                 $this->assertNoClash(
                     isset($params['port']) ? (int) $params['port'] : null,
-                    $params['address'] ?? null,
+                    isset($params['address']) ? $params['address'] : null,
                     $this->otherLinks($name),
+                    $changed6 ? $address6 : null,
                 );
             }
-            if (isset($params['address'])) {
-                $this->assertPeersFit($name, $params['address']);
+            if (isset($params['address']) || $changed6) {
+                $this->assertPeersFit($name, $address, $address6);
             }
 
             $iface = $this->runtimeInterface($name);
@@ -228,17 +246,22 @@ class WireGuard
             if (isset($params['port'])) {
                 $overrides['port'] = (string) $params['port'];
             }
+            $overrides['address6'] = $address6;
             foreach (['forward' => $forward, 'nat' => $nat, 'up' => $up] as $field => $value) {
                 if (array_key_exists($field, $params)) {
                     $overrides[$field] = $value ? 'true' : 'false';
                 }
             }
 
-            // Address and port are applied by wg-quick, so a running link has to restart
-            $restart = $running && $up && (isset($params['address']) || isset($params['port']));
+            // Addresses and port are applied by wg-quick, so a running link has to restart
+            $readdress = isset($params['address']) || $changed6;
+            $restart = $running && $up && ($readdress || isset($params['port']));
 
-            // Rewrite while the interface still exists: a running link's peers are read from it
-            $this->rewriteConf($name, $iface, $overrides);
+            // Rewrite while the interface still exists: a running link's peers are read from it.
+            // Peers' IPv6 addresses mirror their IPv4 host number, so they move with the addresses.
+            $this->rewriteConf($name, $iface, $overrides, $readdress && ($address6 !== null || $current6 !== null)
+                ? fn (array $peers) => $this->readdressPeers($peers, $address, $address6, $current6)
+                : null);
 
             if ($running && (! $up || $restart)) {
                 $this->os->stopInterface($name);
@@ -255,8 +278,8 @@ class WireGuard
 
             $link = $this->getLink($name) ?? throw new NotFoundException("Link does not exist: {$name}");
 
-            // Endpoint port and the link's client defaults are baked into every stored client config
-            if (array_intersect(['port', 'dns', 'keepalive', 'allowed_ips'], array_keys($params)) !== []) {
+            // Endpoint port, addresses and the link's client defaults are baked into every stored client config
+            if ($changed6 || array_intersect(['port', 'dns', 'keepalive', 'allowed_ips', 'address'], array_keys($params)) !== []) {
                 $current_meta = $this->os->parseConfig($name) ?? [];
                 foreach ($link->peers as $peer) {
                     $this->refreshClientConfig($link, $peer->public_key, $meta, $current_meta);
@@ -283,12 +306,12 @@ class WireGuard
 
             // Auto-assign IP if not provided
             $bare_ip = $ip === null || $ip === ''
-                ? $this->ipAllocator->findAvailableIp($link->address, $link->peers)
+                ? $this->ipAllocator->findAvailableIp($link->address, $link->peers, $link->address6)
                 : $this->validator->peerAddress($ip);
 
             // Validate peer IP
             $existing_ips = array_map(fn (PeerInfo $p) => $p->allowed_ips, $link->peers);
-            $this->validator->validateNewPeerIp($bare_ip, $link->address, $existing_ips);
+            $this->validator->validateNewPeerIp($bare_ip, $link->address, $existing_ips, $link->address6);
 
             // Generate keys (base64)
             $privkey = $this->keys->genkey();
@@ -298,7 +321,7 @@ class WireGuard
             $peer = [
                 'public_key' => $pubkey,
                 'preshared_key' => $psk,
-                'allowed_ips' => "{$bare_ip}/32",
+                'allowed_ips' => IpAllocator::peerAllowedIps($bare_ip, $link->address, $link->address6),
             ];
 
             if ($iface !== null) {
@@ -390,9 +413,9 @@ class WireGuard
             if (isset($params['ip'])) {
                 $bare_ip = $this->validator->peerAddress($params['ip']);
                 $others = array_filter($link->peers, fn (PeerInfo $p) => $p->public_key !== $pubkey);
-                $this->validator->validateNewPeerIp($bare_ip, $link->address, array_map(fn (PeerInfo $p) => $p->allowed_ips, $others));
+                $this->validator->validateNewPeerIp($bare_ip, $link->address, array_map(fn (PeerInfo $p) => $p->allowed_ips, $others), $link->address6);
 
-                $allowed_ips = "{$bare_ip}/32";
+                $allowed_ips = IpAllocator::peerAllowedIps($bare_ip, $link->address, $link->address6);
                 $changes['ip'] = $bare_ip;
 
                 if ($iface !== null) {
@@ -526,17 +549,18 @@ class WireGuard
 
         $parsed = $this->configBuilder->parseConfContent($conf);
         $meta = $parsed['metadata'];
-        $address = $meta['address'] ?? $parsed['interface']['Address'] ?? '';
+        $address = $meta['address'] ?? trim(explode(',', $parsed['interface']['Address'] ?? '')[0]);
         $port = (int) ($parsed['interface']['ListenPort'] ?? 0);
         $this->validator->validateCidr($address);
+        $address6 = isset($meta['address6']) ? $this->validator->address6($meta['address6'], $address) : null;
         $this->validator->validatePort($port);
         $this->validateSettings(['dns' => $meta['dns'] ?? null, 'keepalive' => $meta['keepalive'] ?? null, 'allowed_ips' => $meta['allowed_ips'] ?? null]);
 
-        return $this->withLock($name, function () use ($name, $parsed, $meta, $address, $port, $clients, $up) {
+        return $this->withLock($name, function () use ($name, $parsed, $meta, $address, $address6, $port, $clients, $up) {
             if (in_array($name, $this->listLinks(), true)) {
                 throw new ConflictException("Link already exists: {$name}");
             }
-            $this->assertNoClash($port, $address, $this->otherLinks($name));
+            $this->assertNoClash($port, $address, $this->otherLinks($name), $address6);
 
             $ifout = $meta['ifout'] ?? null;
             $moved = null;
@@ -558,6 +582,7 @@ class WireGuard
                 forward: ($meta['forward'] ?? 'false') === 'true',
                 nat: ($meta['nat'] ?? 'false') === 'true',
                 up: $up,
+                address6: $address6,
             ));
 
             $link = $this->getLinkFromConfig($name);
@@ -597,7 +622,7 @@ class WireGuard
      * @param  list<string>  $ignore  links that won't be there (e.g. about to be replaced)
      * @return list<string>
      */
-    public function findClashes(string $name, int $port, string $address, array $ignore = []): array
+    public function findClashes(string $name, int $port, string $address, array $ignore = [], ?string $address6 = null): array
     {
         $problems = [];
         foreach ($this->otherLinks($name) as $other => $settings) {
@@ -609,6 +634,9 @@ class WireGuard
             }
             if ($settings['address'] !== '' && IpAllocator::overlaps($address, $settings['address'])) {
                 $problems[] = "subnet {$address} overlaps {$other} ({$settings['address']})";
+            }
+            if ($address6 !== null && $settings['address6'] !== '' && IpAllocator::overlaps($address6, $settings['address6'])) {
+                $problems[] = "prefix {$address6} overlaps {$other} ({$settings['address6']})";
             }
         }
 
@@ -670,6 +698,7 @@ class WireGuard
             up: true,
             peers: array_map(fn (array $p) => $this->peerInfo($p), $this->parseDumpPeers($lines)),
             interface: $iface,
+            address6: $meta['address6'] ?? null,
         );
     }
 
@@ -690,12 +719,13 @@ class WireGuard
             name: $name,
             public_key: $private_key !== '' ? $this->keys->pubkey($private_key) : '',
             listen_port: (int) ($interface['ListenPort'] ?? 0),
-            address: $metadata['address'] ?? $interface['Address'] ?? '(none)',
+            address: $metadata['address'] ?? trim(explode(',', $interface['Address'] ?? '(none)')[0]),
             ifout: $metadata['ifout'] ?? $this->os->defaultOutboundInterface(),
             forward: ($metadata['forward'] ?? 'false') === 'true',
             nat: ($metadata['nat'] ?? 'false') === 'true',
             up: false,
             peers: array_map(fn (array $p) => $this->peerInfo($p), $this->confPeers($parsed['peers'])),
+            address6: $metadata['address6'] ?? null,
         );
     }
 
@@ -704,7 +734,7 @@ class WireGuard
     /**
      * Listen port and address of every other link, from their configs.
      *
-     * @return array<string, array{port: int, address: string}>
+     * @return array<string, array{port: int, address: string, address6: string}>
      */
     protected function otherLinks(string $name): array
     {
@@ -716,7 +746,8 @@ class WireGuard
             $parsed = $this->configBuilder->parseConfContent($content);
             $links[$other] = [
                 'port' => (int) ($parsed['interface']['ListenPort'] ?? 0),
-                'address' => $parsed['metadata']['address'] ?? $parsed['interface']['Address'] ?? '',
+                'address' => $parsed['metadata']['address'] ?? trim(explode(',', $parsed['interface']['Address'] ?? '')[0]),
+                'address6' => $parsed['metadata']['address6'] ?? '',
             ];
         }
 
@@ -740,9 +771,9 @@ class WireGuard
     }
 
     /**
-     * Two links can't listen on the same port or route overlapping subnets.
+     * Two links can't listen on the same port or route overlapping subnets (of either family).
      */
-    protected function assertNoClash(?int $port, ?string $address, array $others): void
+    protected function assertNoClash(?int $port, ?string $address, array $others, ?string $address6 = null): void
     {
         foreach ($others as $other => $settings) {
             if ($port !== null && $port === $settings['port']) {
@@ -751,24 +782,71 @@ class WireGuard
             if ($address !== null && $settings['address'] !== '' && IpAllocator::overlaps($address, $settings['address'])) {
                 throw new ConflictException("Subnet {$address} overlaps link {$other} ({$settings['address']})");
             }
+            if ($address6 !== null && ($settings['address6'] ?? '') !== '' && IpAllocator::overlaps($address6, $settings['address6'])) {
+                throw new ConflictException("Prefix {$address6} overlaps link {$other} ({$settings['address6']})");
+            }
         }
     }
 
     /**
-     * A link's address can only move to a subnet its peers' tunnel addresses still fit in.
+     * The IPv6 address for a link: null (none; also '' and 'none'), 'auto' (a random unique local
+     * /64, using the IPv4 address's host number), or a validated address and prefix.
      */
-    protected function assertPeersFit(string $name, string $address): void
+    protected function resolveAddress6(?string $value, string $address): ?string
+    {
+        if ($value === null || $value === '' || $value === 'none') {
+            return null;
+        }
+        if ($value === 'auto') {
+            [$ip] = explode('/', $address, 2);
+            $prefix = IpAllocator::randomUlaPrefix();
+
+            return IpAllocator::hostAt($prefix, IpAllocator::hostIndex($ip, $address) ?? 1).'/64';
+        }
+
+        return $this->validator->address6($value, $address);
+    }
+
+    /**
+     * Peers with their IPv6 tunnel address moved to the link's new addresses: the mirrored /128 of
+     * the old prefix is replaced (or dropped); other allowed IPs stay.
+     *
+     * @param  list<array{public_key: string, allowed_ips: string}>  $peers
+     */
+    protected function readdressPeers(array $peers, string $address, ?string $address6, ?string $old_address6): array
+    {
+        return array_map(function (array $peer) use ($address, $address6, $old_address6) {
+            $ip = IpAllocator::tunnelIp($peer['allowed_ips']);
+            if ($ip === null) {
+                return $peer;
+            }
+
+            $others = array_filter(array_map('trim', explode(',', $peer['allowed_ips'])), fn (string $entry) => $entry !== "{$ip}/32"
+                && ! ($old_address6 !== null && str_ends_with($entry, '/128') && IpAllocator::overlaps($entry, $old_address6)));
+
+            return array_merge($peer, ['allowed_ips' => implode(', ', [IpAllocator::peerAllowedIps($ip, $address, $address6), ...$others])]);
+        }, $peers);
+    }
+
+    /**
+     * A link's addresses can only move where its peers' tunnel addresses still fit: inside the
+     * IPv4 subnet, and not mirrored onto the link's own IPv6 address.
+     */
+    protected function assertPeersFit(string $name, string $address, ?string $address6 = null): void
     {
         [$link_ip] = explode('/', $address, 2);
+        $link_ip6 = $address6 === null ? null : explode('/', $address6, 2)[0];
 
         foreach ($this->getLink($name)?->peers ?? [] as $peer) {
-            // The first allowed IP is the peer's tunnel address
-            $ip = explode('/', trim(explode(',', (string) $peer->allowed_ips)[0]), 2)[0];
-            if (! filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) {
+            $ip = IpAllocator::tunnelIp($peer->allowed_ips);
+            if ($ip === null) {
                 continue;
             }
             if ($ip === $link_ip || ! $this->validator->ipInRange($ip, $address)) {
                 throw new InvalidArgumentException("Peer {$ip} would not fit the new address {$address}. Move the peer first (its `ip`).");
+            }
+            if ($address6 !== null && IpAllocator::mirror($ip, $address, $address6) === $link_ip6) {
+                throw new InvalidArgumentException("Peer {$ip} would get the link's IPv6 address {$link_ip6}. Move the peer first (its `ip`).");
             }
         }
     }
@@ -795,7 +873,7 @@ class WireGuard
         $current = $iface !== null ? $this->dumpPeers($iface) : $this->confPeers($parsed['peers']);
 
         $this->os->writeConfig($name, $this->configBuilder->buildConfFile(
-            address: $meta['address'] ?? $interface['Address'] ?? '',
+            address: $meta['address'] ?? trim(explode(',', $interface['Address'] ?? '')[0]),
             privkey: $interface['PrivateKey'] ?? '',
             port: isset($meta['port']) ? (int) $meta['port'] : (int) ($interface['ListenPort'] ?? 0),
             ifout: $meta['ifout'] ?? $this->os->defaultOutboundInterface(),
@@ -806,6 +884,7 @@ class WireGuard
             forward: ($meta['forward'] ?? 'false') === 'true',
             nat: ($meta['nat'] ?? 'false') === 'true',
             up: ($meta['up'] ?? 'true') === 'true',
+            address6: $meta['address6'] ?? null,
         ));
     }
 
@@ -836,7 +915,8 @@ class WireGuard
 
             $peer = [
                 'public_key' => $parts[0],
-                'allowed_ips' => $parts[3],
+                // wg separates them with a bare comma; configs and the API use ", "
+                'allowed_ips' => implode(', ', explode(',', $parts[3])),
                 // Live stats (not written to the config)
                 'endpoint' => ($parts[2] ?? '(none)') === '(none)' ? null : $parts[2],
                 'latest_handshake' => (int) ($parts[4] ?? 0) ?: null,
