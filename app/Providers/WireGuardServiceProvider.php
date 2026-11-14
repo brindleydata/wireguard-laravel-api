@@ -52,6 +52,7 @@ class WireGuardServiceProvider extends ServiceProvider
             keys: $app->make(KeyManager::class),
             configBuilder: $app->make(ConfigBuilder::class),
             ipAllocator: $app->make(IpAllocator::class),
+            lockPath: storage_path('framework/locks'),
         ));
     }
 }

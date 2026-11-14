@@ -2,7 +2,7 @@
 
 namespace App\Services;
 
-use Symfony\Component\Process\Exception\ProcessFailedException;
+use App\Exceptions\CommandFailedException;
 use Symfony\Component\Process\Process;
 
 class Shell
@@ -30,7 +30,7 @@ class Shell
         $process->run();
 
         if (! $process->isSuccessful()) {
-            throw new ProcessFailedException($process);
+            throw CommandFailedException::fromProcess($process);
         }
 
         return trim($process->getOutput());

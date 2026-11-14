@@ -10,8 +10,9 @@ class WgPeerUpdate extends WgCommand
     protected $signature = 'wg:peer:update
         {link : Interface name}
         {pubkey : Peer public key}
-        {--dns= : DNS server override for client config}
-        {--allowed-ips= : Allowed IPs override}';
+        {--ip= : New tunnel address within the link subnet}
+        {--dns= : DNS servers for this peer\'s client config}
+        {--allowed-ips= : Routes for this peer\'s client config (AllowedIPs)}';
 
     protected $description = 'Update a WireGuard peer';
 
@@ -22,6 +23,9 @@ class WgPeerUpdate extends WgCommand
 
         $params = [];
 
+        if ($this->option('ip') !== null) {
+            $params['ip'] = $this->option('ip');
+        }
         if ($this->option('dns') !== null) {
             $params['dns'] = $this->option('dns');
         }

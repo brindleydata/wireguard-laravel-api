@@ -2,10 +2,23 @@
 
 namespace App\Services;
 
+use App\Exceptions\ConflictException;
 use RuntimeException;
 
 class IpAllocator
 {
+    /**
+     * Network address of a CIDR, e.g. 10.0.0.1/24 → 10.0.0.0/24. A bare IP is treated as /32.
+     */
+    public static function networkCidr(string $cidr): string
+    {
+        [$ip, $mask] = array_pad(explode('/', $cidr, 2), 2, '32');
+        $mask = (int) $mask;
+        $netmask = $mask === 0 ? 0 : (-1 << (32 - $mask)) & 0xFFFFFFFF;
+
+        return long2ip(ip2long($ip) & $netmask)."/{$mask}";
+    }
+
     public function findAvailableIp(string $interface_address, array $existing_peers): string
     {
         if (! str_contains($interface_address, '/')) {
@@ -38,6 +51,6 @@ class IpAllocator
             }
         }
 
-        throw new RuntimeException('No available IP addresses in subnet.');
+        throw new ConflictException('No available IP addresses in subnet.');
     }
 }

@@ -134,8 +134,9 @@ class WireGuard extends Controller
     public function peerUpdate(Request $request, string $link, string $pubkey): array
     {
         $data = $request->validate([
-            'allowed_ips' => 'nullable|string',
-            'dns' => 'nullable|string',
+            'ip' => 'nullable|string',          // tunnel address (server AllowedIPs + client Address)
+            'dns' => 'nullable|string',         // client config DNS
+            'allowed_ips' => 'nullable|string', // client config AllowedIPs (routes)
         ]);
 
         $params = array_filter($data, fn ($v) => $v !== null);

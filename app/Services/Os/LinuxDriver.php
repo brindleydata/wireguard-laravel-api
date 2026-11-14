@@ -2,15 +2,8 @@
 
 namespace App\Services\Os;
 
-use App\Services\ConfigBuilder;
-use App\Services\Shell;
-
-class LinuxDriver implements OsDriver
+class LinuxDriver extends BaseDriver
 {
-    public function __construct(
-        protected Shell $shell,
-    ) {}
-
     public function cpu(): array
     {
         $cores = (int) $this->shell->run('nproc');
@@ -67,22 +60,13 @@ class LinuxDriver implements OsDriver
         ];
     }
 
-    public function publicIpv4(string $ip_service): ?string
-    {
-        return $this->shell->tryRun('curl -4 -s --max-time 5 :url', ['url' => $ip_service]);
-    }
-
-    public function publicIpv6(string $ip_service): ?string
-    {
-        return $this->shell->tryRun('curl -6 -s --max-time 5 :url', ['url' => $ip_service]);
-    }
-
     public function networkInterfaces(): array
     {
         $output = $this->shell->run('ip link show');
         $interfaces = [];
         foreach (explode("\n", $output) as $line) {
-            if (preg_match('/^\d+: (?<iface>\w+):/', $line, $matches)) {
+            // e.g. "2: eth0: <...>", "5: eth0@if6: <...>" (containers), "9: br-1a2b: <...>", "4: eth0.100@eth0: <...>"
+            if (preg_match('/^\d+:\s+(?<iface>[^:@\s]+)(@\S+)?:/', $line, $matches)) {
                 $interfaces[] = $matches['iface'];
             }
         }
@@ -119,6 +103,15 @@ class LinuxDriver implements OsDriver
         return '/etc/wireguard';
     }
 
+    public function resolveInterface(string $link): string
+    {
+        return $link;
+    }
+
+    /**
+     * Each link owns one nftables table, `inet wg_<link>`, so its rules can be dropped without
+     * touching anything else. Must stay in sync with applyFirewall().
+     */
     public function interfaceSection(string $address, string $privkey, int $port, string $ifout, bool $forward = false, bool $nat = false): string
     {
         $lines = [
@@ -130,142 +123,52 @@ class LinuxDriver implements OsDriver
 
         if ($forward || $nat) {
             $up = ['nft add table inet wg_%i'];
-            $down = [];
 
             if ($forward) {
                 $up[] = "nft add chain inet wg_%i forward '{ type filter hook forward priority 0; }'";
                 $up[] = 'nft add rule inet wg_%i forward iifname "%i" accept';
                 $up[] = 'nft add rule inet wg_%i forward oifname "%i" accept';
-                $down[] = 'nft flush chain inet wg_%i forward 2>/dev/null';
-                $down[] = 'nft delete chain inet wg_%i forward 2>/dev/null';
             }
 
             if ($nat) {
                 $up[] = "nft add chain inet wg_%i postrouting '{ type nat hook postrouting priority 100; }'";
                 $up[] = "nft add rule inet wg_%i postrouting oifname \"{$ifout}\" masquerade";
-                $down[] = 'nft flush chain inet wg_%i postrouting 2>/dev/null';
-                $down[] = 'nft delete chain inet wg_%i postrouting 2>/dev/null';
             }
 
-            $down[] = 'nft delete table inet wg_%i 2>/dev/null';
-
             $lines[] = 'PostUp = '.implode('; ', $up);
-            $lines[] = 'PostDown = '.implode('; ', $down);
+            // `|| true`: the service may already have cleared the table, and a failing hook would fail `wg-quick down`
+            $lines[] = 'PostDown = nft delete table inet wg_%i 2>/dev/null || true';
         }
 
         return implode("\n", $lines);
     }
 
-    public function enableForward(string $name): void
+    public function applyFirewall(string $link, string $iface, string $address, string $ifout, bool $forward, bool $nat): void
     {
-        $table = "wg_{$name}";
+        $this->clearFirewall($link);
+
+        if (! $forward && ! $nat) {
+            return;
+        }
+
+        $table = "wg_{$link}";
         $this->shell->run('sudo nft add table inet :table', ['table' => $table]);
-        $this->shell->run(
-            "sudo nft add chain inet :table forward '{ type filter hook forward priority 0; }'",
-            ['table' => $table],
-        );
-        $this->shell->run(
-            'sudo nft add rule inet :table forward iifname :name accept',
-            ['table' => $table, 'name' => $name],
-        );
-        $this->shell->run(
-            'sudo nft add rule inet :table forward oifname :name accept',
-            ['table' => $table, 'name' => $name],
-        );
-    }
 
-    public function disableForward(string $name): void
-    {
-        $table = "wg_{$name}";
-        $this->shell->tryRun('sudo nft flush chain inet :table forward', ['table' => $table]);
-        $this->shell->tryRun('sudo nft delete chain inet :table forward', ['table' => $table]);
-        $this->deleteTableIfEmpty($table);
-    }
-
-    public function enableNat(string $name, string $ifout): void
-    {
-        $table = "wg_{$name}";
-        $this->shell->run('sudo nft add table inet :table', ['table' => $table]);
-        $this->shell->run(
-            "sudo nft add chain inet :table postrouting '{ type nat hook postrouting priority 100; }'",
-            ['table' => $table],
-        );
-        $this->shell->run(
-            'sudo nft add rule inet :table postrouting oifname :ifout masquerade',
-            ['table' => $table, 'ifout' => $ifout],
-        );
-    }
-
-    public function disableNat(string $name, string $ifout): void
-    {
-        $table = "wg_{$name}";
-        $this->shell->tryRun('sudo nft flush chain inet :table postrouting', ['table' => $table]);
-        $this->shell->tryRun('sudo nft delete chain inet :table postrouting', ['table' => $table]);
-        $this->deleteTableIfEmpty($table);
-    }
-
-    public function writeConfig(string $name, string $content): void
-    {
-        $dir = $this->configPath();
-        $path = "{$dir}/{$name}.conf";
-
-        $tmp = tempnam(sys_get_temp_dir(), 'wg_');
-        file_put_contents($tmp, $content."\n");
-        chmod($tmp, 0600);
-
-        $this->shell->run('sudo mkdir -p :dir && sudo cp :tmp :path && sudo chmod 600 :path', [
-            'dir' => $dir,
-            'tmp' => $tmp,
-            'path' => $path,
-        ]);
-        @unlink($tmp);
-    }
-
-    public function deleteConfig(string $name): void
-    {
-        $path = $this->configPath()."/{$name}.conf";
-        $this->shell->tryRun('sudo rm -f :path', ['path' => $path]);
-    }
-
-    public function readConfig(string $name): ?string
-    {
-        $path = $this->configPath()."/{$name}.conf";
-
-        return $this->shell->tryRun('sudo cat :path', ['path' => $path]);
-    }
-
-    public function configExists(string $name): bool
-    {
-        $path = $this->configPath()."/{$name}.conf";
-
-        return $this->shell->tryRun('sudo test -f :path && echo 1', ['path' => $path]) === '1';
-    }
-
-    public function listConfigNames(): array
-    {
-        $output = $this->shell->tryRun('sudo ls :path', ['path' => $this->configPath()]);
-        if ($output === null || $output === '') {
-            return [];
+        if ($forward) {
+            $this->shell->run("sudo nft add chain inet :table forward '{ type filter hook forward priority 0; }'", ['table' => $table]);
+            $this->shell->run('sudo nft add rule inet :table forward iifname :iface accept', ['table' => $table, 'iface' => $iface]);
+            $this->shell->run('sudo nft add rule inet :table forward oifname :iface accept', ['table' => $table, 'iface' => $iface]);
         }
 
-        $names = [];
-        foreach (explode("\n", trim($output)) as $file) {
-            if (str_ends_with($file, '.conf')) {
-                $names[] = basename($file, '.conf');
-            }
+        if ($nat) {
+            $this->shell->run("sudo nft add chain inet :table postrouting '{ type nat hook postrouting priority 100; }'", ['table' => $table]);
+            $this->shell->run('sudo nft add rule inet :table postrouting oifname :ifout masquerade', ['table' => $table, 'ifout' => $ifout]);
         }
-
-        return $names;
     }
 
-    public function parseConfig(string $name): ?array
+    public function clearFirewall(string $link): void
     {
-        $content = $this->readConfig($name);
-        if ($content === null) {
-            return null;
-        }
-
-        return ConfigBuilder::parseMetadata($content);
+        $this->shell->tryRun('sudo nft delete table inet :table', ['table' => "wg_{$link}"]);
     }
 
     public function startInterface(string $name): void
@@ -276,53 +179,5 @@ class LinuxDriver implements OsDriver
     public function stopInterface(string $name): void
     {
         $this->shell->run('sudo systemctl stop :unit && sudo systemctl disable :unit', ['unit' => "wg-quick@{$name}"]);
-    }
-
-    public function writeClientConfig(string $link, string $key, string $content): void
-    {
-        $dir = $this->configPath()."/clients/{$link}";
-        $path = "{$dir}/{$key}.conf";
-
-        $tmp = tempnam(sys_get_temp_dir(), 'wg_client_');
-        file_put_contents($tmp, $content."\n");
-        chmod($tmp, 0600);
-
-        $this->shell->run('sudo mkdir -p :dir && sudo cp :tmp :path && sudo chmod 600 :path', [
-            'dir' => $dir,
-            'tmp' => $tmp,
-            'path' => $path,
-        ]);
-        @unlink($tmp);
-    }
-
-    public function readClientConfig(string $link, string $key): ?string
-    {
-        $path = $this->configPath()."/clients/{$link}/{$key}.conf";
-
-        return $this->shell->tryRun('sudo cat :path', ['path' => $path]);
-    }
-
-    public function deleteClientConfig(string $link, string $key): void
-    {
-        $path = $this->configPath()."/clients/{$link}/{$key}.conf";
-        $this->shell->tryRun('sudo rm -f :path', ['path' => $path]);
-    }
-
-    public function deleteClientConfigDir(string $link): void
-    {
-        $dir = $this->configPath()."/clients/{$link}";
-        $this->shell->tryRun('sudo rm -rf :dir', ['dir' => $dir]);
-    }
-
-    protected function deleteTableIfEmpty(string $table): void
-    {
-        $output = $this->shell->tryRun('sudo nft list table inet :table', ['table' => $table]);
-        if ($output === null) {
-            return;
-        }
-
-        if (! str_contains($output, 'chain ')) {
-            $this->shell->tryRun('sudo nft delete table inet :table', ['table' => $table]);
-        }
     }
 }

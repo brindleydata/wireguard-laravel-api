@@ -1,6 +1,6 @@
 # WireGuard Laravel API (WGLA)
 
-Stateless REST API and CLI for managing WireGuard VPN interfaces and peers. Built on Laravel 12 / PHP 8.5+. No database — all state lives in WireGuard `.conf` files and the kernel module.
+Stateless REST API and CLI for managing WireGuard VPN interfaces and peers. Built on Laravel 13 / PHP 8.5+. No database — all state lives in WireGuard `.conf` files and the kernel module.
 
 ## Requirements
 
@@ -77,6 +77,7 @@ _www ALL=(root) NOPASSWD: \
     /opt/homebrew/bin/wg-quick, \
     /sbin/pfctl, \
     /bin/cat /opt/homebrew/etc/wireguard/*, \
+    /bin/cat /var/run/wireguard/*, \
     /usr/bin/test -f /opt/homebrew/etc/wireguard/*, \
     /bin/ls /opt/homebrew/etc/wireguard, \
     /bin/mkdir -p /opt/homebrew/etc/wireguard, \
@@ -110,7 +111,7 @@ Enable IP forwarding: `sudo sysctl -w net.inet.ip.forwarding=1`
 | `nft` | Manage nftables forward/NAT chains per interface (Linux) |
 | `pfctl` | Manage pf anchor rules for forward/NAT (macOS) |
 | `systemctl` | Enable/start/stop/disable `wg-quick@*` units (Linux) |
-| `cat` | Read `.conf` files from the WireGuard config directory |
+| `cat` | Read `.conf` files from the WireGuard config directory; on macOS also the `utunN` name wg-quick records in `/var/run/wireguard/<link>.name` |
 | `test` | Check whether a `.conf` file exists |
 | `ls` | List `.conf` files in the WireGuard config directory |
 | `mkdir` | Create config directory and per-link client subdirectories |
@@ -151,6 +152,20 @@ All protected routes require the `api-key` header.
 | DELETE | `/link/{link}/peer/{pubkey}` | Yes | Delete peer |
 | GET | `/link/{link}/peer/{pubkey}/config` | Yes | Get peer client config |
 
+`{pubkey}` is the peer's public key in URL-safe base64 without padding (`+/` → `-_`, `=` removed).
+
+Updating a peer (`PATCH /link/{link}/peer/{pubkey}`) accepts:
+
+| Field | Effect |
+|-------|--------|
+| `ip` | Moves the peer to another address in the link subnet: server-side AllowedIPs and the client config's `Address` |
+| `dns` | DNS in the peer's client config |
+| `allowed_ips` | AllowedIPs (routes) in the peer's client config. The server side is unchanged |
+
+When a link's `port`, `dns`, `keepalive` or `allowed_ips` change, the stored client configs of its peers are regenerated. Per-peer `dns`/`allowed_ips` overrides are kept.
+
+Errors are JSON `{"error": "..."}`: `403` for a missing or wrong API key (also when `API_KEY` is unset), `404` for an unknown link or peer, `409` for a conflict such as an existing link, `422` for invalid input, and `500` when a system command fails (the message includes its error output).
+
 ## CLI
 
 ```bash
@@ -163,7 +178,7 @@ php artisan wg:link:update       # Update interface
 php artisan wg:link:delete       # Delete interface
 php artisan wg:link:peers        # List peers
 php artisan wg:peer:create       # Create peer
-php artisan wg:peer:update       # Update peer
+php artisan wg:peer:update       # Update peer (--ip, --dns, --allowed-ips)
 php artisan wg:peer:delete       # Delete peer
 php artisan wg:peer              # Show peer client config
 ```

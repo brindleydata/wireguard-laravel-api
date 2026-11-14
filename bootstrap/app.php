@@ -1,6 +1,8 @@
 <?php
 
+use App\Exceptions\ConflictException;
 use App\Exceptions\NotFoundException;
+use App\Exceptions\SystemException;
 use App\Http\Middleware\ForceJsonResponse;
 use Illuminate\Foundation\Application;
 use Illuminate\Foundation\Configuration\Exceptions;
@@ -27,7 +29,16 @@ return Application::configure(basePath: dirname(__DIR__))
             return response()->json(['error' => $e->getMessage()], 404);
         });
 
-        $exceptions->render(function (\InvalidArgumentException $e) {
+        $exceptions->render(function (InvalidArgumentException $e) {
             return response()->json(['error' => $e->getMessage()], 422);
+        });
+
+        $exceptions->render(function (ConflictException $e) {
+            return response()->json(['error' => $e->getMessage()], 409);
+        });
+
+        // Still reported to the log (with the command line for CommandFailedException)
+        $exceptions->render(function (SystemException $e) {
+            return response()->json(['error' => $e->getMessage()], 500);
         });
     })->create();

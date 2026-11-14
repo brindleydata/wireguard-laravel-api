@@ -50,29 +50,30 @@ interface OsDriver
     public function configPath(): string;
 
     /**
+     * Map a link name to the OS interface wg-quick created for it.
+     *
+     * Linux: the link name itself. macOS: wg-quick always creates a fresh utunN and records it in
+     * /var/run/wireguard/<link>.name; falls back to the link name when there is no mapping.
+     * The caller must still check `wg show interfaces` to know whether it is running.
+     */
+    public function resolveInterface(string $link): string;
+
+    /**
      * Generate the [Interface] section for a wg-quick config, with optional PostUp/PostDown for forwarding and NAT.
+     * The hooks must install the same rules as applyFirewall().
      */
     public function interfaceSection(string $address, string $privkey, int $port, string $ifout, bool $forward = false, bool $nat = false): string;
 
     /**
-     * Add nft FORWARD / pfctl pass rules for a WireGuard interface.
+     * Replace the live forward/NAT rules of a running link with exactly the given state.
+     * Clears them when both $forward and $nat are false.
      */
-    public function enableForward(string $name): void;
+    public function applyFirewall(string $link, string $iface, string $address, string $ifout, bool $forward, bool $nat): void;
 
     /**
-     * Remove nft FORWARD / pfctl pass rules for a WireGuard interface.
+     * Remove all live forward/NAT rules of a link. Never throws.
      */
-    public function disableForward(string $name): void;
-
-    /**
-     * Add nft masquerade / pfctl nat rule for a WireGuard interface.
-     */
-    public function enableNat(string $name, string $ifout): void;
-
-    /**
-     * Remove nft masquerade / pfctl nat rule for a WireGuard interface.
-     */
-    public function disableNat(string $name, string $ifout): void;
+    public function clearFirewall(string $link): void;
 
     /**
      * Write a wg-quick .conf file securely (chmod 0600).

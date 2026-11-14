@@ -114,6 +114,7 @@ SNIPPET);
        {$prefix}/bin/wg-quick, \\
        /sbin/pfctl, \\
        /bin/cat {$configPath}/*, \\
+       /bin/cat /var/run/wireguard/*, \\
        /usr/bin/test -f {$configPath}/*, \\
        /bin/ls {$configPath}, \\
        /bin/mkdir -p {$configPath}, \\

@@ -18,12 +18,14 @@ class InterfaceInfo
         public readonly bool $nat = false,
         public readonly bool $up = true,
         public readonly array $peers = [],
+        public readonly ?string $interface = null, // OS interface while running (utunN on macOS)
     ) {}
 
     public function toArray(): array
     {
         return [
             'name' => $this->name,
+            'interface' => $this->interface,
             'public_key' => $this->public_key,
             'private_key' => $this->private_key,
             'listen_port' => $this->listen_port,

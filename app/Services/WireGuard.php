@@ -4,10 +4,13 @@ namespace App\Services;
 
 use App\DTOs\InterfaceInfo;
 use App\DTOs\PeerInfo;
+use App\Exceptions\ConflictException;
 use App\Exceptions\NotFoundException;
+use App\Exceptions\SystemException;
 use App\Services\Os\OsDriver;
 use App\Validation\WireGuardValidator;
-use RuntimeException;
+use Closure;
+use InvalidArgumentException;
 
 class WireGuard
 {
@@ -19,6 +22,7 @@ class WireGuard
         protected KeyManager $keys,
         protected ConfigBuilder $configBuilder,
         protected IpAllocator $ipAllocator,
+        protected string $lockPath,
     ) {}
 
     // ─── Key generation (delegates to KeyManager) ───────────────────
@@ -57,144 +61,26 @@ class WireGuard
 
     // ─── Link operations ──────────────────────────────────────────────
 
+    /**
+     * Links with a .conf, plus running WireGuard interfaces that no .conf accounts for.
+     */
     public function listLinks(): array
     {
-        $running = $this->runningLinks();
-        $persisted = $this->os->listConfigNames();
+        $links = $this->os->listConfigNames();
+        $claimed = array_map(fn (string $link) => $this->os->resolveInterface($link), $links);
+        $unmanaged = array_diff($this->runningInterfaces(), $claimed);
 
-        return array_values(array_unique(array_merge($running, $persisted)));
+        return array_values(array_unique([...$links, ...$unmanaged]));
     }
 
     public function isRunning(string $name): bool
     {
-        return in_array($name, $this->runningLinks());
-    }
-
-    protected function runningLinks(): array
-    {
-        $output = $this->shell->tryRun('sudo wg show interfaces');
-        if ($output === null || $output === '') {
-            return [];
-        }
-
-        return preg_split('/\s+/', trim($output));
+        return $this->runtimeInterface($name) !== null;
     }
 
     public function getLink(string $name): ?InterfaceInfo
     {
-        $is_running = $this->isRunning($name);
-
-        if ($is_running) {
-            return $this->getLinkFromRuntime($name);
-        }
-
-        return $this->getLinkFromConfig($name);
-    }
-
-    protected function getLinkFromRuntime(string $name): ?InterfaceInfo
-    {
-        $output = $this->shell->tryRun('sudo wg show :name dump', ['name' => $name]);
-        if ($output === null || $output === '') {
-            return null;
-        }
-
-        $lines = explode("\n", trim($output));
-        if ($lines === []) {
-            return null;
-        }
-
-        // Line 1: private_key, public_key, listen_port, fwmark (tab-separated)
-        $iface_parts = explode("\t", $lines[0]);
-        $private_key = $iface_parts[0] ?? '';
-        $public_key = $private_key !== '' && $private_key !== '(none)' ? $this->keys->pubkey($private_key) : '';
-        $listen_port = (int) ($iface_parts[2] ?? 0);
-
-        // Get address from OS, fallback to conf metadata
-        $address = $this->os->interfaceAddress($name);
-        if ($address === null) {
-            $meta = $this->os->parseConfig($name);
-            $address = $meta['address'] ?? '(none)';
-        }
-
-        // Get ifout and forward/nat from conf metadata
-        $meta = $meta ?? $this->os->parseConfig($name);
-        $ifout = $meta['ifout'] ?? $this->os->defaultOutboundInterface();
-        $forward = ($meta['forward'] ?? 'false') === 'true';
-        $nat = ($meta['nat'] ?? 'false') === 'true';
-
-        // Build peer list from lines 2+
-        $peers = [];
-        for ($i = 1; $i < count($lines); $i++) {
-            $parts = explode("\t", $lines[$i]);
-            if (count($parts) < 4) {
-                continue;
-            }
-
-            $peer_pubkey = $parts[0];
-            $peer_psk = ($parts[1] ?? '(none)') !== '(none)' ? $parts[1] : null;
-            $allowed_ips = $parts[3] ?? '';
-
-            $peers[] = new PeerInfo(
-                public_key: $peer_pubkey,
-                preshared_key: $peer_psk,
-                allowed_ips: $allowed_ips,
-            );
-        }
-
-        return new InterfaceInfo(
-            name: $name,
-            public_key: $public_key,
-            private_key: $private_key,
-            listen_port: $listen_port,
-            address: $address,
-            ifout: $ifout,
-            forward: $forward,
-            nat: $nat,
-            up: true,
-            peers: $peers,
-        );
-    }
-
-    protected function getLinkFromConfig(string $name): ?InterfaceInfo
-    {
-        $content = $this->os->readConfig($name);
-        if ($content === null) {
-            return null;
-        }
-
-        $parsed = $this->configBuilder->parseConfContent($content);
-        $metadata = $parsed['metadata'];
-        $interface = $parsed['interface'];
-
-        $private_key = $interface['PrivateKey'] ?? '';
-        $public_key = $private_key !== '' ? $this->keys->pubkey($private_key) : '';
-        $listen_port = (int) ($interface['ListenPort'] ?? 0);
-        $address = $metadata['address'] ?? $interface['Address'] ?? '(none)';
-        $ifout = $metadata['ifout'] ?? $this->os->defaultOutboundInterface();
-        $forward = ($metadata['forward'] ?? 'false') === 'true';
-        $nat = ($metadata['nat'] ?? 'false') === 'true';
-
-        $peers = [];
-        foreach ($parsed['peers'] as $peer_data) {
-            $peers[] = new PeerInfo(
-                public_key: $peer_data['PublicKey'] ?? '',
-                preshared_key: $peer_data['PresharedKey'] ?? null,
-                allowed_ips: $peer_data['AllowedIPs'] ?? '',
-            );
-        }
-
-        return new InterfaceInfo(
-            name: $name,
-            public_key: $public_key,
-            private_key: $private_key,
-            listen_port: $listen_port,
-            address: $address,
-            ifout: $ifout,
-            forward: $forward,
-            nat: $nat,
-            up: false,
-            peers: $peers,
-        );
+        return $this->loadLink($name, $this->runtimeInterface($name));
     }
 
     public function createLink(string $name, string $ip, ?int $port = null, ?string $ifout = null, ?string $dns = null, ?int $keepalive = null, ?string $allowed_ips = null, bool $forward = false, bool $nat = false, bool $up = true): InterfaceInfo
@@ -206,17 +92,18 @@ class WireGuard
         } else {
             $this->validator->validateIpAddress($ip);
         }
+        $this->validateSettings(['dns' => $dns, 'keepalive' => $keepalive, 'allowed_ips' => $allowed_ips, 'ifout' => $ifout]);
 
         return $this->withLock($name, function () use ($name, $ip, $port, $ifout, $dns, $keepalive, $allowed_ips, $forward, $nat, $up) {
-            if (in_array($name, $this->listLinks())) {
-                throw new RuntimeException("Link already exists: {$name}");
+            if (in_array($name, $this->listLinks(), true)) {
+                throw new ConflictException("Link already exists: {$name}");
             }
 
             // Check that ifout exists (if specified)
             if ($ifout !== null) {
                 $system_interfaces = $this->os->networkInterfaces();
                 if (! in_array($ifout, $system_interfaces)) {
-                    throw new RuntimeException("Output interface does not exist: {$ifout}");
+                    throw new InvalidArgumentException("Output interface does not exist: {$ifout}");
                 }
             }
 
@@ -226,9 +113,7 @@ class WireGuard
 
             $address = str_contains($ip, '/') ? $ip : "{$ip}/24";
             $privkey = $this->keys->genkey();
-            $pubkey = $this->keys->pubkey($privkey);
 
-            // Build and write conf file with metadata comments
             $content = $this->configBuilder->buildConfFile($address, $privkey, $port, $ifout, [], $dns, $keepalive, $allowed_ips, $forward, $nat, $up);
             $this->os->writeConfig($name, $content);
 
@@ -236,33 +121,18 @@ class WireGuard
                 try {
                     $this->os->startInterface($name);
                 } catch (\Throwable $e) {
-                    if ($forward) {
-                        $this->os->disableForward($name);
-                    }
-                    if ($nat) {
-                        $this->os->disableNat($name, $ifout);
-                    }
                     try {
                         $this->os->stopInterface($name);
                     } catch (\Throwable) {
                     }
+                    $this->os->clearFirewall($name);
                     $this->os->deleteConfig($name);
 
-                    throw new RuntimeException("Failed to create link {$name}: {$e->getMessage()}", 0, $e);
+                    throw new SystemException("Failed to create link {$name}: {$e->getMessage()}", 0, $e);
                 }
             }
 
-            return new InterfaceInfo(
-                name: $name,
-                public_key: $pubkey,
-                private_key: $privkey,
-                listen_port: $port,
-                address: $address,
-                ifout: $ifout,
-                forward: $forward,
-                nat: $nat,
-                up: $up,
-            );
+            return $this->getLink($name) ?? throw new SystemException("Link {$name} was created but could not be read back.");
         });
     }
 
@@ -271,142 +141,22 @@ class WireGuard
         $this->validator->validateInterfaceName($name);
 
         $this->withLock($name, function () use ($name) {
-            $is_running = $this->isRunning($name);
+            $iface = $this->runtimeInterface($name);
 
-            if (! $is_running && ! $this->os->configExists($name)) {
+            if ($iface === null && ! $this->os->configExists($name)) {
                 throw new NotFoundException("Link does not exist: {$name}");
             }
 
-            // Clean up forward/nat rules before stopping
-            $meta = $this->os->parseConfig($name);
-            if ($meta !== null && $is_running) {
-                $forward = ($meta['forward'] ?? 'false') === 'true';
-                $nat = ($meta['nat'] ?? 'false') === 'true';
-                $ifout = $meta['ifout'] ?? $this->os->defaultOutboundInterface();
-
-                if ($forward) {
-                    $this->os->disableForward($name);
-                }
-                if ($nat) {
-                    $this->os->disableNat($name, $ifout);
-                }
-            }
-
-            // Stop the interface if running
-            if ($is_running) {
+            if ($iface !== null) {
                 $this->os->stopInterface($name);
+                // PostDown normally removes the rules; this also covers hooks that no longer match
+                $this->os->clearFirewall($name);
             }
 
             $this->os->deleteConfig($name);
             $this->os->deleteClientConfigDir($name);
         });
     }
-
-    // ─── Peer operations ─────────────────────────────────────────────
-
-    public function addPeer(string $link_name, ?string $ip = null): PeerInfo
-    {
-        return $this->withLock($link_name, function () use ($link_name, $ip) {
-            $link = $this->getLink($link_name);
-            if ($link === null) {
-                throw new NotFoundException("Link does not exist: {$link_name}");
-            }
-
-            // Auto-assign IP if not provided
-            if ($ip === null || $ip === '') {
-                $bare_ip = $this->ipAllocator->findAvailableIp($link->address, $link->peers);
-                $mask = '32';
-            } elseif (str_contains($ip, '/')) {
-                [$bare_ip, $mask] = explode('/', $ip, 2);
-            } else {
-                $bare_ip = $ip;
-                $mask = '32';
-            }
-
-            // Validate peer IP
-            $existing_ips = array_map(fn (PeerInfo $p) => $p->allowed_ips, $link->peers);
-            $this->validator->validateNewPeerIp($bare_ip, $link->address, $existing_ips);
-
-            // Generate keys (base64)
-            $privkey = $this->keys->genkey();
-            $pubkey = $this->keys->pubkey($privkey);
-            $psk = $this->keys->genpsk();
-
-            $allowed_ips = "{$bare_ip}/{$mask}";
-
-            // Write peer config to temp file and apply via wg addconf
-            $peer_conf = implode("\n", [
-                '[Peer]',
-                "PublicKey = {$pubkey}",
-                "PresharedKey = {$psk}",
-                "AllowedIPs = {$allowed_ips}",
-            ]);
-
-            $tmp = tempnam(sys_get_temp_dir(), 'wg_peer_');
-            file_put_contents($tmp, $peer_conf."\n");
-
-            try {
-                $this->shell->run('sudo wg addconf :name :tmp', ['name' => $link_name, 'tmp' => $tmp]);
-            } finally {
-                @unlink($tmp);
-            }
-
-            // Rebuild conf file with new peer appended
-            $this->rebuildConfWithPeers($link_name);
-
-            // Build client config
-            $client_config = $this->configBuilder->buildClientConfig($link, $privkey, $bare_ip, $pubkey, $psk);
-
-            // Save client config keyed by base64url-safe pubkey
-            $this->os->writeClientConfig($link_name, self::pubkeyToSafe($pubkey), $client_config);
-
-            return new PeerInfo(
-                public_key: $pubkey,
-                preshared_key: $psk,
-                allowed_ips: $allowed_ips,
-                private_key: $privkey,
-                client_config: $client_config,
-            );
-        });
-    }
-
-    public function removePeer(string $link_name, string $pubkey): void
-    {
-        $this->withLock($link_name, function () use ($link_name, $pubkey) {
-            $link = $this->getLink($link_name);
-            if ($link === null) {
-                throw new NotFoundException("Link does not exist: {$link_name}");
-            }
-
-            $target = null;
-            foreach ($link->peers as $peer) {
-                if ($peer->public_key === $pubkey) {
-                    $target = $peer;
-                    break;
-                }
-            }
-
-            if ($target === null) {
-                throw new NotFoundException("Peer not found: {$pubkey}");
-            }
-
-            // Remove peer via wg set
-            $this->shell->run('sudo wg set :name peer :pubkey remove', ['name' => $link_name, 'pubkey' => $pubkey]);
-
-            // Rebuild conf file without the removed peer
-            $this->rebuildConfWithPeers($link_name);
-
-            // Delete client config file
-            $this->os->deleteClientConfig($link_name, self::pubkeyToSafe($pubkey));
-        });
-    }
-
-    public function getPeerConfig(string $link_name, string $pubkey): ?string
-    {
-        return $this->os->readClientConfig($link_name, self::pubkeyToSafe($pubkey));
-    }
-
-    // ─── Update operations ──────────────────────────────────────────
 
     public function updateLink(string $name, array $params): InterfaceInfo
     {
@@ -424,33 +174,33 @@ class WireGuard
                 $params['address'] .= '/24';
             }
         }
+        $this->validateSettings($params);
         if (isset($params['ifout'])) {
             $system_interfaces = $this->os->networkInterfaces();
             if (! in_array($params['ifout'], $system_interfaces)) {
-                throw new RuntimeException("Output interface does not exist: {$params['ifout']}");
+                throw new InvalidArgumentException("Output interface does not exist: {$params['ifout']}");
             }
         }
 
         return $this->withLock($name, function () use ($name, $params) {
-            if (! in_array($name, $this->listLinks())) {
+            $meta = $this->os->parseConfig($name);
+            if ($meta === null) {
                 throw new NotFoundException("Link does not exist: {$name}");
             }
 
-            $is_running = $this->isRunning($name);
+            $iface = $this->runtimeInterface($name);
+            $running = $iface !== null;
 
-            // Read current config metadata
-            $meta = $this->os->parseConfig($name) ?? [];
             $current_forward = ($meta['forward'] ?? 'false') === 'true';
             $current_nat = ($meta['nat'] ?? 'false') === 'true';
             $current_ifout = $meta['ifout'] ?? $this->os->defaultOutboundInterface();
 
-            // Determine target states
-            $new_forward = array_key_exists('forward', $params) ? (bool) $params['forward'] : $current_forward;
-            $new_nat = array_key_exists('nat', $params) ? (bool) $params['nat'] : $current_nat;
-            $new_ifout = $params['ifout'] ?? $current_ifout;
-            $target_up = array_key_exists('up', $params) ? (bool) $params['up'] : $is_running;
+            $forward = array_key_exists('forward', $params) ? (bool) $params['forward'] : $current_forward;
+            $nat = array_key_exists('nat', $params) ? (bool) $params['nat'] : $current_nat;
+            $ifout = $params['ifout'] ?? $current_ifout;
+            $up = array_key_exists('up', $params) ? (bool) $params['up'] : $running;
 
-            // Build metadata overrides (only for fields that were provided)
+            // Metadata overrides, only for fields that were provided
             $overrides = [];
             foreach (['dns', 'keepalive', 'allowed_ips', 'ifout', 'address'] as $field) {
                 if (array_key_exists($field, $params)) {
@@ -460,173 +210,488 @@ class WireGuard
             if (isset($params['port'])) {
                 $overrides['port'] = (string) $params['port'];
             }
-            if (array_key_exists('forward', $params)) {
-                $overrides['forward'] = $new_forward ? 'true' : 'false';
-            }
-            if (array_key_exists('nat', $params)) {
-                $overrides['nat'] = $new_nat ? 'true' : 'false';
-            }
-            if (array_key_exists('up', $params)) {
-                $overrides['up'] = $target_up ? 'true' : 'false';
-            }
-
-            $has_config_changes = isset($params['address']) || isset($params['port']);
-            $needs_restart = $is_running && $target_up && $has_config_changes;
-
-            if ($needs_restart) {
-                // Running and staying up with address/port change — full restart
-                $peers = $this->parseDumpPeers($name);
-
-                // Clean up runtime forward/nat rules before stopping
-                if ($current_forward) {
-                    $this->os->disableForward($name);
+            foreach (['forward' => $forward, 'nat' => $nat, 'up' => $up] as $field => $value) {
+                if (array_key_exists($field, $params)) {
+                    $overrides[$field] = $value ? 'true' : 'false';
                 }
-                if ($current_nat) {
-                    $this->os->disableNat($name, $current_ifout);
-                }
+            }
 
+            // Address and port are applied by wg-quick, so a running link has to restart
+            $restart = $running && $up && (isset($params['address']) || isset($params['port']));
+
+            // Rewrite while the interface still exists: a running link's peers are read from it
+            $this->rewriteConf($name, $iface, $overrides);
+
+            if ($running && (! $up || $restart)) {
                 $this->os->stopInterface($name);
+                $this->os->clearFirewall($name);
+            }
 
-                $content = $this->os->readConfig($name);
-                $parsed = $this->configBuilder->parseConfContent($content);
-                $metadata = array_merge($parsed['metadata'], $overrides);
-                $interface = $parsed['interface'];
-
-                $address = $params['address'] ?? $metadata['address'] ?? $interface['Address'] ?? '';
-                $privkey = $interface['PrivateKey'] ?? '';
-                $port = isset($params['port']) ? (int) $params['port'] : (int) ($interface['ListenPort'] ?? 0);
-                $ifout = $metadata['ifout'] ?? $this->os->defaultOutboundInterface();
-                $forward = ($metadata['forward'] ?? 'false') === 'true';
-                $nat = ($metadata['nat'] ?? 'false') === 'true';
-                $up = ($metadata['up'] ?? 'true') === 'true';
-                $dns = $metadata['dns'] ?? null;
-                $keepalive = isset($metadata['keepalive']) ? (int) $metadata['keepalive'] : null;
-                $allowed_ips = $metadata['allowed_ips'] ?? null;
-
-                $new_content = $this->configBuilder->buildConfFile($address, $privkey, $port, $ifout, $peers, $dns, $keepalive, $allowed_ips, $forward, $nat, $up);
-                $this->os->writeConfig($name, $new_content);
-
+            if ($up && (! $running || $restart)) {
+                // PostUp installs the rules for the new state
                 $this->os->startInterface($name);
-            } else {
-                // Apply forward/nat runtime changes (only while running and staying up)
-                if ($is_running && $target_up) {
-                    if (array_key_exists('forward', $params) && $new_forward !== $current_forward) {
-                        if ($new_forward) {
-                            $this->os->enableForward($name);
-                        } else {
-                            $this->os->disableForward($name);
-                        }
-                    }
+            } elseif ($running && $up && ($forward !== $current_forward || $nat !== $current_nat || $ifout !== $current_ifout)) {
+                $address = $meta['address'] ?? $this->os->interfaceAddress($iface) ?? '';
+                $this->os->applyFirewall($name, $iface, $address, $ifout, $forward, $nat);
+            }
 
-                    $nat_toggled = array_key_exists('nat', $params) && $new_nat !== $current_nat;
-                    $ifout_changed = isset($params['ifout']) && $params['ifout'] !== $current_ifout;
+            $link = $this->getLink($name) ?? throw new NotFoundException("Link does not exist: {$name}");
 
-                    if ($nat_toggled || ($ifout_changed && $current_nat)) {
-                        if ($current_nat) {
-                            $this->os->disableNat($name, $current_ifout);
-                        }
-                        if ($new_nat) {
-                            $this->os->enableNat($name, $new_ifout);
-                        }
-                    }
-                }
-
-                // Rebuild conf with all overrides (handles both running and stopped links)
-                if (! empty($overrides)) {
-                    $this->rebuildConfWithOverrides($name, $overrides);
-                }
-
-                // Handle up state transitions
-                if ($target_up && ! $is_running) {
-                    $this->os->startInterface($name);
-                } elseif (! $target_up && $is_running) {
-                    if ($current_forward) {
-                        $this->os->disableForward($name);
-                    }
-                    if ($current_nat) {
-                        $this->os->disableNat($name, $current_ifout);
-                    }
-                    $this->os->stopInterface($name);
+            // Endpoint port and the link's client defaults are baked into every stored client config
+            if (array_intersect(['port', 'dns', 'keepalive', 'allowed_ips'], array_keys($params)) !== []) {
+                $current_meta = $this->os->parseConfig($name) ?? [];
+                foreach ($link->peers as $peer) {
+                    $this->refreshClientConfig($link, $peer->public_key, $meta, $current_meta);
                 }
             }
 
-            return $this->getLink($name);
+            return $link;
         });
     }
 
-    public function updatePeer(string $link_name, string $pubkey, array $params): PeerInfo
+    // ─── Peer operations ─────────────────────────────────────────────
+    //
+    // On a running link a change is applied with `wg` and the .conf is then regenerated from the
+    // live interface. On a stopped link only the .conf is edited; wg-quick loads it on the next start.
+
+    public function addPeer(string $link_name, ?string $ip = null): PeerInfo
     {
-        return $this->withLock($link_name, function () use ($link_name, $pubkey, $params) {
-            $link = $this->getLink($link_name);
+        return $this->withLock($link_name, function () use ($link_name, $ip) {
+            $iface = $this->runtimeInterface($link_name);
+            $link = $this->loadLink($link_name, $iface);
             if ($link === null) {
                 throw new NotFoundException("Link does not exist: {$link_name}");
             }
 
-            $target = null;
-            foreach ($link->peers as $peer) {
-                if ($peer->public_key === $pubkey) {
-                    $target = $peer;
-                    break;
-                }
-            }
-            if ($target === null) {
-                throw new NotFoundException("Peer not found: {$pubkey}");
-            }
+            // Auto-assign IP if not provided
+            $bare_ip = $ip === null || $ip === ''
+                ? $this->ipAllocator->findAvailableIp($link->address, $link->peers)
+                : $this->validator->peerAddress($ip);
 
-            // Update server-side AllowedIPs if requested
-            $allowed_ips = $target->allowed_ips;
-            if (isset($params['allowed_ips'])) {
-                $allowed_ips = $params['allowed_ips'];
-                $this->shell->run('sudo wg set :link peer :pubkey allowed-ips :ips', [
-                    'link' => $link_name,
-                    'pubkey' => $pubkey,
-                    'ips' => $allowed_ips,
-                ]);
-                $this->rebuildConfWithPeers($link_name);
-            }
+            // Validate peer IP
+            $existing_ips = array_map(fn (PeerInfo $p) => $p->allowed_ips, $link->peers);
+            $this->validator->validateNewPeerIp($bare_ip, $link->address, $existing_ips);
 
-            // Read stored client config to extract keys for regeneration
-            $safe = self::pubkeyToSafe($pubkey);
-            $client_content = $this->os->readClientConfig($link_name, $safe);
-            if ($client_content === null) {
-                throw new NotFoundException("Client config not found for peer: {$pubkey}");
+            // Generate keys (base64)
+            $privkey = $this->keys->genkey();
+            $pubkey = $this->keys->pubkey($privkey);
+            $psk = $this->keys->genpsk();
+
+            $peer = [
+                'public_key' => $pubkey,
+                'preshared_key' => $psk,
+                'allowed_ips' => "{$bare_ip}/32",
+            ];
+
+            if ($iface !== null) {
+                // Piped through stdin so the preshared key never touches the disk
+                $this->shell->run('sudo wg addconf :iface /dev/stdin', ['iface' => $iface], $this->peerSection($peer));
+                $this->rewriteConf($link_name, $iface);
+            } else {
+                $this->rewriteConf($link_name, null, peers: fn (array $peers) => [...$peers, $peer]);
             }
 
-            $client = $this->configBuilder->parseClientConfig($client_content);
+            $client_config = $this->configBuilder->buildClientConfig($link, $privkey, $bare_ip, $pubkey, $psk);
 
-            // Rebuild client config with overrides
-            $new_client_config = $this->configBuilder->buildClientConfig(
-                $link,
-                $client['PrivateKey'],
-                $client['Address'],
-                $pubkey,
-                $client['PresharedKey'],
-                $params['dns'] ?? null,
-                $params['allowed_ips'] ?? null,
-            );
-            $this->os->writeClientConfig($link_name, $safe, $new_client_config);
+            // Save client config keyed by base64url-safe pubkey
+            $this->os->writeClientConfig($link_name, self::pubkeyToSafe($pubkey), $client_config);
 
             return new PeerInfo(
                 public_key: $pubkey,
-                preshared_key: $client['PresharedKey'],
-                allowed_ips: $allowed_ips,
-                client_config: $new_client_config,
+                preshared_key: $psk,
+                allowed_ips: $peer['allowed_ips'],
+                private_key: $privkey,
+                client_config: $client_config,
             );
         });
     }
 
+    public function removePeer(string $link_name, string $pubkey): void
+    {
+        $this->withLock($link_name, function () use ($link_name, $pubkey) {
+            $iface = $this->runtimeInterface($link_name);
+            $link = $this->loadLink($link_name, $iface);
+            if ($link === null) {
+                throw new NotFoundException("Link does not exist: {$link_name}");
+            }
+
+            if ($this->findPeer($link, $pubkey) === null) {
+                throw new NotFoundException("Peer not found: {$pubkey}");
+            }
+
+            if ($iface !== null) {
+                $this->shell->run('sudo wg set :iface peer :pubkey remove', ['iface' => $iface, 'pubkey' => $pubkey]);
+                $this->rewriteConf($link_name, $iface);
+            } else {
+                $this->rewriteConf($link_name, null, peers: fn (array $peers) => array_values(
+                    array_filter($peers, fn (array $p) => $p['public_key'] !== $pubkey),
+                ));
+            }
+
+            $this->os->deleteClientConfig($link_name, self::pubkeyToSafe($pubkey));
+        });
+    }
+
+    public function getPeerConfig(string $link_name, string $pubkey): ?string
+    {
+        return $this->os->readClientConfig($link_name, self::pubkeyToSafe($pubkey));
+    }
+
+    /**
+     * Change a peer.
+     *
+     * - `ip` moves its tunnel address: the server-side AllowedIPs and the client config's Address.
+     * - `dns` and `allowed_ips` only change what its client config hands out (per-peer overrides of
+     *   the link's client defaults), just like `allowed_ips` on a link.
+     */
+    public function updatePeer(string $link_name, string $pubkey, array $params): PeerInfo
+    {
+        $this->validateSettings($params);
+
+        return $this->withLock($link_name, function () use ($link_name, $pubkey, $params) {
+            $iface = $this->runtimeInterface($link_name);
+            $link = $this->loadLink($link_name, $iface);
+            if ($link === null) {
+                throw new NotFoundException("Link does not exist: {$link_name}");
+            }
+
+            $target = $this->findPeer($link, $pubkey);
+            if ($target === null) {
+                throw new NotFoundException("Peer not found: {$pubkey}");
+            }
+
+            // Checked before changing anything: it holds the peer's private key
+            $client_content = $this->os->readClientConfig($link_name, self::pubkeyToSafe($pubkey));
+            if ($client_content === null) {
+                throw new NotFoundException("Client config not found for peer: {$pubkey}");
+            }
+
+            $changes = array_intersect_key($params, array_flip(['dns', 'allowed_ips']));
+            $allowed_ips = $target->allowed_ips;
+
+            if (isset($params['ip'])) {
+                $bare_ip = $this->validator->peerAddress($params['ip']);
+                $others = array_filter($link->peers, fn (PeerInfo $p) => $p->public_key !== $pubkey);
+                $this->validator->validateNewPeerIp($bare_ip, $link->address, array_map(fn (PeerInfo $p) => $p->allowed_ips, $others));
+
+                $allowed_ips = "{$bare_ip}/32";
+                $changes['ip'] = $bare_ip;
+
+                if ($iface !== null) {
+                    $this->shell->run('sudo wg set :iface peer :pubkey allowed-ips :ips', [
+                        'iface' => $iface,
+                        'pubkey' => $pubkey,
+                        'ips' => $allowed_ips,
+                    ]);
+                    $this->rewriteConf($link_name, $iface);
+                } else {
+                    $this->rewriteConf($link_name, null, peers: fn (array $peers) => array_map(
+                        fn (array $p) => $p['public_key'] === $pubkey ? array_merge($p, ['allowed_ips' => $allowed_ips]) : $p,
+                        $peers,
+                    ));
+                }
+            }
+
+            $meta = $this->os->parseConfig($link_name) ?? [];
+            $client_config = $this->refreshClientConfig($link, $pubkey, $meta, $meta, $changes, $client_content);
+            $client = $this->configBuilder->parseClientConfig($client_config);
+
+            return new PeerInfo(
+                public_key: $pubkey,
+                preshared_key: $client['PresharedKey'] ?? $target->preshared_key,
+                allowed_ips: $allowed_ips,
+                client_config: $client_config,
+            );
+        });
+    }
+
+    /**
+     * Re-render a peer's stored client config for the link's current settings.
+     *
+     * A value that differs from the link default in force when the config was written
+     * ($previous_meta) is a per-peer override and is kept. $changes (ip, dns, allowed_ips)
+     * replace values. Returns null when the peer has no stored client config (added elsewhere).
+     */
+    protected function refreshClientConfig(InterfaceInfo $link, string $pubkey, array $previous_meta, array $current_meta, array $changes = [], ?string $content = null): ?string
+    {
+        $safe = self::pubkeyToSafe($pubkey);
+        $content ??= $this->os->readClientConfig($link->name, $safe);
+        if ($content === null) {
+            return null;
+        }
+
+        $client = $this->configBuilder->parseClientConfig($content);
+        $previous = $this->configBuilder->clientDefaults($previous_meta);
+        $override = fn (string $field, string $key): ?string => array_key_exists($field, $changes)
+            ? (string) $changes[$field]
+            : (isset($client[$key]) && $client[$key] !== $previous[$field] ? $client[$key] : null);
+
+        $config = $this->configBuilder->buildClientConfig(
+            $link,
+            $client['PrivateKey'],
+            $changes['ip'] ?? $client['Address'],
+            $pubkey,
+            $client['PresharedKey'],
+            dns_override: $override('dns', 'DNS'),
+            allowed_ips_override: $override('allowed_ips', 'AllowedIPs'),
+            metadata: $current_meta,
+            keepalive_override: $override('keepalive', 'PersistentKeepalive'),
+        );
+        $this->os->writeClientConfig($link->name, $safe, $config);
+
+        return $config;
+    }
+
+    /**
+     * Validate the settings that get written into config files, when present.
+     */
+    protected function validateSettings(array $settings): void
+    {
+        if (isset($settings['dns'])) {
+            $this->validator->validateDns((string) $settings['dns']);
+        }
+        if (isset($settings['allowed_ips'])) {
+            $this->validator->validateAllowedIps((string) $settings['allowed_ips']);
+        }
+        if (isset($settings['keepalive'])) {
+            $this->validator->validateKeepalive((int) $settings['keepalive']);
+        }
+        if (isset($settings['ifout'])) {
+            $this->validator->validateOutboundInterface((string) $settings['ifout']);
+        }
+    }
+
+    // ─── Runtime state ───────────────────────────────────────────────
+
+    /**
+     * The OS interface of a running link (utunN on macOS), or null when it is down.
+     */
+    protected function runtimeInterface(string $name): ?string
+    {
+        $iface = $this->os->resolveInterface($name);
+
+        return in_array($iface, $this->runningInterfaces(), true) ? $iface : null;
+    }
+
+    protected function runningInterfaces(): array
+    {
+        $output = $this->shell->tryRun('sudo wg show interfaces');
+        if ($output === null || $output === '') {
+            return [];
+        }
+
+        return preg_split('/\s+/', trim($output));
+    }
+
+    protected function loadLink(string $name, ?string $iface): ?InterfaceInfo
+    {
+        return $iface !== null
+            ? $this->getLinkFromRuntime($name, $iface)
+            : $this->getLinkFromConfig($name);
+    }
+
+    protected function getLinkFromRuntime(string $name, string $iface): ?InterfaceInfo
+    {
+        $output = $this->shell->tryRun('sudo wg show :iface dump', ['iface' => $iface]);
+        if ($output === null || $output === '') {
+            return null;
+        }
+
+        $lines = explode("\n", $output);
+
+        // Line 1: private_key, public_key, listen_port, fwmark (tab-separated)
+        $iface_parts = explode("\t", $lines[0]);
+        $private_key = $iface_parts[0] ?? '';
+        $public_key = $private_key !== '' && $private_key !== '(none)' ? $this->keys->pubkey($private_key) : '';
+
+        $meta = $this->os->parseConfig($name) ?? [];
+
+        return new InterfaceInfo(
+            name: $name,
+            public_key: $public_key,
+            private_key: $private_key,
+            listen_port: (int) ($iface_parts[2] ?? 0),
+            address: $this->os->interfaceAddress($iface) ?? $meta['address'] ?? '(none)',
+            ifout: $meta['ifout'] ?? $this->os->defaultOutboundInterface(),
+            forward: ($meta['forward'] ?? 'false') === 'true',
+            nat: ($meta['nat'] ?? 'false') === 'true',
+            up: true,
+            peers: array_map(fn (array $p) => $this->peerInfo($p), $this->parseDumpPeers($lines)),
+            interface: $iface,
+        );
+    }
+
+    protected function getLinkFromConfig(string $name): ?InterfaceInfo
+    {
+        $content = $this->os->readConfig($name);
+        if ($content === null) {
+            return null;
+        }
+
+        $parsed = $this->configBuilder->parseConfContent($content);
+        $metadata = $parsed['metadata'];
+        $interface = $parsed['interface'];
+
+        $private_key = $interface['PrivateKey'] ?? '';
+
+        return new InterfaceInfo(
+            name: $name,
+            public_key: $private_key !== '' ? $this->keys->pubkey($private_key) : '',
+            private_key: $private_key,
+            listen_port: (int) ($interface['ListenPort'] ?? 0),
+            address: $metadata['address'] ?? $interface['Address'] ?? '(none)',
+            ifout: $metadata['ifout'] ?? $this->os->defaultOutboundInterface(),
+            forward: ($metadata['forward'] ?? 'false') === 'true',
+            nat: ($metadata['nat'] ?? 'false') === 'true',
+            up: false,
+            peers: array_map(fn (array $p) => $this->peerInfo($p), $this->confPeers($parsed['peers'])),
+        );
+    }
+
+    // ─── Config regeneration ─────────────────────────────────────────
+
+    /**
+     * Regenerate a link's .conf from its current contents plus metadata overrides.
+     *
+     * Peers come from the live interface when $iface is given (the source of truth after
+     * `wg addconf` / `wg set`), otherwise from the file itself. $peers can transform that list.
+     */
+    protected function rewriteConf(string $name, ?string $iface, array $overrides = [], ?Closure $peers = null): void
+    {
+        $content = $this->os->readConfig($name);
+        if ($content === null) {
+            return; // A running interface that no .conf manages
+        }
+
+        $parsed = $this->configBuilder->parseConfContent($content);
+        $meta = array_merge($parsed['metadata'], $overrides);
+        $interface = $parsed['interface'];
+
+        $current = $iface !== null ? $this->dumpPeers($iface) : $this->confPeers($parsed['peers']);
+
+        $this->os->writeConfig($name, $this->configBuilder->buildConfFile(
+            address: $meta['address'] ?? $interface['Address'] ?? '',
+            privkey: $interface['PrivateKey'] ?? '',
+            port: isset($meta['port']) ? (int) $meta['port'] : (int) ($interface['ListenPort'] ?? 0),
+            ifout: $meta['ifout'] ?? $this->os->defaultOutboundInterface(),
+            peers: $peers !== null ? $peers($current) : $current,
+            dns: $meta['dns'] ?? null,
+            keepalive: isset($meta['keepalive']) ? (int) $meta['keepalive'] : null,
+            allowed_ips: $meta['allowed_ips'] ?? null,
+            forward: ($meta['forward'] ?? 'false') === 'true',
+            nat: ($meta['nat'] ?? 'false') === 'true',
+            up: ($meta['up'] ?? 'true') === 'true',
+        ));
+    }
+
+    /**
+     * Peers of a running interface. Throws rather than returning an empty list, so a failed
+     * read can never be written back as "no peers".
+     */
+    protected function dumpPeers(string $iface): array
+    {
+        $output = $this->shell->run('sudo wg show :iface dump', ['iface' => $iface]);
+
+        return $this->parseDumpPeers(explode("\n", $output));
+    }
+
+    /**
+     * @param  string[]  $lines  `wg show <iface> dump` output; line 1 is the interface itself
+     * @return list<array{public_key: string, allowed_ips: string, preshared_key?: string}>
+     */
+    protected function parseDumpPeers(array $lines): array
+    {
+        $peers = [];
+        // Peer lines: public_key, preshared_key, endpoint, allowed_ips, latest_handshake, rx, tx, keepalive
+        foreach (array_slice($lines, 1) as $line) {
+            $parts = explode("\t", $line);
+            if (count($parts) < 4) {
+                continue;
+            }
+
+            $peer = ['public_key' => $parts[0], 'allowed_ips' => $parts[3]];
+            if ($parts[1] !== '(none)') {
+                $peer['preshared_key'] = $parts[1];
+            }
+            $peers[] = $peer;
+        }
+
+        return $peers;
+    }
+
+    /**
+     * @param  array  $sections  [Peer] sections from ConfigBuilder::parseConfContent()
+     */
+    protected function confPeers(array $sections): array
+    {
+        $peers = [];
+        foreach ($sections as $section) {
+            $peer = [
+                'public_key' => $section['PublicKey'] ?? '',
+                'allowed_ips' => $section['AllowedIPs'] ?? '',
+            ];
+            if (! empty($section['PresharedKey'])) {
+                $peer['preshared_key'] = $section['PresharedKey'];
+            }
+            $peers[] = $peer;
+        }
+
+        return $peers;
+    }
+
+    protected function peerInfo(array $peer): PeerInfo
+    {
+        return new PeerInfo(
+            public_key: $peer['public_key'],
+            preshared_key: $peer['preshared_key'] ?? null,
+            allowed_ips: $peer['allowed_ips'],
+        );
+    }
+
+    protected function findPeer(InterfaceInfo $link, string $pubkey): ?PeerInfo
+    {
+        foreach ($link->peers as $peer) {
+            if ($peer->public_key === $pubkey) {
+                return $peer;
+            }
+        }
+
+        return null;
+    }
+
+    protected function peerSection(array $peer): string
+    {
+        return implode("\n", [
+            '[Peer]',
+            "PublicKey = {$peer['public_key']}",
+            "PresharedKey = {$peer['preshared_key']}",
+            "AllowedIPs = {$peer['allowed_ips']}",
+        ])."\n";
+    }
+
     // ─── Locking ─────────────────────────────────────────────────────
 
+    /**
+     * Serialize changes to one link across processes. The lock directory is shared by the CLI and
+     * the web server (unlike /tmp, which differs per user on macOS and under php-fpm's PrivateTmp).
+     */
     protected function withLock(string $name, callable $fn): mixed
     {
-        $lockPath = sys_get_temp_dir()."/wgla_{$name}.lock";
-        $handle = fopen($lockPath, 'c');
-        if ($handle === false) {
-            throw new RuntimeException("Unable to open lock file: {$lockPath}");
+        if (! is_dir($this->lockPath) && ! @mkdir($this->lockPath, 0775, true) && ! is_dir($this->lockPath)) {
+            throw new SystemException("Unable to create lock directory: {$this->lockPath}");
         }
+
+        $path = $this->lockPath.'/'.preg_replace('/[^A-Za-z0-9_.=+-]/', '_', $name).'.lock';
+
+        // flock() works on read-only handles, so a lock file created by another user still works
+        $handle = @fopen($path, 'c') ?: @fopen($path, 'r');
+        if ($handle === false) {
+            throw new SystemException("Unable to open lock file: {$path}");
+        }
+
         try {
             if (! flock($handle, LOCK_EX)) {
-                throw new RuntimeException("Unable to acquire lock for interface: {$name}");
+                throw new SystemException("Unable to acquire lock for link: {$name}");
             }
 
             return $fn();
@@ -634,105 +699,5 @@ class WireGuard
             flock($handle, LOCK_UN);
             fclose($handle);
         }
-    }
-
-    // ─── Private helpers ─────────────────────────────────────────────
-
-    protected function parseDumpPeers(string $name): array
-    {
-        $output = $this->shell->tryRun('sudo wg show :name dump', ['name' => $name]);
-        $peers = [];
-        if ($output !== null && $output !== '') {
-            $lines = explode("\n", trim($output));
-            for ($i = 1; $i < count($lines); $i++) {
-                $parts = explode("\t", $lines[$i]);
-                if (count($parts) < 4) {
-                    continue;
-                }
-                $peer = [
-                    'public_key' => $parts[0],
-                    'allowed_ips' => $parts[3] ?? '',
-                ];
-                if (($parts[1] ?? '(none)') !== '(none)') {
-                    $peer['preshared_key'] = $parts[1];
-                }
-                $peers[] = $peer;
-            }
-        }
-
-        return $peers;
-    }
-
-    protected function rebuildConfWithPeers(string $name): void
-    {
-        // Read current conf to get metadata and interface details
-        $content = $this->os->readConfig($name);
-        if ($content === null) {
-            return;
-        }
-
-        $parsed = $this->configBuilder->parseConfContent($content);
-        $metadata = $parsed['metadata'];
-        $interface = $parsed['interface'];
-
-        $address = $metadata['address'] ?? $interface['Address'] ?? '';
-        $privkey = $interface['PrivateKey'] ?? '';
-        $port = (int) ($interface['ListenPort'] ?? 0);
-        $ifout = $metadata['ifout'] ?? $this->os->defaultOutboundInterface();
-        $forward = ($metadata['forward'] ?? 'false') === 'true';
-        $nat = ($metadata['nat'] ?? 'false') === 'true';
-        $up = ($metadata['up'] ?? 'true') === 'true';
-        $dns = $metadata['dns'] ?? null;
-        $keepalive = isset($metadata['keepalive']) ? (int) $metadata['keepalive'] : null;
-        $allowed_ips = $metadata['allowed_ips'] ?? null;
-
-        // Get current peers from running interface (source of truth after wg addconf/set)
-        $peers = $this->parseDumpPeers($name);
-
-        $new_content = $this->configBuilder->buildConfFile($address, $privkey, $port, $ifout, $peers, $dns, $keepalive, $allowed_ips, $forward, $nat, $up);
-        $this->os->writeConfig($name, $new_content);
-    }
-
-    protected function rebuildConfWithOverrides(string $name, array $overrides): void
-    {
-        $content = $this->os->readConfig($name);
-        if ($content === null) {
-            return;
-        }
-
-        $parsed = $this->configBuilder->parseConfContent($content);
-        $metadata = array_merge($parsed['metadata'], $overrides);
-        $interface = $parsed['interface'];
-
-        $address = $metadata['address'] ?? $interface['Address'] ?? '';
-        $privkey = $interface['PrivateKey'] ?? '';
-        $port = isset($metadata['port']) ? (int) $metadata['port'] : (int) ($interface['ListenPort'] ?? 0);
-        $ifout = $metadata['ifout'] ?? $this->os->defaultOutboundInterface();
-        $forward = ($metadata['forward'] ?? 'false') === 'true';
-        $nat = ($metadata['nat'] ?? 'false') === 'true';
-        $up = ($metadata['up'] ?? 'true') === 'true';
-        $dns = $metadata['dns'] ?? null;
-        $keepalive = isset($metadata['keepalive']) ? (int) $metadata['keepalive'] : null;
-        $allowed_ips = $metadata['allowed_ips'] ?? null;
-
-        // Get peers from runtime if running, otherwise from config file
-        $peers = [];
-        if ($this->isRunning($name)) {
-            $peers = $this->parseDumpPeers($name);
-        } else {
-            foreach ($parsed['peers'] as $peer_data) {
-                $peer = [
-                    'public_key' => $peer_data['PublicKey'] ?? '',
-                    'allowed_ips' => $peer_data['AllowedIPs'] ?? '',
-                ];
-                if (! empty($peer_data['PresharedKey'])) {
-                    $peer['preshared_key'] = $peer_data['PresharedKey'];
-                }
-                $peers[] = $peer;
-            }
-        }
-
-        $new_content = $this->configBuilder->buildConfFile($address, $privkey, $port, $ifout, $peers, $dns, $keepalive, $allowed_ips, $forward, $nat, $up);
-        $this->os->writeConfig($name, $new_content);
     }
 }

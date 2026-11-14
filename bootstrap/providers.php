@@ -1,6 +1,9 @@
 <?php
 
+use App\Providers\AppServiceProvider;
+use App\Providers\WireGuardServiceProvider;
+
 return [
-    App\Providers\AppServiceProvider::class,
-    App\Providers\WireGuardServiceProvider::class,
+    AppServiceProvider::class,
+    WireGuardServiceProvider::class,
 ];

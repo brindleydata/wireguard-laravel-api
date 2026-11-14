@@ -1,0 +1,33 @@
+<?php
+
+use App\Exceptions\CommandFailedException;
+use App\Services\Shell;
+
+/*
+ * The real Shell, running real (harmless) processes.
+ */
+
+it('passes bindings as single literal arguments', function () {
+    $value = "it's; echo injected \$(id) `id`";
+
+    expect((new Shell)->run('printf %s :value', ['value' => $value]))->toBe($value);
+});
+
+it('does not let shorter binding names clobber longer ones', function () {
+    expect((new Shell)->run('printf "%s %s" :name :name_long', ['name' => 'a', 'name_long' => 'b']))->toBe('a b');
+});
+
+it('reports the exit code and stderr of a failed command', function () {
+    try {
+        (new Shell)->run('sh -c :script', ['script' => 'echo "sudo: a password is required" >&2; exit 3']);
+        test()->fail('Expected the command to fail');
+    } catch (CommandFailedException $e) {
+        expect($e->exitCode)->toBe(3)
+            ->and($e->getMessage())->toBe('Command failed with exit code 3: sudo: a password is required')
+            ->and($e->context()['command'])->toContain('sh -c');
+    }
+});
+
+it('returns null from tryRun when the command fails', function () {
+    expect((new Shell)->tryRun('sh -c :script', ['script' => 'exit 1']))->toBeNull();
+});

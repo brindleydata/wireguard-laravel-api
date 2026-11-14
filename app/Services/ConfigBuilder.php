@@ -48,13 +48,27 @@ class ConfigBuilder
         return implode("\n", $lines);
     }
 
-    public function buildClientConfig(InterfaceInfo $link, string $privkey, string $ip, string $pubkey, string $psk, ?string $dns_override = null, ?string $allowed_ips_override = null, ?array $metadata = null): string
+    /**
+     * Client config values a link hands out unless a peer overrides them: the link's own metadata
+     * (dns, keepalive, allowed_ips), falling back to the global WIREGUARD_* defaults.
+     *
+     * @return array{dns: string, keepalive: string, allowed_ips: string}
+     */
+    public function clientDefaults(array $metadata): array
     {
-        // Per-interface overrides from conf metadata, falling back to global defaults
-        $meta = $metadata ?? $this->os->parseConfig($link->name) ?? [];
-        $dns = $dns_override ?? $meta['dns'] ?? $this->config['default_dns'] ?? '8.8.8.8';
-        $keepalive = $meta['keepalive'] ?? $this->config['default_keepalive'] ?? 25;
-        $allowed_ips = $allowed_ips_override ?? $meta['allowed_ips'] ?? $this->config['allowed_ips'] ?? '0.0.0.0/0';
+        return [
+            'dns' => (string) ($metadata['dns'] ?? $this->config['default_dns'] ?? '8.8.8.8'),
+            'keepalive' => (string) ($metadata['keepalive'] ?? $this->config['default_keepalive'] ?? 25),
+            'allowed_ips' => (string) ($metadata['allowed_ips'] ?? $this->config['allowed_ips'] ?? '0.0.0.0/0'),
+        ];
+    }
+
+    public function buildClientConfig(InterfaceInfo $link, string $privkey, string $ip, string $pubkey, string $psk, ?string $dns_override = null, ?string $allowed_ips_override = null, ?array $metadata = null, ?string $keepalive_override = null): string
+    {
+        $defaults = $this->clientDefaults($metadata ?? $this->os->parseConfig($link->name) ?? []);
+        $dns = $dns_override ?? $defaults['dns'];
+        $keepalive = $keepalive_override ?? $defaults['keepalive'];
+        $allowed_ips = $allowed_ips_override ?? $defaults['allowed_ips'];
         $endpoint_host = $this->config['hostname'] ?? null;
         if ($endpoint_host === null || $endpoint_host === '') {
             $hostname = gethostname();
@@ -183,14 +197,14 @@ class ConfigBuilder
             if (preg_match('/^(\S+)\s*=\s*(.+)$/', $line, $m)) {
                 $key = $m[1];
                 $value = trim($m[2]);
-                if ($section === 'interface' && $key === 'PrivateKey') {
-                    $result['PrivateKey'] = $value;
+                if ($section === 'interface' && in_array($key, ['PrivateKey', 'DNS'], true)) {
+                    $result[$key] = $value;
                 }
                 if ($section === 'interface' && $key === 'Address') {
                     $result['Address'] = explode('/', $value, 2)[0];
                 }
-                if ($section === 'peer' && $key === 'PresharedKey') {
-                    $result['PresharedKey'] = $value;
+                if ($section === 'peer' && in_array($key, ['PresharedKey', 'AllowedIPs', 'PersistentKeepalive'], true)) {
+                    $result[$key] = $value;
                 }
             }
         }

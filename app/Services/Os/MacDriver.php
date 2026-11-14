@@ -2,15 +2,10 @@
 
 namespace App\Services\Os;
 
-use App\Services\ConfigBuilder;
-use App\Services\Shell;
+use App\Services\IpAllocator;
 
-class MacDriver implements OsDriver
+class MacDriver extends BaseDriver
 {
-    public function __construct(
-        protected Shell $shell,
-    ) {}
-
     public function cpu(): array
     {
         $cores = (int) $this->shell->run('sysctl -n hw.ncpu');
@@ -37,7 +32,9 @@ class MacDriver implements OsDriver
             $wired = (int) $matches[1];
         }
 
-        $used = (int) (($active + $wired) * 4096 / 1024);
+        // 16384 on Apple Silicon, 4096 on Intel
+        $page_size = preg_match('/page size of (\d+) bytes/', $vmstat, $matches) ? (int) $matches[1] : 4096;
+        $used = (int) (($active + $wired) * $page_size / 1024);
         $free = $total - $used;
         $usage = $total > 0 ? (int) round($used / $total * 100) : 0;
 
@@ -60,16 +57,6 @@ class MacDriver implements OsDriver
             'free' => (int) ($parts[3] ?? 0),
             'usage' => (int) preg_replace('/\s*%/', '', $parts[4] ?? '0'),
         ];
-    }
-
-    public function publicIpv4(string $ip_service): ?string
-    {
-        return $this->shell->tryRun('curl -4 -s --max-time 5 :url', ['url' => $ip_service]);
-    }
-
-    public function publicIpv6(string $ip_service): ?string
-    {
-        return $this->shell->tryRun('curl -6 -s --max-time 5 :url', ['url' => $ip_service]);
     }
 
     public function networkInterfaces(): array
@@ -124,10 +111,21 @@ class MacDriver implements OsDriver
         return php_uname('m') === 'arm64' ? $arm_path : $intel_path;
     }
 
+    public function resolveInterface(string $link): string
+    {
+        // Written by wireguard-go (mode 0400, so it needs sudo) and removed by `wg-quick down`
+        $real = $this->shell->tryRun('sudo cat :path', ['path' => "/var/run/wireguard/{$link}.name"]);
+
+        return $real !== null && preg_match('/^utun\d+$/', $real) ? $real : $link;
+    }
+
+    /**
+     * Rules live in the pf anchor `wg/<link>`. In wg-quick hooks on macOS `%i` expands to the
+     * real utunN and `%I` to the link name, so the anchor uses `%I` (matching applyFirewall()
+     * and clearFirewall()) while the rules use `%i`.
+     */
     public function interfaceSection(string $address, string $privkey, int $port, string $ifout, bool $forward = false, bool $nat = false): string
     {
-        $anchor = 'wg/%i';
-
         $lines = [
             '[Interface]',
             "Address = {$address}",
@@ -135,162 +133,35 @@ class MacDriver implements OsDriver
             "ListenPort = {$port}",
         ];
 
-        if ($forward || $nat) {
-            $rules = [];
-            if ($forward) {
-                $rules[] = 'pass in on %i all';
-                $rules[] = 'pass out on %i all';
-            }
-            if ($nat) {
-                $rules[] = "nat on {$ifout} from {$address} to any -> ({$ifout})";
-            }
-
-            $post_up = 'echo "'.implode("\n", $rules)."\" | pfctl -a \"{$anchor}\" -f -; pfctl -e 2>/dev/null || true";
-            $post_down = "pfctl -a \"{$anchor}\" -F all 2>/dev/null || true";
-
-            $lines[] = "PostUp = {$post_up}";
-            $lines[] = "PostDown = {$post_down}";
+        $rules = $this->firewallRules('%i', $address, $ifout, $forward, $nat);
+        if ($rules !== []) {
+            // A wg-quick value can't span lines, so printf emits one rule per line for pfctl.
+            // `&&` makes a rejected ruleset fail `wg-quick up` instead of passing silently.
+            $printf = "printf '%s\\n' ".implode(' ', array_map('escapeshellarg', $rules));
+            $lines[] = "PostUp = {$printf} | pfctl -a 'wg/%I' -f - && { pfctl -e 2>/dev/null || true; }";
+            $lines[] = "PostDown = pfctl -a 'wg/%I' -F all 2>/dev/null || true";
         }
 
         return implode("\n", $lines);
     }
 
-    public function enableForward(string $name): void
+    public function applyFirewall(string $link, string $iface, string $address, string $ifout, bool $forward, bool $nat): void
     {
-        $anchor = "wg/{$name}";
-        $rules = $this->getCurrentAnchorRules($anchor);
-        $rules[] = "pass in on {$name} all";
-        $rules[] = "pass out on {$name} all";
-        $this->loadAnchorRules($anchor, $rules);
-    }
-
-    public function disableForward(string $name): void
-    {
-        $anchor = "wg/{$name}";
-        $rules = $this->getCurrentAnchorRules($anchor);
-        $rules = array_values(array_filter($rules, fn (string $r) => ! str_starts_with($r, 'pass ')));
-        $this->loadAnchorRules($anchor, $rules);
-    }
-
-    public function enableNat(string $name, string $ifout): void
-    {
-        $anchor = "wg/{$name}";
-        $address = $this->interfaceAddress($name) ?? '0.0.0.0/0';
-        $rules = $this->getCurrentAnchorRules($anchor);
-        $rules[] = "nat on {$ifout} from {$address} to any -> ({$ifout})";
-        $this->loadAnchorRules($anchor, $rules);
-    }
-
-    public function disableNat(string $name, string $ifout): void
-    {
-        $anchor = "wg/{$name}";
-        $rules = $this->getCurrentAnchorRules($anchor);
-        $rules = array_values(array_filter($rules, fn (string $r) => ! str_starts_with($r, 'nat ')));
-        $this->loadAnchorRules($anchor, $rules);
-    }
-
-    protected function getCurrentAnchorRules(string $anchor): array
-    {
-        $output = $this->shell->tryRun('sudo pfctl -a :anchor -s rules 2>/dev/null', ['anchor' => $anchor]);
-        $nat = $this->shell->tryRun('sudo pfctl -a :anchor -s nat 2>/dev/null', ['anchor' => $anchor]);
-
-        $rules = [];
-        foreach ([$nat, $output] as $block) {
-            if ($block !== null && trim($block) !== '') {
-                foreach (explode("\n", trim($block)) as $line) {
-                    $line = trim($line);
-                    if ($line !== '') {
-                        $rules[] = $line;
-                    }
-                }
-            }
-        }
-
-        return $rules;
-    }
-
-    protected function loadAnchorRules(string $anchor, array $rules): void
-    {
+        $rules = $this->firewallRules($iface, $address, $ifout, $forward, $nat);
         if ($rules === []) {
-            $this->shell->tryRun('sudo pfctl -a :anchor -F all 2>/dev/null', ['anchor' => $anchor]);
+            $this->clearFirewall($link);
 
             return;
         }
 
-        $content = implode("\n", $rules);
-        $tmp = tempnam(sys_get_temp_dir(), 'pfctl_');
-        file_put_contents($tmp, $content."\n");
-
-        try {
-            $this->shell->run('sudo pfctl -a :anchor -f :tmp', ['anchor' => $anchor, 'tmp' => $tmp]);
-            $this->shell->tryRun('sudo pfctl -e 2>/dev/null');
-        } finally {
-            @unlink($tmp);
-        }
+        // Loading a ruleset into an anchor replaces everything previously in it
+        $this->shell->run('sudo pfctl -a :anchor -f -', ['anchor' => "wg/{$link}"], implode("\n", $rules)."\n");
+        $this->shell->tryRun('sudo pfctl -e');
     }
 
-    public function writeConfig(string $name, string $content): void
+    public function clearFirewall(string $link): void
     {
-        $dir = $this->configPath();
-        $path = "{$dir}/{$name}.conf";
-
-        $tmp = tempnam(sys_get_temp_dir(), 'wg_');
-        file_put_contents($tmp, $content."\n");
-        chmod($tmp, 0600);
-
-        $this->shell->run('sudo mkdir -p :dir && sudo cp :tmp :path && sudo chmod 600 :path', [
-            'dir' => $dir,
-            'tmp' => $tmp,
-            'path' => $path,
-        ]);
-        @unlink($tmp);
-    }
-
-    public function deleteConfig(string $name): void
-    {
-        $path = $this->configPath()."/{$name}.conf";
-        $this->shell->tryRun('sudo rm -f :path', ['path' => $path]);
-    }
-
-    public function readConfig(string $name): ?string
-    {
-        $path = $this->configPath()."/{$name}.conf";
-
-        return $this->shell->tryRun('sudo cat :path', ['path' => $path]);
-    }
-
-    public function configExists(string $name): bool
-    {
-        $path = $this->configPath()."/{$name}.conf";
-
-        return $this->shell->tryRun('sudo test -f :path && echo 1', ['path' => $path]) === '1';
-    }
-
-    public function listConfigNames(): array
-    {
-        $output = $this->shell->tryRun('sudo ls :path', ['path' => $this->configPath()]);
-        if ($output === null || $output === '') {
-            return [];
-        }
-
-        $names = [];
-        foreach (explode("\n", trim($output)) as $file) {
-            if (str_ends_with($file, '.conf')) {
-                $names[] = basename($file, '.conf');
-            }
-        }
-
-        return $names;
-    }
-
-    public function parseConfig(string $name): ?array
-    {
-        $content = $this->readConfig($name);
-        if ($content === null) {
-            return null;
-        }
-
-        return ConfigBuilder::parseMetadata($content);
+        $this->shell->tryRun('sudo pfctl -a :anchor -F all', ['anchor' => "wg/{$link}"]);
     }
 
     public function startInterface(string $name): void
@@ -303,40 +174,24 @@ class MacDriver implements OsDriver
         $this->shell->run('sudo wg-quick down :name', ['name' => $name]);
     }
 
-    public function writeClientConfig(string $link, string $key, string $content): void
+    /**
+     * pf rejects a ruleset whose translation (nat) rules come after filter (pass) rules.
+     */
+    protected function firewallRules(string $iface, string $address, string $ifout, bool $forward, bool $nat): array
     {
-        $dir = $this->configPath()."/clients/{$link}";
-        $path = "{$dir}/{$key}.conf";
+        $rules = [];
 
-        $tmp = tempnam(sys_get_temp_dir(), 'wg_client_');
-        file_put_contents($tmp, $content."\n");
-        chmod($tmp, 0600);
+        if ($nat) {
+            $network = IpAllocator::networkCidr($address);
+            $rules[] = "nat on {$ifout} from {$network} to any -> ({$ifout})";
+        }
 
-        $this->shell->run('sudo mkdir -p :dir && sudo cp :tmp :path && sudo chmod 600 :path', [
-            'dir' => $dir,
-            'tmp' => $tmp,
-            'path' => $path,
-        ]);
-        @unlink($tmp);
-    }
+        if ($forward) {
+            $rules[] = "pass in on {$iface} all";
+            $rules[] = "pass out on {$iface} all";
+        }
 
-    public function readClientConfig(string $link, string $key): ?string
-    {
-        $path = $this->configPath()."/clients/{$link}/{$key}.conf";
-
-        return $this->shell->tryRun('sudo cat :path', ['path' => $path]);
-    }
-
-    public function deleteClientConfig(string $link, string $key): void
-    {
-        $path = $this->configPath()."/clients/{$link}/{$key}.conf";
-        $this->shell->tryRun('sudo rm -f :path', ['path' => $path]);
-    }
-
-    public function deleteClientConfigDir(string $link): void
-    {
-        $dir = $this->configPath()."/clients/{$link}";
-        $this->shell->tryRun('sudo rm -rf :dir', ['dir' => $dir]);
+        return $rules;
     }
 
     protected function hexMaskToCidr(string $hex): int
