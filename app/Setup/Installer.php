@@ -5,6 +5,7 @@ namespace App\Setup;
 use App\Services\Shell;
 use App\Setup\Steps\AppArmor;
 use App\Setup\Steps\Environment;
+use App\Setup\Steps\FirewallRepair;
 use App\Setup\Steps\Forwarding;
 use App\Setup\Steps\Health;
 use App\Setup\Steps\Helper;
@@ -55,6 +56,7 @@ class Installer
             new Helper($this->shell),
             new Sudoers($this->shell),
             new AppArmor($this->shell),
+            new FirewallRepair($this->shell),
             new Shortcut($this->shell),
             $server,
             new Health($this->shell, $server),

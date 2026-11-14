@@ -105,7 +105,7 @@ abstract class BaseDriver implements OsDriver
 
     // ─── Link configs ───────────────────────────────────────────────
 
-    public function interfaceSection(string $address, string $privkey, int $port, string $ifout, bool $forward = false, bool $nat = false): string
+    public function interfaceSection(string $address, string $privkey, int $port, string $ifout, bool $forward = false, bool $nat = false, ?int $mtu = null): string
     {
         $lines = [
             '[Interface]',
@@ -113,6 +113,9 @@ abstract class BaseDriver implements OsDriver
             "PrivateKey = {$privkey}",
             "ListenPort = {$port}",
         ];
+        if ($mtu !== null) {
+            $lines[] = "MTU = {$mtu}";
+        }
 
         if ($forward || $nat) {
             [$link, $iface] = $this->hookPlaceholders();
@@ -184,6 +187,11 @@ abstract class BaseDriver implements OsDriver
     public function applyFirewall(string $link, string $iface): void
     {
         $this->helper('firewall-up :link :iface', ['link' => $link, 'iface' => $iface]);
+    }
+
+    public function firewallIntact(string $link, string $iface): bool
+    {
+        return $this->helper('firewall-check :link :iface', ['link' => $link, 'iface' => $iface]) === 'ok';
     }
 
     public function clearFirewall(string $link): void

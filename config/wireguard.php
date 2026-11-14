@@ -13,12 +13,13 @@ return [
     'hostname' => env('WIREGUARD_HOSTNAME'),
 
     'templates' => [
-        // Client-side configuration template
+        // Client-side configuration template. A line whose value doesn't exist is left out (MTU, PresharedKey).
         'client' => <<<'CONF'
 [Interface]
 PrivateKey = {privkey}
 Address = {address}
 DNS = {dns}
+MTU = {mtu}
 
 [Peer]
 PublicKey = {pubkey}

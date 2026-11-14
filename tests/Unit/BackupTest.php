@@ -258,13 +258,13 @@ it('backs up a hand-written config but does not restore it', function () {
 
     $payload = $rig->backup->create();
 
-    expect($rig->backup->links($payload)['office']['unmanaged'])->toBe(['MTU', 'PostUp', 'comments', 'Endpoint', 'PersistentKeepalive'])
+    expect($rig->backup->links($payload)['office']['unmanaged'])->toBe(['Table', 'PostUp', 'comments', 'PersistentKeepalive'])
         ->and($rig->backup->links($payload)['wg0']['unmanaged'])->toBe([]);
 
     // Rebuilding it for another server would drop those settings
     $new = new Rig('linux');
     expect($new->backup->problems($payload, 'office'))->toHaveCount(1)
-        ->and($new->backup->problems($payload, 'office')[0])->toContain("has settings this app doesn't manage (MTU, PostUp, comments, Endpoint, PersistentKeepalive)")
+        ->and($new->backup->problems($payload, 'office')[0])->toContain("has settings this app doesn't manage (Table, PostUp, comments, PersistentKeepalive)")
         ->and(fn () => $new->backup->restore($payload, ['office' => 'restore']))->toThrow(ConflictException::class, "doesn't manage")
         ->and($new->host->files())->toBe([]);
 });
@@ -292,7 +292,11 @@ it('exports the stored client config of each peer', function () {
 it('restores what peers had of their own from a backup made before that was stored with them', function () {
     [$old, $peers] = backedUpServer('linux'); // one peer with its own DNS, 9.9.9.9
     $payload = $old->backup->create();
+    // Then: no peer settings in the link config, and whole client configs in the backup
     $payload['links']['wg0']['conf'] = asFormat1($payload['links']['wg0']['conf']);
+    foreach ([$peers['plain'], $peers['custom']] as $peer) {
+        $payload['links']['wg0']['clients'][KeyManager::pubkeyToSafe($peer->public_key)] = $old->wg->getPeerConfig('wg0', $peer->public_key);
+    }
     expect($payload['links']['wg0']['conf'])->not->toContain('9.9.9.9');
     $new = new Rig('linux', hostname: 'new.example.test');
 
@@ -302,4 +306,35 @@ it('restores what peers had of their own from a backup made before that was stor
         ->and($new->wg->getLink('wg0')->peers[0]->dns)->toBeNull()
         ->and($new->wg->getPeerConfig('wg0', $peers['custom']->public_key))->toContain("DNS = 9.9.9.9\n", 'Endpoint = new.example.test:51820')
         ->and($new->wg->getPeerConfig('wg0', $peers['plain']->public_key))->toContain("DNS = 8.8.8.8\n");
+});
+
+it('restores the keys of the peers, and the MTU and remotes of the link', function () {
+    $old = new Rig('linux');
+    $old->wg->createLink('wg0', '10.0.0.1/24', 51820, mtu: 1380);
+    $peer = $old->wg->addPeer('wg0', remote: 'branch.example.com:51820');
+    $new = new Rig('mac', hostname: 'new.example.test');
+
+    $report = $new->backup->restore($old->backup->create(), ['wg0' => 'restore']);
+
+    $link = $new->wg->getLink('wg0');
+    expect($report['clients'])->toBe(1)
+        ->and($link->mtu)->toBe(1380)
+        ->and($link->peers[0]->remote)->toBe('branch.example.com:51820')
+        ->and(array_values($new->host->clients)[0])->toContain("PrivateKey = {$peer->private_key}")->not->toContain('Endpoint')
+        ->and($new->wg->getPeerConfig('wg0', $peer->public_key))->toContain("PrivateKey = {$peer->private_key}\n", 'Endpoint = new.example.test:51820', "MTU = 1380\n");
+});
+
+it('does not restore networks that cover an address this server needs itself', function () {
+    $old = new Rig('linux');
+    $old->wg->createLink('wg0', '10.0.0.1/24', 51820);
+    $old->wg->addPeer('wg0', networks: '192.168.50.0/24');
+    $payload = $old->backup->create();
+    // On the old server that was a branch office; here it is this server's own LAN
+    $payload['links']['wg0']['conf'] = str_replace('192.168.50.0/24', '192.0.2.0/24', $payload['links']['wg0']['conf']);
+    $new = new Rig('linux');
+
+    expect($new->backup->problems($payload, 'wg0'))->toHaveCount(1)
+        ->and($new->backup->problems($payload, 'wg0')[0])->toStartWith('192.0.2.0/24 covers 192.0.2.10, an address this server uses itself')
+        ->and(fn () => $new->backup->restore($payload, ['wg0' => 'restore']))->toThrow(ConflictException::class, 'covers 192.0.2.10')
+        ->and($new->host->files())->toBe([]);
 });

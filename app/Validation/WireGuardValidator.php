@@ -177,6 +177,33 @@ class WireGuardValidator
         }
     }
 
+    /**
+     * A link's MTU. IPv6 needs at least 1280 (so does a dual-stack link's interface).
+     */
+    public function validateMtu(int $mtu, bool $ipv6 = false): void
+    {
+        $min = $ipv6 ? 1280 : 576;
+        if ($mtu < $min || $mtu > 65535) {
+            throw new InvalidArgumentException("Invalid MTU: {$mtu} (it must be {$min} to 65535".($ipv6 ? ', as the link has an IPv6 address)' : ')'));
+        }
+    }
+
+    /**
+     * Where the server reaches a peer it has to connect to itself: host:port, with the host an
+     * IPv4 address, a name, or an IPv6 address in brackets. Returns it as it is written.
+     */
+    public function remote(string $remote): string
+    {
+        $remote = trim($remote);
+        if (! preg_match('/^(?:\[([0-9A-Fa-f:]+)\]|([A-Za-z0-9.-]+)):(\d{1,5})$/', $remote, $m)
+            || ((int) $m[3] < 1 || (int) $m[3] > 65535)
+            || ($m[1] !== '' ? ! filter_var($m[1], FILTER_VALIDATE_IP, FILTER_FLAG_IPV6) : ! filter_var($m[2], FILTER_VALIDATE_IP, FILTER_FLAG_IPV4) && ! $this->isHostname($m[2]))) {
+            throw new InvalidArgumentException("Invalid remote (host:port, an IPv6 address in brackets): {$remote}");
+        }
+
+        return ($m[1] !== '' ? '['.inet_ntop(inet_pton($m[1])).']' : $m[2]).':'.(int) $m[3];
+    }
+
     public function validateKeepalive(int $seconds): void
     {
         if ($seconds < 0 || $seconds > 65535) {

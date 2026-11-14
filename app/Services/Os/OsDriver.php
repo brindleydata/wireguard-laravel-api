@@ -50,6 +50,14 @@ interface OsDriver
      */
     public function defaultOutboundInterface(): string;
 
+    /**
+     * The addresses the server needs to stay reachable itself, of either family: those of its
+     * interfaces, and its default gateway. No route to a peer may cover them.
+     *
+     * @return list<string>
+     */
+    public function ownAddresses(): array;
+
     // ─── Root helper ────────────────────────────────────────────────
 
     /**
@@ -111,7 +119,7 @@ interface OsDriver
      * The [Interface] section of a wg-quick config. With forward or NAT on, its PostUp/PostDown
      * hooks call the helper's firewall commands (the only hooks the helper accepts).
      */
-    public function interfaceSection(string $address, string $privkey, int $port, string $ifout, bool $forward = false, bool $nat = false): string;
+    public function interfaceSection(string $address, string $privkey, int $port, string $ifout, bool $forward = false, bool $nat = false, ?int $mtu = null): string;
 
     /**
      * Write a wg-quick .conf (0600). The helper rejects anything the app wouldn't generate.
@@ -159,6 +167,12 @@ interface OsDriver
      * (clearing them when both are off). The PostUp hook does the same.
      */
     public function applyFirewall(string $link, string $iface): void;
+
+    /**
+     * Whether a running link still has the forward/NAT rules its config asks for. Another tool
+     * can take them away (a ruleset reload that flushes everything, a firewall restart).
+     */
+    public function firewallIntact(string $link, string $iface): bool;
 
     /**
      * Remove a link's forward/NAT rules. Never throws.

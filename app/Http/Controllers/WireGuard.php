@@ -65,6 +65,7 @@ class WireGuard extends Controller
             'forward' => 'nullable|boolean',
             'nat' => 'nullable|boolean',
             'up' => 'nullable|boolean',
+            'mtu' => 'nullable|integer|min:576|max:65535',  // for the interface and its clients
         ]);
 
         $link = $this->wg->createLink(
@@ -79,6 +80,7 @@ class WireGuard extends Controller
             $data['nat'] ?? false,
             $data['up'] ?? true,
             $data['address6'] ?? null,
+            $data['mtu'] ?? null,
         );
 
         return response()->json($link->toArray(), 201);
@@ -105,12 +107,13 @@ class WireGuard extends Controller
             'nat' => 'nullable|boolean',
             'up' => 'nullable|boolean',
             'move_peers' => 'nullable|boolean',  // with a new address: peers keep their host number in it
+            'mtu' => 'nullable|integer|min:576|max:65535',  // null: wg-quick's own again
         ]);
 
         // Only the fields that were sent. For most a null says nothing; for these it is a value:
         // no IPv6 address, or the global default instead of the link's own
         $params = array_filter($data, fn ($v) => $v !== null);
-        foreach (['address6', 'dns', 'keepalive', 'allowed_ips'] as $field) {
+        foreach (['address6', 'dns', 'keepalive', 'allowed_ips', 'mtu'] as $field) {
             if ($request->exists($field)) {
                 $params[$field] = $data[$field] ?? null;
             }
@@ -119,6 +122,12 @@ class WireGuard extends Controller
         $link = $this->wg->updateLink($name, $params);
 
         return $link->toArray();
+    }
+
+    /** Put a running link's forward/NAT rules back, when another tool took them away. */
+    public function linkRepair(string $name): array
+    {
+        return $this->wg->repairLink($name)->toArray();
     }
 
     public function peers(string $link): array
@@ -132,15 +141,27 @@ class WireGuard extends Controller
         return array_map(fn ($p) => $p->toArray(), $info->peers);
     }
 
+    public function peer(string $link, string $pubkey): array
+    {
+        $peer = $this->wg->getPeer($link, $pubkey);
+
+        if ($peer === null) {
+            abort(404, "Peer not found on {$link}");
+        }
+
+        return $peer->toArray();
+    }
+
     public function peerCreate(Request $request, string $link): JsonResponse
     {
         $data = $request->validate([
             'ip' => 'nullable|string',
             'name' => 'nullable|string',      // a label
             'networks' => 'nullable|string',  // networks behind the peer (site-to-site)
+            'remote' => 'nullable|string',    // host:port the server connects to (else the peer connects)
         ]);
 
-        $peer = $this->wg->addPeer($link, $data['ip'] ?? null, $data['name'] ?? null, $data['networks'] ?? null);
+        $peer = $this->wg->addPeer($link, $data['ip'] ?? null, $data['name'] ?? null, $data['networks'] ?? null, $data['remote'] ?? null);
 
         return response()->json($peer->toArray(), 201);
     }
@@ -163,10 +184,11 @@ class WireGuard extends Controller
             'name' => 'nullable|string',        // a label; null removes it
             'enabled' => 'nullable|boolean',    // false takes the peer off the interface
             'networks' => 'nullable|string',    // networks behind the peer; null removes them
+            'remote' => 'nullable|string',      // host:port the server connects to; null: the peer connects
         ]);
 
         $params = array_filter($data, fn ($v) => $v !== null);
-        foreach (['name', 'networks', 'dns', 'allowed_ips', 'keepalive'] as $field) {
+        foreach (['name', 'networks', 'remote', 'dns', 'allowed_ips', 'keepalive'] as $field) {
             if ($request->exists($field)) {
                 $params[$field] = $data[$field] ?? null;
             }
@@ -178,10 +200,15 @@ class WireGuard extends Controller
         return $peer->toArray();
     }
 
+    /** New keys for a peer. Its public key changes: the answer has the new one, and the new client config. */
+    public function peerRekey(string $link, string $pubkey): array
+    {
+        return $this->wg->rekeyPeer($link, WireGuardService::safeToPubkey($pubkey))->toArray();
+    }
+
     public function peerConfig(string $link, string $pubkey): array
     {
-        $decoded = WireGuardService::safeToPubkey($pubkey);
-        $config = $this->wg->getPeerConfig($link, $decoded);
+        $config = $this->wg->getPeerConfig($link, $pubkey);
 
         if ($config === null) {
             abort(404, "Configuration not found for peer on {$link}");
@@ -193,7 +220,7 @@ class WireGuard extends Controller
     /** The client config as a QR code (SVG) for the WireGuard apps. It holds the private key. */
     public function peerQr(QrCode $qr, string $link, string $pubkey): Response
     {
-        $config = $this->wg->getPeerConfig($link, WireGuardService::safeToPubkey($pubkey));
+        $config = $this->wg->getPeerConfig($link, $pubkey);
 
         if ($config === null) {
             abort(404, "Configuration not found for peer on {$link}");

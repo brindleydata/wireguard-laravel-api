@@ -2,6 +2,7 @@
 
 use App\Services\KeyManager;
 use Symfony\Component\Process\Process;
+use Tests\Fakes\FakeHost;
 use Tests\TestCase;
 
 /*
@@ -29,8 +30,9 @@ function helperVersion(): string
 }
 
 /**
- * A wg-quick config written by hand, with what the app doesn't write: an MTU, a hook of its
- * own, a comment, and a peer the server dials.
+ * A wg-quick config written by hand, with what the app doesn't write: a routing table setting,
+ * a hook of its own, a comment, and a keepalive other than the one the app uses for a peer the
+ * server connects to.
  */
 function handWrittenConf(): string
 {
@@ -41,7 +43,7 @@ function handWrittenConf(): string
         'Address = 10.7.0.1/24',
         'PrivateKey = '.$keys->genkey(),
         'ListenPort = 51900',
-        'MTU = 1380',
+        'Table = off',
         'PostUp = /usr/local/bin/my-routes up',
         '',
         '[Peer]',
@@ -49,16 +51,21 @@ function handWrittenConf(): string
         'PublicKey = '.$keys->pubkey($keys->genkey()),
         'AllowedIPs = 10.7.0.2/32, 192.168.9.0/24',
         'Endpoint = branch.example.com:51820',
-        'PersistentKeepalive = 25',
+        'PersistentKeepalive = 15',
     ]);
 }
 
 /**
  * A link config as written before format 2: no format line, and nothing of a peer's own client
- * settings in its section (they only showed in its client config).
+ * settings in its section. They only showed in its client config, which was stored whole then:
+ * store $clients (public key => client config, as getPeerConfig() builds it) the same way.
  */
-function asFormat1(string $conf): string
+function asFormat1(string $conf, ?FakeHost $host = null, string $link = '', array $clients = []): string
 {
+    foreach ($clients as $pubkey => $config) {
+        $host->clients[$link.'/'.KeyManager::pubkeyToSafe($pubkey)] = $config;
+    }
+
     [$header, $sections] = explode('[Interface]', $conf, 2);
 
     return preg_replace('/^# format = .*\n/m', '', $header).'[Interface]'.preg_replace('/^# (dns|keepalive|allowed_ips) = .*\n/m', '', $sections);

@@ -5,6 +5,7 @@ use App\Setup\EnvFile;
 use App\Setup\Installer;
 use App\Setup\Steps\AppArmor;
 use App\Setup\Steps\Environment;
+use App\Setup\Steps\FirewallRepair;
 use App\Setup\Steps\Forwarding;
 use App\Setup\Steps\Helper;
 use App\Setup\Steps\Permissions;
@@ -667,3 +668,44 @@ it('takes the newest release, not a pre-release, as the latest', function (strin
     ['v1.0.0-rc1', null],
     ['', null],
 ]);
+
+// ─── Firewall rules kept in place ───────────────────────────────────
+
+it('has the root helper put missing firewall rules back every minute', function () {
+    $ctx = setupContext();
+    $shell = (new FakeShell)->otherwise(fn () => throw new CommandFailed);
+    $step = new FirewallRepair($shell);
+
+    expect($step->applies($ctx))->toBeTrue()
+        ->and($step->applies(setupContext('mac')))->toBeFalse('systemd only')
+        ->and($step->service($ctx))->toContain("ExecStart={$ctx->helperPath} firewall-repair\n", "Type=oneshot\n", "LogLevelMax=notice\n")
+        ->and($step->timer())->toContain("OnUnitActiveSec=1min\n", "WantedBy=timers.target\n")
+        ->and($step->check($ctx))->toBe(['The timer that puts missing firewall rules back is not installed, or its settings changed']);
+
+    $commands = array_map(fn ($action) => $action->command, $step->plan($ctx));
+    expect($commands[0])->toContain("sudo install -o root -g root -m 644 \"\$tmp/service\" '{$ctx->system(FirewallRepair::SERVICE)}'", "'{$ctx->system(FirewallRepair::TIMER)}'")
+        ->and($commands[1])->toBe('sudo systemctl daemon-reload && sudo systemctl enable wgla-firewall.timer 2> /dev/null && sudo systemctl restart wgla-firewall.timer');
+
+    mkdir(dirname($ctx->system(FirewallRepair::SERVICE)), 0755, true);
+    file_put_contents($ctx->system(FirewallRepair::SERVICE), $step->service($ctx));
+    file_put_contents($ctx->system(FirewallRepair::TIMER), $step->timer());
+    expect($step->check($ctx))->toBe(['The timer that puts missing firewall rules back is not enabled and running']);
+
+    $shell->on('systemctl is-enabled wgla-firewall.timer', fn () => 'enabled')->on('systemctl is-active wgla-firewall.timer', fn () => 'active');
+    expect($step->check($ctx))->toBe([]);
+});
+
+it('writes the timer units the printed command says it writes', function () {
+    $ctx = setupContext();
+    $step = new FirewallRepair(new FakeShell);
+    // The same command, installing as this user into the temp root instead of as root into /etc
+    $command = str_replace('sudo install -o root -g root -m 644', 'install -m 644', $step->plan($ctx)[0]->command);
+    mkdir(dirname($ctx->system(FirewallRepair::SERVICE)), 0755, true);
+
+    $process = Process::fromShellCommandline($command);
+    $process->run();
+
+    expect($process->getExitCode())->toBe(0, $process->getErrorOutput())
+        ->and(file_get_contents($ctx->system(FirewallRepair::SERVICE)))->toBe($step->service($ctx))
+        ->and(file_get_contents($ctx->system(FirewallRepair::TIMER)))->toBe($step->timer());
+});

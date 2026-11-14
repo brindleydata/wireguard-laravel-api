@@ -134,3 +134,25 @@ it('rejects link addresses that would break routing', function (string $address,
     'IPv6' => ['fd12::1/64', 'Invalid CIDR'],
     'an octet with a leading zero' => ['10.0.0.01/24', 'Invalid IPv4 address'],
 ]);
+
+it('takes where to connect to a peer as host:port', function (string $given, string $written) {
+    expect((new WireGuardValidator)->remote($given))->toBe($written);
+})->with([
+    ['203.0.113.7:51820', '203.0.113.7:51820'],
+    [' branch.example.com:51820 ', 'branch.example.com:51820'],
+    ['[2001:DB8:0::7]:1', '[2001:db8::7]:1'],
+]);
+
+it('rejects a remote that is no host and port', function (string $remote) {
+    expect(fn () => (new WireGuardValidator)->remote($remote))->toThrow(InvalidArgumentException::class, 'Invalid remote');
+})->with(['branch.example.com', '203.0.113.7:0', '203.0.113.7:70000', '2001:db8::7:51820', '[203.0.113.7]:51820', 'branch.example.com:51820;id', "a.example.com:1\nPostUp = id", '-bad.example:1']);
+
+it('bounds a link\'s MTU', function () {
+    $validator = new WireGuardValidator;
+
+    expect(fn () => $validator->validateMtu(576))->not->toThrow(InvalidArgumentException::class)
+        ->and(fn () => $validator->validateMtu(1280, ipv6: true))->not->toThrow(InvalidArgumentException::class)
+        ->and(fn () => $validator->validateMtu(575))->toThrow(InvalidArgumentException::class)
+        ->and(fn () => $validator->validateMtu(1279, ipv6: true))->toThrow(InvalidArgumentException::class, '1280')
+        ->and(fn () => $validator->validateMtu(65536))->toThrow(InvalidArgumentException::class);
+});

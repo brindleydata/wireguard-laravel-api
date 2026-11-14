@@ -89,11 +89,27 @@ check "nftables: NAT only for the VPN subnet" "nft list table inet wg_e2e0 | gre
 check "nftables: NAT66 only for the VPN prefix" "nft list table inet wg_e2e0 | grep -q 'ip6 saddr fd80::/64 oifname \"e2e-fh\" masquerade'"
 check "IPv6 forwarding is on (wg:install)" "[ \"\$(sysctl -n net.ipv6.conf.all.forwarding)\" = 1 ]"
 
+step "Firewall rules that another tool took away"
+check "the repair timer runs (wg:install)" "systemctl is-active -q wgla-firewall.timer"
+# Paused for these checks: it would put the rules back by itself, any second
+systemctl stop wgla-firewall.timer
+nft delete table inet wg_e2e0
+check "the link says its rules are missing" "cli wg:link e2e0 | grep -q 'firewall rules are missing' && [ \"\$(api $URL/link/e2e0)\" = 200 ] && grep -q '\"firewall\":\"missing\"' /tmp/wgla-e2e-body"
+systemctl start wgla-firewall.service
+check "what the timer runs puts them back" "nft list table inet wg_e2e0 | grep -q 'ip saddr 10.80.0.0/24 oifname \"e2e-fh\" masquerade' && [ \"\$(api $URL/link/e2e0)\" = 200 ] && grep -q '\"firewall\":\"ok\"' /tmp/wgla-e2e-body"
+nft delete table inet wg_e2e0
+check "and so does wg:link:repair" "cli wg:link:repair e2e0 | grep -q 'are in place' && nft list table inet wg_e2e0 | grep -q 'iifname \"e2e0\" accept'"
+systemctl start wgla-firewall.timer
+
 step "A peer, and a real handshake from a client namespace"
 PEER=$(cli wg:peer:create e2e0 | peer_key)
-CLIENT=/etc/wireguard/clients/e2e0/$(safe "$PEER").conf
+KEYFILE=/etc/wireguard/clients/e2e0/$(safe "$PEER").conf
+# Only the peer's private key is stored; its client config is built when asked for
+CLIENT=/tmp/wgla-e2e-client.conf
+cli wg:peer e2e0 "$PEER" | sed -n '/^\[Interface\]/,$p' > "$CLIENT"
 check "peer live and saved" "wg show e2e0 allowed-ips | grep -q \"$PEER.*10.80.0.2/32\" && grep -q \"PublicKey = $PEER\" /etc/wireguard/e2e0.conf"
-check "client config is 0600" "[ \"\$(stat -c %a \"$CLIENT\")\" = 600 ]"
+check "the stored key is 0600, and only the key" "[ \"\$(stat -c %a \"$KEYFILE\")\" = 600 ] && grep -q '^PrivateKey = ' \"$KEYFILE\" && ! grep -q Endpoint \"$KEYFILE\""
+check "the client config has that key and this server as endpoint" "grep -qxF \"\$(grep '^PrivateKey = ' \"$KEYFILE\")\" \"$CLIENT\" && grep -q '^Endpoint = .*:51880\$' \"$CLIENT\""
 check "the peer's IPv6 address mirrors its IPv4 one" "wg show e2e0 allowed-ips | grep -q \"$PEER.*10.80.0.2/32 fd80::2/128\" && grep -qx 'Address = 10.80.0.2/32, fd80::2/128' \"$CLIENT\""
 ip netns add e2e-client
 ip link add e2e-h type veth peer name e2e-c
@@ -101,9 +117,9 @@ ip link set e2e-c netns e2e-client
 ip addr add 10.99.0.1/24 dev e2e-h; ip link set e2e-h up
 ip netns exec e2e-client sh -c 'ip addr add 10.99.0.2/24 dev e2e-c; ip link set e2e-c up; ip link set lo up'
 ip netns exec e2e-client ip link add e2ec0 type wireguard
-# The client config minus wg-quick's own keys (Address, DNS), through a pipe: Ubuntu's AppArmor
+# The client config minus wg-quick's own keys (Address, DNS, MTU), through a pipe: Ubuntu's AppArmor
 # profiles only let wg and wg-quick open files under /etc/wireguard, so no `wg-quick strip` of a copy
-grep -vE '^(Address|DNS) =' "$CLIENT" | sed 's/^Endpoint = .*/Endpoint = 10.99.0.1:51880/' \
+grep -vE '^(Address|DNS|MTU) =' "$CLIENT" | sed 's/^Endpoint = .*/Endpoint = 10.99.0.1:51880/' \
     | ip netns exec e2e-client wg setconf e2ec0 /dev/stdin
 ip netns exec e2e-client sh -c 'ip addr add 10.80.0.2/32 dev e2ec0; ip -6 addr add fd80::2/128 dev e2ec0 nodad; ip link set e2ec0 up
     ip route add 10.80.0.0/24 dev e2ec0; ip route add 10.98.0.0/24 dev e2ec0; ip -6 route add fd80::/64 dev e2ec0; ip -6 route add fd98::/64 dev e2ec0'
@@ -159,23 +175,34 @@ check "the same port is refused" "! \"\${ART[@]}\" wg:link:create e2e1 10.81.0.1
 check "an overlapping subnet is refused" "! \"\${ART[@]}\" wg:link:create e2e1 10.80.0.129/25 --port=51881"
 check "an overlapping IPv6 prefix is refused" "! \"\${ART[@]}\" wg:link:create e2e1 10.81.0.1/24 --port=51881 --address6=fd80::abcd/64"
 check "nothing was written" "[ ! -e /etc/wireguard/e2e1.conf ]"
+OWN=$(ip -4 route get 192.0.2.1 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p')
+if [ -n "$OWN" ]; then
+    check "this server's own address can't be routed to a peer" "! \"\${ART[@]}\" wg:peer:create e2e0 --networks=$OWN/32"
+else
+    echo "  skip no IPv4 route out of this host"; SKIP=$((SKIP + 1))
+fi
 
-step "Peers on a stopped link"
-cli wg:link:create e2e1 10.81.0.1/24 --port=51881 --up=false > /dev/null
-P1=$(cli wg:peer:create e2e1 | peer_key)
+step "Peers on a stopped link; an MTU, a peer the server connects to, new keys"
+cli wg:link:create e2e1 10.81.0.1/24 --port=51881 --up=false --mtu=1380 > /dev/null
+P1=$(cli wg:peer:create e2e1 --remote=10.99.0.2:51999 | peer_key)
 check "the link is not running, the peer is saved" "! wg show interfaces | grep -qw e2e1 && grep -q \"PublicKey = $P1\" /etc/wireguard/e2e1.conf"
 cli wg:link:update e2e1 --up=true > /dev/null
 check "the peer is loaded when the link starts" "wg show e2e1 peers | grep -q \"$P1\""
+check "the interface has the link's MTU" "ip link show e2e1 | grep -q 'mtu 1380'"
+check "the server connects to the peer, and keeps the path open" "wg show e2e1 endpoints | grep -q '10.99.0.2:51999' && [ \"\$(wg show e2e1 persistent-keepalive | awk '{print \$2}')\" = 25 ]"
+P2=$(cli wg:peer:rekey e2e1 "$P1" | sed -n 's/^Rekeyed peer \([^ ]*\).*/\1/p')
+check "new keys: the peer is there under its new public key only" "[ -n \"$P2\" ] && wg show e2e1 peers | grep -qF \"$P2\" && ! wg show e2e1 peers | grep -qF \"$P1\" && ! grep -qF \"$P1\" /etc/wireguard/e2e1.conf"
+check "... still with where to connect to it" "wg show e2e1 endpoints | grep -q '10.99.0.2:51999'"
 cli wg:link:update e2e1 --up=false > /dev/null
 systemctl enable wg-quick@e2e1 > /dev/null 2>&1
 cli wg:link:delete e2e1 > /dev/null
 check "deleting it also disables a leftover unit" "! systemctl is-enabled -q wg-quick@e2e1 && [ ! -e /etc/wireguard/e2e1.conf ]"
 
 step "A config written by hand"
-printf '[Interface]\nAddress = 10.83.0.1/24\nPrivateKey = %s\nListenPort = 51883\nMTU = 1380\n' "$(wg genkey)" > /etc/wireguard/e2e3.conf
+printf '[Interface]\nAddress = 10.83.0.1/24\nPrivateKey = %s\nListenPort = 51883\nTable = off\n' "$(wg genkey)" > /etc/wireguard/e2e3.conf
 chmod 600 /etc/wireguard/e2e3.conf
 check "is listed and shown" "cli wg:links | grep -qw e2e3 && cli wg:link e2e3 | grep -q '10.83.0.1/24'"
-check "but not changed: that would drop its MTU" "! \"\${ART[@]}\" wg:peer:create e2e3 && grep -qx 'MTU = 1380' /etc/wireguard/e2e3.conf"
+check "but not changed: that would drop its Table setting" "! \"\${ART[@]}\" wg:peer:create e2e3 && grep -qx 'Table = off' /etc/wireguard/e2e3.conf"
 cli wg:link:delete e2e3 > /dev/null
 check "and can be deleted" "[ ! -e /etc/wireguard/e2e3.conf ]"
 

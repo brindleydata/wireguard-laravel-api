@@ -205,6 +205,7 @@ class FakeHost
 
             return '';
         });
+        $helper('firewall-check :link :iface', fn (array $b) => $this->firewallExpected($b['link']) === ($this->firewall[$b['link']] ?? null) ? 'ok' : 'missing');
         $helper('firewall-down :link', function (array $b) {
             unset($this->firewall[$b['link']]);
 
@@ -235,17 +236,25 @@ class FakeHost
 
     protected function applyFirewall(string $link): void
     {
+        $state = $this->firewallExpected($link);
+
+        if ($state !== null) {
+            $this->firewall[$link] = $state;
+        } else {
+            unset($this->firewall[$link]);
+        }
+    }
+
+    /** The rules a link's config asks for (null: none). */
+    protected function firewallExpected(string $link): ?array
+    {
         $meta = $this->parse($this->conf($link) ?? $this->fail("no config for link {$link}"))['meta'];
         $state = ['forward' => ($meta['forward'] ?? 'false') === 'true', 'nat' => ($meta['nat'] ?? 'false') === 'true'];
         if ($state['nat'] && isset($meta['address6'])) {
             $state['nat6'] = $meta['address6'];
         }
 
-        if ($state['forward'] || $state['nat']) {
-            $this->firewall[$link] = $state;
-        } else {
-            unset($this->firewall[$link]);
-        }
+        return $state['forward'] || $state['nat'] ? $state : null;
     }
 
     // ─── wg-quick ────────────────────────────────────────────────────
@@ -367,7 +376,17 @@ class FakeHost
 
                 return implode("\n", $lines);
             })
-            ->on('ip route show default', fn () => 'default via 192.0.2.1 dev eth0 proto static');
+            ->on('ip route show default', fn () => 'default via 192.0.2.1 dev eth0 proto static')
+            ->on('ip -o address show', function () {
+                $lines = ['1: lo    inet 127.0.0.1/8 scope host lo', '2: eth0    inet 192.0.2.10/24 brd 192.0.2.255 scope global eth0', '2: eth0    inet6 2001:db8:f::10/64 scope global'];
+                foreach ($this->interfaces as $iface => $interface) {
+                    foreach (array_map('trim', explode(',', $interface['address'])) as $address) {
+                        $lines[] = "7: {$iface}    ".(str_contains($address, ':') ? 'inet6' : 'inet')." {$address} scope global {$iface}";
+                    }
+                }
+
+                return implode("\n", $lines);
+            });
     }
 
     protected function registerMac(): void
@@ -387,7 +406,19 @@ class FakeHost
                 return $output;
             })
             ->on('ifconfig -l', fn () => implode(' ', ['lo0', 'en0', ...array_keys($this->interfaces)]))
-            ->on('route -n get default 2>/dev/null', fn () => "   route to: default\ndestination: default\n  interface: en0");
+            ->on('route -n get default 2>/dev/null', fn () => "   route to: default\ndestination: default\n    gateway: 192.0.2.1\n  interface: en0")
+            ->on('ifconfig', function () {
+                $output = "lo0: flags=8049<UP,LOOPBACK,RUNNING,MULTICAST> mtu 16384\n\tinet 127.0.0.1 netmask 0xff000000\n\tinet6 fe80::1%lo0 prefixlen 64 scopeid 0x1\n"
+                    ."en0: flags=8863<UP,BROADCAST,RUNNING> mtu 1500\n\tinet 192.0.2.10 netmask 0xffffff00 broadcast 192.0.2.255\n\tinet6 2001:db8:f::10 prefixlen 64\n";
+                foreach ($this->interfaces as $iface => $interface) {
+                    $output .= "{$iface}: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1420\n";
+                    foreach (array_map('trim', explode(',', $interface['address'])) as $address) {
+                        $output .= "\t".(str_contains($address, ':') ? 'inet6' : 'inet').' '.explode('/', $address)[0]."\n";
+                    }
+                }
+
+                return $output;
+            });
     }
 
     // ─── Shared ──────────────────────────────────────────────────────

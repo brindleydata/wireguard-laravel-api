@@ -33,6 +33,7 @@ class PeerInfo
         public readonly ?string $dns = null,
         public readonly ?int $keepalive = null,
         public readonly ?string $client_allowed_ips = null,
+        public readonly ?string $remote = null,  // host:port the server connects to; null: the peer connects
     ) {}
 
     /**
@@ -43,6 +44,12 @@ class PeerInfo
     public function clientSettings(): array
     {
         return ['dns' => $this->dns, 'keepalive' => $this->keepalive, 'allowed_ips' => $this->client_allowed_ips];
+    }
+
+    /** A copy with some properties replaced. */
+    public function with(mixed ...$changes): static
+    {
+        return new static(...[...get_object_vars($this), ...$changes]);
     }
 
     /** Null while the link is down: there is nothing to know. */
@@ -64,6 +71,7 @@ class PeerInfo
             'preshared_key' => $this->preshared_key,
             'allowed_ips' => $this->allowed_ips,
             'networks' => $this->networks,
+            'remote' => $this->remote,
             'client' => $this->clientSettings(),
             'endpoint' => $this->endpoint,
             'latest_handshake_at' => $this->latest_handshake === null ? null : gmdate('Y-m-d\TH:i:s\Z', $this->latest_handshake),

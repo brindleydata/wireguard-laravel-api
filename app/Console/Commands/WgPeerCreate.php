@@ -13,6 +13,7 @@ class WgPeerCreate extends WgCommand
         {--ip= : Peer IP address within the link subnet (auto-assigned if omitted)}
         {--name= : A label for the peer}
         {--networks= : Networks behind the peer, routed to it (site-to-site), e.g. 192.168.1.0/24}
+        {--remote= : host:port the server connects to, when the peer can\'t be the one to connect}
         {--qr : Also print the client config as a QR code}';
 
     protected $description = 'Create a WireGuard peer';
@@ -23,7 +24,7 @@ class WgPeerCreate extends WgCommand
         $ip = $this->option('ip');
 
         try {
-            $peer = $wg->addPeer($link, $ip, $this->option('name'), $this->option('networks'));
+            $peer = $wg->addPeer($link, $ip, $this->option('name'), $this->option('networks'), $this->option('remote'));
         } catch (\Throwable $e) {
             $this->error($e->getMessage());
 

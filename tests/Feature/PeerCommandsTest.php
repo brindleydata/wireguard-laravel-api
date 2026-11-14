@@ -114,3 +114,53 @@ it('moves a link and its peers, and gives a peer its own keepalive', function ()
 
     expect($wg->getLink('wg0')->peers[0])->allowed_ips->toBe('10.5.0.2/32')->keepalive->toBe(7);
 });
+
+it('gives a peer new keys from the command line', function () {
+    $wg = app(WireGuard::class);
+    $old = $wg->addPeer('wg0', name: 'laptop');
+
+    $this->artisan('wg:peer:rekey', ['link' => 'wg0', 'pubkey' => $old->public_key, '--qr' => true])
+        ->expectsOutputToContain('(laptop)')
+        ->expectsOutputToContain("It was {$old->public_key}: the client config with that key no longer works.")
+        ->expectsOutputToContain('PrivateKey = ')
+        ->expectsOutputToContain('▀')
+        ->assertSuccessful();
+
+    expect($wg->getLink('wg0')->peers[0]->public_key)->not->toBe($old->public_key)
+        ->and($wg->getPeerConfig('wg0', $old->public_key))->toBeNull();
+    $this->artisan('wg:peer:rekey', ['link' => 'wg0', 'pubkey' => $old->public_key])->expectsOutputToContain('Peer not found')->assertFailed();
+});
+
+it('sets a link\'s MTU and a peer\'s remote, and shows what a link hands out', function () {
+    $wg = app(WireGuard::class);
+
+    $this->artisan('wg:link:update', ['link' => 'wg0', '--mtu' => '1380', '--dns' => '9.9.9.9'])->expectsOutputToContain('MTU: 1380')->assertSuccessful();
+    $this->artisan('wg:peer:create', ['link' => 'wg0', '--name' => 'branch', '--remote' => 'branch.example.com:51820'])
+        ->expectsOutputToContain('MTU = 1380')
+        ->assertSuccessful();
+    $this->artisan('wg:link', ['link' => 'wg0'])
+        ->expectsOutputToContain('MTU: 1380')
+        ->expectsOutputToContain('Client DNS: 9.9.9.9')
+        ->expectsOutputToContain('Client keepalive: (default)')
+        ->expectsOutputToContain('Remote: branch.example.com:51820')
+        ->assertSuccessful();
+
+    $key = $wg->getLink('wg0')->peers[0]->public_key;
+    $this->artisan('wg:peer:update', ['link' => 'wg0', 'pubkey' => $key, '--remote' => ''])->assertSuccessful();
+    $this->artisan('wg:link:update', ['link' => 'wg0', '--mtu' => ''])->expectsOutputToContain('MTU: (default)')->assertSuccessful();
+
+    expect($wg->getLink('wg0'))->mtu->toBeNull()
+        ->and($wg->getLink('wg0')->peers[0]->remote)->toBeNull();
+});
+
+it('says when a link\'s firewall rules are missing, and repairs them', function () {
+    $wg = app(WireGuard::class);
+    $wg->updateLink('wg0', ['forward' => true]);
+    unset($this->host->firewall['wg0']);
+
+    $this->artisan('wg:link', ['link' => 'wg0'])->expectsOutputToContain('Its firewall rules are missing. Put them back with: wgla link:repair wg0')->assertSuccessful();
+    $this->artisan('wg:link:repair', ['link' => 'wg0'])->expectsOutputToContain('The firewall rules of wg0 are in place.')->assertSuccessful();
+    $this->artisan('wg:link:repair', ['link' => 'nope'])->expectsOutputToContain('Link does not exist: nope')->assertFailed();
+
+    expect($this->host->firewall)->toHaveKey('wg0');
+});

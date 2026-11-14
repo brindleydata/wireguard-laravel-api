@@ -16,6 +16,7 @@ class WgLinkCreate extends WgCommand
         {--dns= : DNS server for peers (default: 8.8.8.8)}
         {--keepalive= : Persistent keepalive interval in seconds (default: 25)}
         {--allowed-ips= : Allowed IPs for peer configs (default: all traffic, 0.0.0.0/0 and ::/0 with IPv6)}
+        {--mtu= : MTU for the interface and its clients (default: wg-quick\'s, usually 1420)}
         {--forward= : Enable or disable IP forwarding (true/false)}
         {--nat= : Enable or disable NAT masquerading (true/false)}
         {--up= : Start the interface after creation (true/false, default: true)}';
@@ -37,7 +38,7 @@ class WgLinkCreate extends WgCommand
             $nat = $this->flag('nat') ?? false;
             $up = $this->flag('up') ?? true;
 
-            $link = $wg->createLink($name, $ip, $port, $ifout, $dns, $keepalive, $allowed_ips, $forward, $nat, $up, $this->option('address6'));
+            $link = $wg->createLink($name, $ip, $port, $ifout, $dns, $keepalive, $allowed_ips, $forward, $nat, $up, $this->option('address6'), $this->number('mtu'));
         } catch (\Throwable $e) {
             $this->error($e->getMessage());
 

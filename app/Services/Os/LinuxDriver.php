@@ -98,6 +98,15 @@ class LinuxDriver extends BaseDriver
         return 'eth0';
     }
 
+    public function ownAddresses(): array
+    {
+        // "2: eth0    inet 192.0.2.10/24 brd …", "2: eth0    inet6 2001:db8::10/64 scope global …"
+        preg_match_all('/\binet6? ([0-9A-Fa-f.:]+)\//', $this->shell->run('ip -o address show'), $addresses);
+        preg_match_all('/\bvia ([0-9A-Fa-f.:]+)/', (string) $this->shell->tryRun('ip route show default'), $gateways);
+
+        return array_values(array_unique([...$addresses[1], ...$gateways[1]]));
+    }
+
     public function resolveInterface(string $link): string
     {
         // A Linux link runs as an interface of the same name; no helper call needed

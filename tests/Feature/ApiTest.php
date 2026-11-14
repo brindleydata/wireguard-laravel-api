@@ -201,9 +201,9 @@ it('refuses to change a hand-written config with a 409', function () {
     $this->getJson('/link/office', $this->auth)->assertOk()->assertJsonPath('address', '10.7.0.1/24');
     $this->postJson('/link/office/peers', [], $this->auth)
         ->assertConflict()
-        ->assertJsonPath('error', fn (string $error) => str_contains($error, "has settings this app doesn't manage (MTU, PostUp, comments, Endpoint, PersistentKeepalive)"));
+        ->assertJsonPath('error', fn (string $error) => str_contains($error, "has settings this app doesn't manage (Table, PostUp, comments, PersistentKeepalive)"));
     $this->patchJson('/link/office', ['dns' => '1.1.1.1'], $this->auth)->assertConflict();
-    expect($this->host->conf('office'))->toContain('MTU = 1380', 'Endpoint = branch.example.com:51820');
+    expect($this->host->conf('office'))->toContain('Table = off', 'PersistentKeepalive = 15');
 
     $this->deleteJson('/link/office', [], $this->auth)->assertOk();
 });
@@ -349,4 +349,70 @@ it('answers 422 for a QR code of a config that is too long for one', function ()
         ->assertUnprocessable()
         ->assertJsonPath('error', 'This client config is too long for a QR code.');
     $this->getJson("/link/wg0/peer/{$safe}/config", $this->auth)->assertOk();
+});
+
+it('shows one peer, and a link\'s own settings', function () {
+    $this->postJson('/link', ['name' => 'wg0', 'ip' => '10.0.0.1/24', 'port' => 51820, 'dns' => '9.9.9.9', 'mtu' => 1380, 'forward' => true], $this->auth)
+        ->assertCreated()
+        ->assertJsonPath('mtu', 1380)
+        ->assertJsonPath('client', ['dns' => '9.9.9.9', 'keepalive' => null, 'allowed_ips' => null])
+        ->assertJsonPath('firewall', 'ok');
+    $peer = $this->postJson('/link/wg0/peers', ['name' => 'branch', 'remote' => 'branch.example.com:51820'], $this->auth)
+        ->assertCreated()
+        ->assertJsonPath('remote', 'branch.example.com:51820')
+        ->assertJsonPath('client_config', fn (string $config) => str_contains($config, "MTU = 1380\n"))
+        ->json();
+    $safe = KeyManager::pubkeyToSafe($peer['public_key']);
+
+    $this->getJson("/link/wg0/peer/{$safe}", $this->auth)
+        ->assertOk()
+        ->assertJsonPath('name', 'branch')
+        ->assertJsonPath('remote', 'branch.example.com:51820')
+        ->assertJsonPath('connected', false)
+        ->assertJsonMissingPath('private_key');
+    $this->getJson('/link/wg0/peer/'.str_repeat('A', 43), $this->auth)->assertNotFound();
+    $this->getJson("/link/wg0/peer/{$safe}")->assertForbidden();
+
+    // null takes the MTU and the remote out again
+    $this->patchJson('/link/wg0', ['mtu' => null], $this->auth)->assertOk()->assertJsonPath('mtu', null);
+    $this->patchJson("/link/wg0/peer/{$safe}", ['remote' => null], $this->auth)->assertOk()->assertJsonPath('remote', null);
+    $this->patchJson("/link/wg0/peer/{$safe}", ['remote' => 'no port'], $this->auth)->assertUnprocessable();
+    $this->patchJson('/link/wg0', ['mtu' => 100], $this->auth)->assertUnprocessable();
+});
+
+it('gives a peer new keys under a new public key', function () {
+    $this->postJson('/link', ['name' => 'wg0', 'ip' => '10.0.0.1/24', 'port' => 51820], $this->auth)->assertCreated();
+    $old = $this->postJson('/link/wg0/peers', ['name' => 'laptop'], $this->auth)->json();
+    $safe = KeyManager::pubkeyToSafe($old['public_key']);
+
+    $new = $this->postJson("/link/wg0/peer/{$safe}/rekey", [], $this->auth)
+        ->assertOk()
+        ->assertJsonPath('name', 'laptop')
+        ->assertJsonPath('allowed_ips', '10.0.0.2/32')
+        ->json();
+
+    expect($new['public_key'])->not->toBe($old['public_key'])
+        ->and($new['client_config'])->toContain("PrivateKey = {$new['private_key']}\n")->not->toContain($old['private_key']);
+    $this->getJson("/link/wg0/peer/{$safe}/config", $this->auth)->assertNotFound();
+    $this->getJson('/link/wg0/peer/'.KeyManager::pubkeyToSafe($new['public_key']).'/config', $this->auth)->assertOk()->assertJsonPath('config', $new['client_config']);
+    $this->postJson("/link/wg0/peer/{$safe}/rekey", [], $this->auth)->assertNotFound();
+});
+
+it('reports missing firewall rules and puts them back on request', function () {
+    $this->postJson('/link', ['name' => 'wg0', 'ip' => '10.0.0.1/24', 'port' => 51820, 'nat' => true], $this->auth)->assertCreated();
+    unset($this->host->firewall['wg0']); // another tool flushed the ruleset
+
+    $this->getJson('/link/wg0', $this->auth)->assertOk()->assertJsonPath('firewall', 'missing');
+    $this->postJson('/link/wg0/repair', [], $this->auth)->assertOk()->assertJsonPath('firewall', 'ok');
+    $this->postJson('/link/nope/repair', [], $this->auth)->assertNotFound();
+
+    expect($this->host->firewall['wg0'])->toBe(['forward' => false, 'nat' => true]);
+});
+
+it('refuses networks that cover an address of the server with a 422', function () {
+    $this->postJson('/link', ['name' => 'wg0', 'ip' => '10.0.0.1/24', 'port' => 51820], $this->auth)->assertCreated();
+
+    $this->postJson('/link/wg0/peers', ['networks' => '192.0.2.0/24'], $this->auth)
+        ->assertUnprocessable()
+        ->assertJsonPath('error', fn (string $error) => str_starts_with($error, '192.0.2.0/24 covers 192.0.2.10, an address this server uses itself'));
 });

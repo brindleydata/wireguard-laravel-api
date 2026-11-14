@@ -131,7 +131,7 @@ it('skips a link that cannot be restored here, and one that then clashes with it
     $this->host->confs['wg2'] = handWrittenConf();
     $file = "{$this->dir}/server.backup";
     $this->artisan('wg:backup', ['file' => $file, '--passphrase-file' => "{$this->dir}/pass"])
-        ->expectsOutputToContain("wg2 has settings this app doesn't manage (MTU, PostUp, comments, Endpoint, PersistentKeepalive). It is in the backup, but a restore will skip it")
+        ->expectsOutputToContain("wg2 has settings this app doesn't manage (Table, PostUp, comments, PersistentKeepalive). It is in the backup, but a restore will skip it")
         ->assertSuccessful();
 
     // Here now: only a link in the network that the backed-up wg1 routes

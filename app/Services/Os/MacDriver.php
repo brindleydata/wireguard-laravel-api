@@ -91,6 +91,15 @@ class MacDriver extends BaseDriver
         return 'en0';
     }
 
+    public function ownAddresses(): array
+    {
+        // "\tinet 192.0.2.10 netmask 0xffffff00 …", "\tinet6 fe80::1%lo0 prefixlen 64 …"
+        preg_match_all('/\binet6? ([0-9A-Fa-f.:]+)/', $this->shell->run('ifconfig'), $addresses);
+        preg_match_all('/gateway:\s*([0-9A-Fa-f.:]+)/', (string) $this->shell->tryRun('route -n get default 2>/dev/null'), $gateways);
+
+        return array_values(array_unique([...$addresses[1], ...array_filter($gateways[1], fn (string $gateway) => filter_var($gateway, FILTER_VALIDATE_IP) !== false)]));
+    }
+
     protected function hookPlaceholders(): array
     {
         // wg-quick on macOS expands %I to the link name and %i to the real utunN

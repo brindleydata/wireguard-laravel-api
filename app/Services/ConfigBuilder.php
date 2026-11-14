@@ -3,6 +3,7 @@
 namespace App\Services;
 
 use App\DTOs\InterfaceInfo;
+use App\DTOs\PeerInfo;
 use App\Services\Os\OsDriver;
 
 class ConfigBuilder
@@ -27,15 +28,24 @@ class ConfigBuilder
      */
     public const FORMAT = 2;
 
+    /** Seconds between the keepalives the server sends a peer it connects to itself (`remote`). */
+    public const REMOTE_KEEPALIVE = 25;
+
+    /** The client config when config('wireguard.templates.client') doesn't say otherwise. */
+    public const CLIENT_TEMPLATE = "[Interface]\nPrivateKey = {privkey}\nAddress = {address}\nDNS = {dns}\nMTU = {mtu}\n\n[Peer]\nPublicKey = {pubkey}\nPresharedKey = {psk}\nAllowedIPs = {subnets}\nEndpoint = {endpoint}\nPersistentKeepalive = {keepalive}";
+
     /** What a peer's section holds as comments (peer field => comment key): its label and client settings. */
     public const PEER_SETTINGS = ['name' => 'name', 'dns' => 'dns', 'keepalive' => 'keepalive', 'client_allowed_ips' => 'allowed_ips'];
+
+    /** This server's public address, once it had to be asked for (no WIREGUARD_HOSTNAME, no FQDN). */
+    protected ?string $publicHost = null;
 
     public function __construct(
         protected array $config,
         protected OsDriver $os,
     ) {}
 
-    public function buildConfFile(string $address, string $privkey, int $port, string $ifout, array $peers = [], ?string $dns = null, ?int $keepalive = null, ?string $allowed_ips = null, bool $forward = false, bool $nat = false, bool $up = true, ?string $address6 = null): string
+    public function buildConfFile(string $address, string $privkey, int $port, string $ifout, array $peers = [], ?string $dns = null, ?int $keepalive = null, ?string $allowed_ips = null, bool $forward = false, bool $nat = false, bool $up = true, ?string $address6 = null, ?int $mtu = null): string
     {
         // Metadata comments (address and ifout always written)
         $lines = [];
@@ -59,7 +69,7 @@ class ConfigBuilder
         }
 
         // Interface section from OS driver
-        $lines[] = $this->os->interfaceSection($address6 === null ? $address : "{$address}, {$address6}", $privkey, $port, $ifout, $forward, $nat);
+        $lines[] = $this->os->interfaceSection($address6 === null ? $address : "{$address}, {$address6}", $privkey, $port, $ifout, $forward, $nat, $mtu);
 
         // Peer sections. A disabled peer is commented out, so wg-quick doesn't load it; its name
         // and its own client settings are comments either way.
@@ -78,6 +88,11 @@ class ConfigBuilder
                 $lines[] = "{$prefix}PresharedKey = {$peer['preshared_key']}";
             }
             $lines[] = "{$prefix}AllowedIPs = {$peer['allowed_ips']}";
+            // A peer the server connects to itself: it also has to keep trying, and keep the path open
+            if (($peer['remote'] ?? null) !== null) {
+                $lines[] = "{$prefix}Endpoint = {$peer['remote']}";
+                $lines[] = "{$prefix}PersistentKeepalive = ".self::REMOTE_KEEPALIVE;
+            }
         }
 
         return implode("\n", $lines);
@@ -111,52 +126,80 @@ class ConfigBuilder
             : "{$ip}/32, ".IpAllocator::mirror($ip, $link->address, $link->address6).'/128';
     }
 
-    public function buildClientConfig(InterfaceInfo $link, string $privkey, string $ip, string $pubkey, string $psk, ?string $dns_override = null, ?string $allowed_ips_override = null, ?array $metadata = null, ?string $keepalive_override = null): string
+    /**
+     * A peer's client config: its key and tunnel addresses, this server as its endpoint, and DNS,
+     * routes and keepalive from the nearest place that has them: the peer, its link, the fixed
+     * defaults. Null for a peer without an IPv4 tunnel address (not one of this app's).
+     *
+     * A template line whose value doesn't exist is left out (no MTU of the link's own, a peer
+     * without a preshared key).
+     */
+    public function buildClientConfig(InterfaceInfo $link, PeerInfo $peer, string $privkey): ?string
     {
-        $defaults = $this->clientDefaults($metadata ?? $this->os->parseConfig($link->name) ?? []);
-        $dns = $dns_override ?? $defaults['dns'];
-        $keepalive = $keepalive_override ?? $defaults['keepalive'];
-        $allowed_ips = $allowed_ips_override ?? $defaults['allowed_ips'];
-        $endpoint_host = $this->config['hostname'] ?? null;
-        if ($endpoint_host === null || $endpoint_host === '') {
+        $ip = IpAllocator::tunnelIp($peer->allowed_ips);
+        if ($ip === null) {
+            return null;
+        }
+
+        $settings = array_filter($peer->clientSettings(), fn ($value) => $value !== null)
+            + $this->clientDefaults([...$link->clientSettings(), 'address6' => $link->address6]);
+
+        // {address}: the Address value (both families); {ip}: the bare IPv4 tunnel address
+        $values = [
+            '{privkey}' => $privkey,
+            '{pubkey}' => $link->public_key,
+            '{psk}' => $peer->preshared_key ?: null,
+            '{subnets}' => $settings['allowed_ips'],
+            '{keepalive}' => (string) $settings['keepalive'],
+            '{dns}' => $settings['dns'],
+            '{endpoint}' => $this->endpoint($link),
+            '{address}' => $this->clientAddress($link, $ip),
+            '{ip}' => $ip,
+            '{mtu}' => $link->mtu === null ? null : (string) $link->mtu,
+        ];
+        $lines = array_filter(
+            explode("\n", $this->config['templates']['client'] ?? self::CLIENT_TEMPLATE),
+            fn (string $line) => ! array_any($values, fn (?string $value, string $placeholder) => $value === null && str_contains($line, $placeholder)),
+        );
+
+        return strtr(implode("\n", $lines), array_filter($values, fn (?string $value) => $value !== null));
+    }
+
+    /**
+     * Where clients reach this link: WIREGUARD_HOSTNAME, else the machine's name when that looks
+     * reachable (an FQDN or IP), else its public IPv4.
+     */
+    protected function endpoint(InterfaceInfo $link): string
+    {
+        $host = $this->config['hostname'] ?? null;
+        if ($host === null || $host === '') {
             $hostname = gethostname();
-            // Use gethostname() only if it looks like a reachable FQDN or IP
-            if (filter_var($hostname, FILTER_VALIDATE_IP) || str_contains($hostname, '.')) {
-                $endpoint_host = $hostname;
-            } else {
-                $ip_service = $this->config['ip_service'] ?? 'http://ifconfig.me/ip';
-                $endpoint_host = $this->os->publicIpv4($ip_service) ?? $hostname;
-            }
+            // Looked up once per process: client configs are built on every read
+            $host = filter_var($hostname, FILTER_VALIDATE_IP) || str_contains($hostname, '.')
+                ? $hostname
+                : ($this->publicHost ??= $this->os->publicIpv4($this->config['ip_service'] ?? 'http://ifconfig.me/ip') ?? $hostname);
         }
+
         // An IPv6 literal needs brackets before the port
-        $endpoint = filter_var($endpoint_host, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6)
-            ? "[{$endpoint_host}]:{$link->listen_port}"
-            : "{$endpoint_host}:{$link->listen_port}";
-        $address = $this->clientAddress($link, $ip);
+        return filter_var($host, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6) ? "[{$host}]:{$link->listen_port}" : "{$host}:{$link->listen_port}";
+    }
 
-        $template = $this->config['templates']['client'] ?? null;
-        if ($template !== null) {
-            // {address}: the Address value (both families); {ip}: the bare IPv4 tunnel address
-            return str_replace(
-                ['{privkey}', '{pubkey}', '{psk}', '{subnets}', '{keepalive}', '{dns}', '{endpoint}', '{address}', '{ip}'],
-                [$privkey, $link->public_key, $psk, $allowed_ips, $keepalive, $dns, $endpoint, $address, $ip],
-                $template,
-            );
-        }
+    /**
+     * What is stored for a peer: only what can't be derived, its private key. Its client config is
+     * built from it whenever it is asked for.
+     */
+    public static function clientKeyFile(string $privkey): string
+    {
+        return "# This peer's private key. Its client config is built from it and the link's settings.\nPrivateKey = {$privkey}";
+    }
 
-        return implode("\n", [
-            '[Interface]',
-            "PrivateKey = {$privkey}",
-            "Address = {$address}",
-            "DNS = {$dns}",
-            '',
-            '[Peer]',
-            "PublicKey = {$link->public_key}",
-            "PresharedKey = {$psk}",
-            "AllowedIPs = {$allowed_ips}",
-            "Endpoint = {$endpoint}",
-            "PersistentKeepalive = {$keepalive}",
-        ]);
+    /**
+     * The private key in a peer's stored file: a key file, or a whole client config as stored
+     * before client configs were built on demand.
+     */
+    public static function clientPrivateKey(?string $content): ?string
+    {
+        return preg_match('/^\s*PrivateKey\s*=\s*(\S+)\s*$/m', (string) $content, $m) && KeyManager::isKey($m[1]) ? $m[1] : null;
     }
 
     public function parseConfContent(string $content): array
@@ -191,7 +234,7 @@ class ConfigBuilder
 
                 continue;
             }
-            if ($current_section === 'disabled' && preg_match('/^#\s*(PublicKey|PresharedKey|AllowedIPs)\s*=\s*(.+)$/', $trimmed, $matches)) {
+            if ($current_section === 'disabled' && preg_match('/^#\s*(PublicKey|PresharedKey|AllowedIPs|Endpoint|PersistentKeepalive)\s*=\s*(.+)$/', $trimmed, $matches)) {
                 $peers[count($peers) - 1][$matches[1]] = trim($matches[2]);
 
                 continue;

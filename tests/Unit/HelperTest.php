@@ -29,7 +29,7 @@ dataset('helper os', ['Linux' => 'Linux', 'macOS' => 'Darwin']);
 /**
  * A link config exactly as the app writes it (hooks naming the helper under test).
  */
-function appConf(string $os, bool $forward = true, bool $nat = true, ?string $address6 = null): string
+function appConf(string $os, bool $forward = true, bool $nat = true, ?string $address6 = null, ?int $mtu = 1380): string
 {
     $driver = $os === 'Darwin'
         ? new MacDriver(new FakeShell, HelperSandbox::path())
@@ -41,11 +41,12 @@ function appConf(string $os, bool $forward = true, bool $nat = true, ?string $ad
         [
             ['public_key' => $keys->pubkey($keys->genkey()), 'preshared_key' => $keys->genpsk(), 'allowed_ips' => '10.0.0.2/32', 'name' => "Ана's phone (#2)",
                 'dns' => '10.0.0.1, corp.example.com', 'keepalive' => '0', 'client_allowed_ips' => '10.0.0.0/24, fd00::/64'],
-            ['public_key' => $keys->pubkey($keys->genkey()), 'allowed_ips' => '10.0.0.3/32, fd00::3/128, 192.168.1.0/24'],
+            // One the server connects to itself
+            ['public_key' => $keys->pubkey($keys->genkey()), 'allowed_ips' => '10.0.0.3/32, fd00::3/128, 192.168.1.0/24', 'remote' => 'branch.example.com:51820'],
             // Disabled: commented out, so wg-quick doesn't load it
             ['public_key' => $keys->pubkey($keys->genkey()), 'preshared_key' => $keys->genpsk(), 'allowed_ips' => '10.0.0.4/32', 'name' => 'old laptop', 'enabled' => false, 'dns' => '9.9.9.9'],
         ],
-        '1.1.1.1, 8.8.8.8', 25, '0.0.0.0/0, ::/0', $forward, $nat, address6: $address6,
+        '1.1.1.1, 8.8.8.8', 25, '0.0.0.0/0, ::/0', $forward, $nat, address6: $address6, mtu: $mtu,
     )."\n";
 }
 
@@ -91,7 +92,8 @@ it('stores exactly the link configs the app writes', function (string $os) {
         ->and($box->run(['conf-write', 'wg1'], $plain)['exit'])->toBe(0)
         ->and($box->run(['conf-write', 'wg2'], $dual)['exit'])->toBe(0)
         ->and($dual)->toContain("# address6 = fd12:3456:789a::1/64\n")->toContain("Address = 10.0.0.1/24, fd12:3456:789a::1/64\n")
-        ->and($hooked)->toContain("# up = true\n# format = 2\n")
+        ->and($hooked)->toContain("# up = true\n# format = 2\n", "ListenPort = 51820\nMTU = 1380\n")
+        ->toContain("AllowedIPs = 10.0.0.3/32, fd00::3/128, 192.168.1.0/24\nEndpoint = branch.example.com:51820\nPersistentKeepalive = 25\n")
         ->toContain("[Peer]\n# name = Ана's phone (#2)\n# dns = 10.0.0.1, corp.example.com\n# keepalive = 0\n# allowed_ips = 10.0.0.0/24, fd00::/64\nPublicKey = ")
         ->toContain("# [Peer] disabled\n# name = old laptop\n# dns = 9.9.9.9\n# PublicKey = ")
         ->and(file_get_contents("{$box->confDir}/wg0.conf"))->toBe($hooked)
@@ -120,7 +122,10 @@ it('rejects anything else in a link config and keeps the saved one', function (s
     'DNS (runs resolvconf)' => ['/^ListenPort/m', "DNS = 1.1.1.1\nListenPort", 'not allowed in a link config: DNS'],
     'Table' => ['/^ListenPort/m', "Table = off\nListenPort", 'not allowed in a link config: Table'],
     'SaveConfig' => ['/^ListenPort/m', "SaveConfig = true\nListenPort", 'not allowed in a link config: SaveConfig'],
-    'an Endpoint on the server' => ['/^\[Peer\]$/m', "[Peer]\nEndpoint = 203.0.113.1:51820", 'not allowed in a link config: Endpoint'],
+    'shell syntax in where to connect to a peer' => ['/^\[Peer\]$/m', "[Peer]\nEndpoint = 203.0.113.1:51820;id", 'not allowed in a link config: Endpoint'],
+    'an endpoint without a port' => ['/^\[Peer\]$/m', "[Peer]\nEndpoint = branch.example.com", 'not allowed in a link config: Endpoint'],
+    'a keepalive out of range' => ['/^\[Peer\]$/m', "[Peer]\nPersistentKeepalive = 70000", 'not allowed in a link config: PersistentKeepalive'],
+    'an MTU too small to be one' => ['/^ListenPort/m', "MTU = 100\nListenPort", 'not allowed in a link config: MTU'],
     'shell syntax in metadata' => ['/^# ifout = .*$/m', '# ifout = eth0;id', 'metadata not allowed'],
     'shell syntax in an IPv6 address' => ['/^# address = .*$/m', "# address = 10.0.0.1/24\n# address6 = fd12::1/64;id", 'metadata not allowed'],
     'a second IPv6 address' => ['/^Address = .*$/m', 'Address = 10.0.0.1/24, fd12::1/64, fd13::1/64', 'not allowed in a link config: Address'],
@@ -190,14 +195,18 @@ it('lists only configs with valid link names', function () {
 
 // ─── Peers and client configs ───────────────────────────────────────
 
-it('adds a validated peer to a running interface', function () {
+it('adds a validated peer to a running interface', function (string $where) {
     $box = new HelperSandbox;
-    $peer = "[Peer]\nPublicKey = ".HELPER_TEST_KEY."\nPresharedKey = ".HELPER_TEST_KEY."\nAllowedIPs = 10.0.0.2/32\n";
+    $peer = "[Peer]\nPublicKey = ".HELPER_TEST_KEY."\nPresharedKey = ".HELPER_TEST_KEY."\nAllowedIPs = 10.0.0.2/32\n{$where}";
 
     expect($box->run(['peer-add', 'wg0'], $peer)['exit'])->toBe(0)
         ->and($box->calls())->toBe([['wg', 'addconf', 'wg0', '/dev/stdin']])
         ->and($box->stdin())->toBe([$peer]);
-});
+})->with([
+    'one that connects to the server' => '',
+    'one the server connects to' => "Endpoint = branch.example.com:51820\nPersistentKeepalive = 25\n",
+    'one at an IPv6 address' => "Endpoint = [2001:db8::7]:51820\nPersistentKeepalive = 25\n",
+]);
 
 it('sets allowed IPs of both families in the form wg takes', function () {
     $box = new HelperSandbox;
@@ -206,15 +215,16 @@ it('sets allowed IPs of both families in the form wg takes', function () {
         ->and($box->calls())->toBe([['wg', 'set', 'wg0', 'peer', HELPER_TEST_KEY, 'allowed-ips', '10.0.0.2/32,fd12::2/128']]);
 });
 
-it('rejects a peer with anything but keys and allowed IPs', function (string $extra) {
+it('rejects a peer with anything but keys, allowed IPs and where to connect to it', function (string $extra) {
     $box = new HelperSandbox;
 
     $run = $box->run(['peer-add', 'wg0'], "[Peer]\nPublicKey = ".HELPER_TEST_KEY."\n{$extra}\n");
 
     expect($run['exit'])->not->toBe(0)->and($box->calls())->toBe([]);
 })->with([
-    'an endpoint' => 'Endpoint = 203.0.113.1:51820',
-    'a keepalive' => 'PersistentKeepalive = 25',
+    'shell syntax in an endpoint' => 'Endpoint = 203.0.113.1:51820;id',
+    'a keepalive out of range' => 'PersistentKeepalive = 70000',
+    'a hook' => 'PostUp = id',
     'an [Interface] section' => "[Interface]\nPrivateKey = ".HELPER_TEST_KEY,
     'shell syntax in allowed IPs' => 'AllowedIPs = 10.0.0.2/32;id',
 ]);
@@ -465,3 +475,84 @@ it('clears the link firewall and tolerates there being nothing to clear', functi
         expect($box->calls())->toContain(['iptables', '-D', 'FORWARD', '-i', 'wg0', '-m', 'comment', '--comment', 'wgla:wg0', '-j', 'ACCEPT']);
     }
 })->with('helper os');
+
+// ─── Rules that went missing ────────────────────────────────────────
+
+it('says whether a link still has the rules its config asks for', function (string $os, bool $present) {
+    $box = new HelperSandbox($os);
+    $box->writeConf('wg0', appConf($os));
+    $iface = $os === 'Darwin' ? 'utun5' : 'wg0';
+    file_put_contents("{$box->runDir}/wg0.name", "utun5\n");
+    $box->respond('iptables -S FORWARD', '-P FORWARD ACCEPT');
+    if ($os === 'Darwin') {
+        $box->respond('pfctl -a wg/wg0 -s nat', $present ? 'nat on en0 inet from 10.0.0.0/24 to any -> (en0) round-robin' : '');
+        $box->respond('pfctl -a wg/wg0 -s rules', $present ? "pass in on utun5 all flags S/SA keep state\npass out on utun5 all flags S/SA keep state" : '');
+    } elseif ($present) {
+        $box->respond('nft list table inet wg_wg0', "table inet wg_wg0 {\n\tchain forward {\n\t\ttype filter hook forward priority filter; policy accept;\n\t\tiifname \"wg0\" accept\n\t\toifname \"wg0\" accept\n\t}\n\n"
+            ."\tchain postrouting {\n\t\ttype nat hook postrouting priority srcnat; policy accept;\n\t\tip saddr 10.0.0.0/24 oifname \"eth0\" masquerade\n\t}\n}");
+    } else {
+        // As after `nft -f` of a ruleset that starts with "flush ruleset"
+        $box->respond('nft list table inet wg_wg0', '', 1);
+    }
+
+    $run = $box->run(['firewall-check', 'wg0', $iface]);
+
+    expect($run['exit'])->toBe(0, $run['stderr'])
+        ->and($run['stdout'])->toBe($present ? "ok\n" : "missing\n");
+})->with('helper os')->with(['in place' => true, 'gone' => false]);
+
+it('misses its accepts in an iptables chain that drops forwarded traffic', function (string $listing, string $answer) {
+    $box = new HelperSandbox('Linux');
+    $box->writeConf('wg0', appConf('Linux', nat: false));
+    $box->respond('nft list table inet wg_wg0', "table inet wg_wg0 {\n\tchain forward {\n\t\tiifname \"wg0\" accept\n\t\toifname \"wg0\" accept\n\t}\n}");
+    $box->respond('iptables -S FORWARD', $listing);
+
+    expect($box->run(['firewall-check', 'wg0', 'wg0'])['stdout'])->toBe("{$answer}\n");
+})->with([
+    'both there' => ["-P FORWARD DROP\n-A FORWARD -i wg0 -m comment --comment \"wgla:wg0\" -j ACCEPT\n-A FORWARD -o wg0 -m comment --comment \"wgla:wg0\" -j ACCEPT\n-A FORWARD -j DOCKER-USER", 'ok'],
+    'gone after a Docker or ufw restart' => ["-P FORWARD DROP\n-A FORWARD -j DOCKER-USER", 'missing'],
+    'nothing drops' => ['-P FORWARD ACCEPT', 'ok'],
+]);
+
+it('has nothing to miss for a link without forward or NAT', function (string $os) {
+    $box = new HelperSandbox($os);
+    $box->writeConf('wg0', appConf($os, forward: false, nat: false));
+    file_put_contents("{$box->runDir}/wg0.name", "utun5\n");
+
+    expect($box->run(['firewall-check', 'wg0', $os === 'Darwin' ? 'utun5' : 'wg0'])['stdout'])->toBe("ok\n")
+        ->and($box->calls())->toBe([]);
+})->with('helper os');
+
+it('puts the rules back for every running link that lost them, and only for those', function () {
+    $box = new HelperSandbox('Linux');
+    foreach (['wg0', 'wg1', 'wg2'] as $link) {
+        $box->writeConf($link, appConf('Linux'));
+    }
+    $box->writeConf('wg3', "this is no config\n"); // must not stop the others
+    $box->respond('wg show interfaces', 'wg0 wg1 wg3 unmanaged9');
+    $box->respond('iptables -S FORWARD', '-P FORWARD ACCEPT');
+    $box->respond('nft list table inet wg_wg0', '', 1);
+    $box->respond('nft list table inet wg_wg1', "table inet wg_wg1 {\n\tiifname \"wg1\" accept\n\tmasquerade\n}");
+
+    $run = $box->run(['firewall-repair']);
+
+    // wg0 lost them; wg1 has them; wg2 isn't running; wg3 and the interface without a config are skipped
+    expect($run['exit'])->toBe(0, $run['stderr'])
+        ->and($run['stdout'])->toBe("<4>wgla-helper: link wg0 had lost its firewall rules; they are back\n")
+        ->and(array_values(array_filter($box->calls(), fn (array $call) => $call === ['nft', '-f', '-'])))->toHaveCount(1)
+        ->and($box->stdin()[0])->toContain('table inet wg_wg0 {', 'iifname "wg0" accept');
+});
+
+it('repairs the link behind each utun on macOS', function () {
+    $box = new HelperSandbox('Darwin');
+    $box->writeConf('wg0', appConf('Darwin'));
+    file_put_contents("{$box->runDir}/wg0.name", "utun5\n");
+    $box->respond('wg show interfaces', 'utun5 utun9');
+
+    $run = $box->run(['firewall-repair']);
+
+    expect($run['exit'])->toBe(0, $run['stderr'])
+        ->and($run['stdout'])->toContain('link wg0 had lost its firewall rules')
+        ->and($box->calls())->toContain(['pfctl', '-a', 'wg/wg0', '-f', '-'])
+        ->and($box->stdin()[0])->toContain('pass in on utun5 all')->toBeAcceptedByPf();
+});

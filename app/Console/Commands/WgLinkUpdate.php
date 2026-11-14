@@ -17,6 +17,7 @@ class WgLinkUpdate extends WgCommand
         {--address= : VPN address in CIDR notation (without a mask: the current one)}
         {--move-peers : With --address in another subnet: peers keep their host number there (clients need their new config)}
         {--address6= : IPv6 address and prefix (e.g. fd12:3456:789a::1/64), "auto" for a random private /64, or "none" to remove it}
+        {--mtu= : MTU for the interface and its clients ("" goes back to wg-quick\'s)}
         {--forward= : Enable or disable IP forwarding (true/false)}
         {--nat= : Enable or disable NAT masquerading (true/false)}
         {--up= : Bring interface up or down (true/false)}';
@@ -40,9 +41,11 @@ class WgLinkUpdate extends WgCommand
                 'up' => $this->flag('up'),
                 'move_peers' => $this->option('move-peers') ?: null,
             ], fn ($value) => $value !== null);
-            if ($this->option('keepalive') !== null) {
-                // "" is not 0 seconds: it takes the link's own value out
-                $params['keepalive'] = $this->option('keepalive') === '' ? null : $this->number('keepalive');
+            foreach (['keepalive', 'mtu'] as $option) {
+                if ($this->option($option) !== null) {
+                    // "" is not 0: it takes the link's own value out
+                    $params[$option] = $this->option($option) === '' ? null : $this->number($option);
+                }
             }
 
             if ($params === []) {
@@ -62,6 +65,7 @@ class WgLinkUpdate extends WgCommand
         $this->line("Address: {$link->address}");
         $this->line('IPv6 Address: '.($link->address6 ?? '(none)'));
         $this->line("Listen Port: {$link->listen_port}");
+        $this->line('MTU: '.($link->mtu ?? '(default)'));
         $this->line("Outbound: {$link->ifout}");
         $this->line('Forward: '.($link->forward ? 'enabled' : 'disabled'));
         $this->line('NAT: '.($link->nat ? 'enabled' : 'disabled'));

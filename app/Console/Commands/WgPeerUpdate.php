@@ -16,7 +16,8 @@ class WgPeerUpdate extends WgCommand
         {--keepalive= : Keepalive interval for this peer\'s client config ("" goes back to the link\'s)}
         {--name= : A label for the peer ("" removes it)}
         {--enabled= : false takes the peer off the interface, true puts it back}
-        {--networks= : Networks behind the peer, routed to it ("" removes them)}';
+        {--networks= : Networks behind the peer, routed to it ("" removes them)}
+        {--remote= : host:port the server connects to ("" removes it: the peer connects)}';
 
     protected $description = 'Update a WireGuard peer';
 
@@ -33,6 +34,7 @@ class WgPeerUpdate extends WgCommand
                 'name' => $this->option('name'),
                 'enabled' => $this->flag('enabled'),
                 'networks' => $this->option('networks'),
+                'remote' => $this->option('remote'),
             ], fn ($value) => $value !== null);
             if ($this->option('keepalive') !== null) {
                 // "" is not 0 seconds: it takes the peer's own value out
