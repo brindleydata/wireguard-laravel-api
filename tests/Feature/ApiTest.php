@@ -1,7 +1,6 @@
 <?php
 
 use App\Services\KeyManager;
-use App\Services\Os\OsDriver;
 use App\Services\Shell;
 use Tests\Fakes\FakeHost;
 use Tests\Fakes\FakeShell;
@@ -17,7 +16,7 @@ beforeEach(function () {
     $this->app->instance(Shell::class, $shell);
 
     $os = PHP_OS_FAMILY === 'Darwin' ? 'mac' : 'linux';
-    $this->host = new FakeHost($os, $shell, app(OsDriver::class)->configPath(), '/tmp');
+    $this->host = new FakeHost($os, $shell);
     $this->auth = ['api-key' => 'test-key'];
 });
 
@@ -26,7 +25,8 @@ it('runs a link and peer through their lifecycle', function () {
         ->assertCreated()
         ->assertJsonPath('name', 'wg0')
         ->assertJsonPath('up', true)
-        ->assertJsonPath('interface', $this->host->interfaceOf('wg0'));
+        ->assertJsonPath('interface', $this->host->interfaceOf('wg0'))
+        ->assertJsonMissingPath('private_key'); // the server's private key never leaves the host
 
     $peer = $this->postJson('/link/wg0/peers', [], $this->auth)
         ->assertCreated()
@@ -43,7 +43,7 @@ it('runs a link and peer through their lifecycle', function () {
     $this->deleteJson('/link/wg0', [], $this->auth)->assertOk();
 
     $this->getJson('/link/wg0', $this->auth)->assertNotFound();
-    expect($this->host->files)->toBe([]);
+    expect($this->host->files())->toBe([]);
 });
 
 it('rejects requests without the right API key', function () {

@@ -10,7 +10,6 @@ class InterfaceInfo
     public function __construct(
         public readonly string $name,
         public readonly string $public_key,
-        public readonly string $private_key,
         public readonly int $listen_port,
         public readonly string $address,
         public readonly string $ifout,
@@ -27,7 +26,6 @@ class InterfaceInfo
             'name' => $this->name,
             'interface' => $this->interface,
             'public_key' => $this->public_key,
-            'private_key' => $this->private_key,
             'listen_port' => $this->listen_port,
             'address' => $this->address,
             'ifout' => $this->ifout,

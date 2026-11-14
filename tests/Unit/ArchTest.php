@@ -13,5 +13,5 @@ arch('frontends only use the WireGuard and Server services')
         'App\DTOs',
         'App\Console\Commands', // the WgCommand base class
         'Illuminate',
-        'abort', 'app', 'response', // Laravel helper functions
+        'abort', 'app', 'response', 'config', 'base_path', // Laravel helper functions
     ]);

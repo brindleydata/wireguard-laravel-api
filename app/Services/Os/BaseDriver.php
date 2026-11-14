@@ -2,22 +2,27 @@
 
 namespace App\Services\Os;
 
-use App\Exceptions\SystemException;
 use App\Services\ConfigBuilder;
 use App\Services\Shell;
 
 /**
- * Config and client-config file handling shared by both drivers.
- *
- * The web server user can't touch the config directory directly, so every operation goes through
- * sudo with commands that match the path-restricted sudoers rules shown by `wg:help`.
+ * Everything privileged, shared by both drivers: it all goes through the root helper
+ * (bin/wgla-helper, installed as config('wireguard.helper')), the one command sudoers allows.
+ * The helper knows the OS-specific paths, lifecycle and firewall; contents go in on stdin.
  */
 abstract class BaseDriver implements OsDriver
 {
     public function __construct(
         protected Shell $shell,
-        protected string $stagingDir = '/tmp',
+        protected string $helperPath = '/usr/local/sbin/wgla-helper',
     ) {}
+
+    /**
+     * What wg-quick expands to [the link name, the OS interface] in a hook on this OS.
+     *
+     * @return array{0: string, 1: string}
+     */
+    abstract protected function hookPlaceholders(): array;
 
     public function publicIpv4(string $ip_service): ?string
     {
@@ -29,41 +34,97 @@ abstract class BaseDriver implements OsDriver
         return $this->shell->tryRun('curl -6 -s --max-time 5 :url', ['url' => $ip_service]);
     }
 
+    // ─── WireGuard runtime state ────────────────────────────────────
+
+    public function runningInterfaces(): array
+    {
+        $output = $this->tryHelper('interfaces');
+
+        return $output === null || $output === '' ? [] : preg_split('/\s+/', $output);
+    }
+
+    public function interfaceDump(string $iface): string
+    {
+        return $this->helper('dump :iface', ['iface' => $iface]);
+    }
+
+    public function addPeer(string $iface, string $section): void
+    {
+        $this->helper('peer-add :iface', ['iface' => $iface], $section);
+    }
+
+    public function removePeer(string $iface, string $pubkey): void
+    {
+        $this->helper('peer-remove :iface :pubkey', ['iface' => $iface, 'pubkey' => $pubkey]);
+    }
+
+    public function setPeerAllowedIps(string $iface, string $pubkey, string $allowed_ips): void
+    {
+        $this->helper('peer-ips :iface :pubkey :ips', ['iface' => $iface, 'pubkey' => $pubkey, 'ips' => $allowed_ips]);
+    }
+
+    // ─── Link lifecycle ─────────────────────────────────────────────
+
+    public function resolveInterface(string $link): string
+    {
+        return $this->tryHelper('resolve :name', ['name' => $link]) ?: $link;
+    }
+
+    public function startInterface(string $name): void
+    {
+        $this->helper('up :name', ['name' => $name]);
+    }
+
+    public function stopInterface(string $name): void
+    {
+        $this->helper('down :name', ['name' => $name]);
+    }
+
+    // ─── Link configs ───────────────────────────────────────────────
+
+    public function interfaceSection(string $address, string $privkey, int $port, string $ifout, bool $forward = false, bool $nat = false): string
+    {
+        $lines = [
+            '[Interface]',
+            "Address = {$address}",
+            "PrivateKey = {$privkey}",
+            "ListenPort = {$port}",
+        ];
+
+        if ($forward || $nat) {
+            [$link, $iface] = $this->hookPlaceholders();
+            $lines[] = "PostUp = {$this->helperPath} firewall-up {$link} {$iface}";
+            $lines[] = "PostDown = {$this->helperPath} firewall-down {$link}";
+        }
+
+        return implode("\n", $lines);
+    }
+
     public function writeConfig(string $name, string $content): void
     {
-        $this->installFile($this->configPath()."/{$name}.conf", $content);
+        $this->helper('conf-write :name', ['name' => $name], $content."\n");
     }
 
     public function deleteConfig(string $name): void
     {
-        $this->shell->tryRun('sudo rm -f :path', ['path' => $this->configPath()."/{$name}.conf"]);
+        $this->tryHelper('conf-delete :name', ['name' => $name]);
     }
 
     public function readConfig(string $name): ?string
     {
-        return $this->shell->tryRun('sudo cat :path', ['path' => $this->configPath()."/{$name}.conf"]);
+        return $this->tryHelper('conf-read :name', ['name' => $name]);
     }
 
     public function configExists(string $name): bool
     {
-        return $this->shell->tryRun('sudo test -f :path && echo 1', ['path' => $this->configPath()."/{$name}.conf"]) === '1';
+        return $this->readConfig($name) !== null;
     }
 
     public function listConfigNames(): array
     {
-        $output = $this->shell->tryRun('sudo ls :path', ['path' => $this->configPath()]);
-        if ($output === null || $output === '') {
-            return [];
-        }
+        $output = $this->tryHelper('conf-list');
 
-        $names = [];
-        foreach (explode("\n", trim($output)) as $file) {
-            if (str_ends_with($file, '.conf')) {
-                $names[] = basename($file, '.conf');
-            }
-        }
-
-        return $names;
+        return $output === null || $output === '' ? [] : explode("\n", $output);
     }
 
     public function parseConfig(string $name): ?array
@@ -73,71 +134,53 @@ abstract class BaseDriver implements OsDriver
         return $content === null ? null : ConfigBuilder::parseMetadata($content);
     }
 
+    // ─── Client configs ─────────────────────────────────────────────
+
     public function writeClientConfig(string $link, string $key, string $content): void
     {
-        $this->installFile($this->configPath()."/clients/{$link}/{$key}.conf", $content);
+        $this->helper('client-write :link :key', ['link' => $link, 'key' => $key], $content."\n");
     }
 
     public function readClientConfig(string $link, string $key): ?string
     {
-        return $this->shell->tryRun('sudo cat :path', ['path' => $this->configPath()."/clients/{$link}/{$key}.conf"]);
+        return $this->tryHelper('client-read :link :key', ['link' => $link, 'key' => $key]);
     }
 
     public function deleteClientConfig(string $link, string $key): void
     {
-        $this->shell->tryRun('sudo rm -f :path', ['path' => $this->configPath()."/clients/{$link}/{$key}.conf"]);
+        $this->tryHelper('client-delete :link :key', ['link' => $link, 'key' => $key]);
     }
 
     public function deleteClientConfigDir(string $link): void
     {
-        $this->shell->tryRun('sudo rm -rf :dir', ['dir' => $this->configPath()."/clients/{$link}"]);
+        $this->tryHelper('client-delete-all :link', ['link' => $link]);
     }
 
-    /**
-     * Write a root-owned 0600 file by staging it and copying it into place with sudo.
-     */
-    protected function installFile(string $path, string $content): void
-    {
-        $tmp = $this->stage($content);
+    // ─── Firewall ───────────────────────────────────────────────────
 
-        try {
-            $this->shell->run('sudo mkdir -p :dir && sudo cp :tmp :path && sudo chmod 600 :path', [
-                'dir' => dirname($path),
-                'tmp' => $tmp,
-                'path' => $path,
-            ]);
-        } finally {
-            @unlink($tmp);
-        }
+    public function applyFirewall(string $link, string $iface): void
+    {
+        $this->helper('firewall-up :link :iface', ['link' => $link, 'iface' => $iface]);
     }
 
-    /**
-     * Create a private (0600) staging file and return its path.
-     *
-     * The path is built by hand instead of using tempnam(): sudoers only allows `cp /tmp/* ...`,
-     * while tempnam() follows TMPDIR (/var/folders/... for macOS users) and resolves /tmp to
-     * /private/tmp on macOS, so neither would match. Opening with 'x' (O_EXCL) refuses to follow
-     * a planted symlink in the shared directory.
-     */
-    protected function stage(string $content): string
+    public function clearFirewall(string $link): void
     {
-        $handle = false;
-        for ($attempt = 0; $attempt < 5 && $handle === false; $attempt++) {
-            $path = $this->stagingDir.'/wgla_'.bin2hex(random_bytes(8));
-            $handle = @fopen($path, 'x');
-        }
+        $this->tryHelper('firewall-down :link', ['link' => $link]);
+    }
 
-        if ($handle === false) {
-            throw new SystemException("Unable to create a staging file in {$this->stagingDir}");
-        }
+    // ─── Helper ─────────────────────────────────────────────────────
 
-        try {
-            chmod($path, 0600);
-            fwrite($handle, $content."\n");
-        } finally {
-            fclose($handle);
-        }
+    /**
+     * Run a helper command as root. `sudo -n` fails at once when sudoers isn't set up, instead
+     * of waiting for a password.
+     */
+    protected function helper(string $command, array $bindings = [], ?string $input = null): string
+    {
+        return $this->shell->run("sudo -n :helper {$command}", ['helper' => $this->helperPath, ...$bindings], $input);
+    }
 
-        return $path;
+    protected function tryHelper(string $command, array $bindings = [], ?string $input = null): ?string
+    {
+        return $this->shell->tryRun("sudo -n :helper {$command}", ['helper' => $this->helperPath, ...$bindings], $input);
     }
 }

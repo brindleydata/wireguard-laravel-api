@@ -7,92 +7,52 @@ use Illuminate\Console\Command;
 
 class WgCommand extends Command
 {
-    protected $signature = 'wg:help {--os= : Target OS (linux or mac)} {--arch= : Architecture (arm64 or x86_64, macOS only)}';
+    protected $signature = 'wg:help {--os= : Target OS (linux or mac)} {--user= : Web server user (default: www-data on Linux, _www on macOS)}';
 
     protected $description = 'Show prerequisites';
 
     public function handle(WireGuard $wg): int
     {
         $os = $this->option('os') ?? (PHP_OS_FAMILY === 'Darwin' ? 'mac' : 'linux');
+        $mac = in_array($os, ['mac', 'macos', 'darwin'], true);
+        $user = $this->option('user') ?? ($mac ? '_www' : 'www-data');
 
-        if ($os === 'mac' || $os === 'macos' || $os === 'darwin') {
-            $arch = $this->option('arch') ?? php_uname('m');
-            $this->macOS($arch === 'arm64');
-        } else {
-            $this->linux();
-        }
+        $mac ? $this->macOS($user) : $this->linux($user);
 
         return Command::SUCCESS;
     }
 
-    protected function linux(): void
+    protected function linux(string $user): void
     {
         $this->info('Linux prerequisites:');
         $this->line('');
 
-        $this->comment('1. Install wireguard-tools and PHP sodium extension');
-        $this->line('   apt install wireguard-tools nftables curl php-sodium');
+        $this->comment('1. Install wireguard-tools, nftables and PHP');
+        $this->line('   sudo apt install wireguard-tools nftables curl php-cli php-mbstring php-xml php-curl');
         $this->line('');
 
-        $this->comment('2. Enable IP forwarding');
-        $this->line('   sudo sysctl -w net.ipv4.ip_forward=1');
-        $this->line('');
-        $this->line('   To persist across reboots:');
+        $this->comment('2. Enable IP forwarding (needed for forward/NAT)');
         $this->line('   echo "net.ipv4.ip_forward=1" | sudo tee /etc/sysctl.d/99-wireguard.conf');
         $this->line('   sudo sysctl --system');
         $this->line('');
 
-        $this->comment('3. Create sudoers file (replace www-data with your web server user)');
-        $this->line(<<<'SNIPPET'
-   sudo tee /etc/sudoers.d/wireguard > /dev/null <<'EOF'
-   www-data ALL=(root) NOPASSWD: \
-       /usr/bin/wg, \
-       /usr/bin/wg-quick, \
-       /usr/sbin/nft, \
-       /usr/bin/systemctl enable wg-quick@*, \
-       /usr/bin/systemctl disable wg-quick@*, \
-       /usr/bin/systemctl start wg-quick@*, \
-       /usr/bin/systemctl stop wg-quick@*, \
-       /usr/bin/cat /etc/wireguard/*, \
-       /usr/bin/test -f /etc/wireguard/*, \
-       /usr/bin/ls /etc/wireguard, \
-       /usr/bin/mkdir -p /etc/wireguard, \
-       /usr/bin/mkdir -p /etc/wireguard/clients/*, \
-       /usr/bin/cp /tmp/* /etc/wireguard/*, \
-       /usr/bin/chmod 600 /etc/wireguard/*, \
-       /usr/bin/rm -f /etc/wireguard/*, \
-       /usr/bin/rm -rf /etc/wireguard/clients/*
-   EOF
-   sudo chmod 440 /etc/sudoers.d/wireguard
-SNIPPET);
-        $this->line('');
-
-        $this->comment('4. Validate sudoers syntax');
-        $this->line('   sudo visudo -cf /etc/sudoers.d/wireguard');
-        $this->line('');
+        $this->helperSteps(3, $user, 'root');
     }
 
-    protected function macOS(bool $arm64): void
+    protected function macOS(string $user): void
     {
-        $prefix = $arm64 ? '/opt/homebrew' : '/usr/local';
-        $arch = $arm64 ? 'arm64' : 'x86_64';
-
-        $this->info("macOS prerequisites ({$arch}):");
+        $this->info('macOS prerequisites:');
         $this->line('');
 
-        $this->comment('1. Install wireguard-tools, wireguard-go, bash 4+, and PHP sodium extension');
-        $this->line('   brew install wireguard-tools wireguard-go bash php-sodium');
+        $this->comment('1. Install wireguard-tools, wireguard-go and bash 4+ (wg-quick needs it)');
+        $this->line('   brew install wireguard-tools wireguard-go bash');
         $this->line('');
 
-        $this->comment('2. Fix wg-quick shebang (macOS ships bash 3, wg-quick needs 4+)');
-        $this->line("   sudo sed -i \"\" \"1s|.*|#\\!{$prefix}/bin/bash|\" {$prefix}/bin/wg-quick");
-        $this->line('');
-
-        $this->comment('3. Enable IP forwarding');
+        $this->comment('2. Enable IP forwarding (needed for forward/NAT)');
         $this->line('   sudo sysctl -w net.inet.ip.forwarding=1');
         $this->line('');
 
-        $this->comment('4. Set up pfctl anchors for NAT');
+        $this->comment('3. Add the pf anchors for forward/NAT rules (one-time)');
         $this->line(<<<'SNIPPET'
    sudo bash -c 'cat >> /etc/pf.conf <<EOF
 
@@ -104,32 +64,33 @@ SNIPPET);
 SNIPPET);
         $this->line('');
 
-        $configPath = "{$prefix}/etc/wireguard";
+        $this->helperSteps(4, $user, 'wheel');
+    }
 
-        $this->comment('5. Create sudoers file (replace _www with your web server user)');
-        $this->line(<<<SNIPPET
-   sudo tee /etc/sudoers.d/wireguard > /dev/null <<'EOF'
-   _www ALL=(root) NOPASSWD: \\
-       {$prefix}/bin/wg, \\
-       {$prefix}/bin/wg-quick, \\
-       /sbin/pfctl, \\
-       /bin/cat {$configPath}/*, \\
-       /bin/cat /var/run/wireguard/*, \\
-       /usr/bin/test -f {$configPath}/*, \\
-       /bin/ls {$configPath}, \\
-       /bin/mkdir -p {$configPath}, \\
-       /bin/mkdir -p {$configPath}/clients/*, \\
-       /bin/cp /tmp/* {$configPath}/*, \\
-       /bin/chmod 600 {$configPath}/*, \\
-       /bin/rm -f {$configPath}/*, \\
-       /bin/rm -rf {$configPath}/clients/*
-   EOF
-   sudo chmod 440 /etc/sudoers.d/wireguard
-SNIPPET);
+    /**
+     * The root helper is the only command the web server user may run as root.
+     */
+    protected function helperSteps(int $step, string $user, string $group): void
+    {
+        $helper = config('wireguard.helper');
+        $source = base_path('bin/wgla-helper');
+
+        $this->comment("{$step}. Install the root helper (again after every update of this app)");
+        // mkdir -p leaves an existing directory's owner alone (Homebrew owns /usr/local/sbin on Intel Macs)
+        $this->line('   sudo mkdir -p '.dirname($helper));
+        $this->line("   sudo install -o root -g {$group} -m 755 {$source} {$helper}");
         $this->line('');
 
-        $this->comment('6. Validate sudoers syntax');
-        $this->line('   sudo visudo -cf /etc/sudoers.d/wireguard');
+        $step++;
+        $this->comment("{$step}. Let the web server user run it as root, and nothing else");
+        $this->line("   echo '{$user} ALL=(root) NOPASSWD: {$helper}' | sudo tee /etc/sudoers.d/wgla > /dev/null");
+        $this->line('   sudo chmod 440 /etc/sudoers.d/wgla');
+        $this->line('   sudo visudo -cf /etc/sudoers.d/wgla');
+        $this->line('');
+
+        $step++;
+        $this->comment("{$step}. Set API_KEY in .env (the API refuses every protected request without it)");
+        $this->line('   echo "API_KEY=$(openssl rand -hex 32)" >> .env');
         $this->line('');
     }
 }

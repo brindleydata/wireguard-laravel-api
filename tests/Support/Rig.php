@@ -17,7 +17,7 @@ use Tests\Fakes\FakeShell;
 
 /**
  * The WireGuard service wired to a simulated Linux or macOS host (see FakeHost), with its own
- * temporary staging and lock directories. Call Rig::cleanup() after each test.
+ * temporary lock directory. Call Rig::cleanup() after each test.
  */
 final class Rig
 {
@@ -35,22 +35,19 @@ final class Rig
     public function __construct(public readonly string $os)
     {
         $this->tmp = sys_get_temp_dir().'/wgla_test_'.bin2hex(random_bytes(6));
-        mkdir("{$this->tmp}/staging", 0700, true);
+        mkdir($this->tmp, 0700, true);
         self::$dirs[] = $this->tmp;
 
-        $this->shell = new FakeShell;
-        $driver = $os === 'mac'
-            ? new MacDriver($this->shell, "{$this->tmp}/staging")
-            : new LinuxDriver($this->shell, "{$this->tmp}/staging");
-        $this->host = new FakeHost($os, $this->shell, $driver->configPath(), "{$this->tmp}/staging");
-
         $config = array_merge(require dirname(__DIR__, 2).'/config/wireguard.php', ['hostname' => 'vpn.example.test']);
+
+        $this->shell = new FakeShell;
+        $driver = $os === 'mac' ? new MacDriver($this->shell, $config['helper']) : new LinuxDriver($this->shell, $config['helper']);
+        $this->host = new FakeHost($os, $this->shell);
 
         $this->wg = new WireGuard(
             config: $config,
             os: $driver,
             validator: new WireGuardValidator,
-            shell: $this->shell,
             keys: new KeyManager,
             configBuilder: new ConfigBuilder($config, $driver),
             ipAllocator: new IpAllocator,

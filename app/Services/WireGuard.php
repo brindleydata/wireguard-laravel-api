@@ -4,6 +4,7 @@ namespace App\Services;
 
 use App\DTOs\InterfaceInfo;
 use App\DTOs\PeerInfo;
+use App\Exceptions\CommandFailedException;
 use App\Exceptions\ConflictException;
 use App\Exceptions\NotFoundException;
 use App\Exceptions\SystemException;
@@ -18,7 +19,6 @@ class WireGuard
         protected array $config,
         protected OsDriver $os,
         protected WireGuardValidator $validator,
-        protected Shell $shell,
         protected KeyManager $keys,
         protected ConfigBuilder $configBuilder,
         protected IpAllocator $ipAllocator,
@@ -99,19 +99,21 @@ class WireGuard
                 throw new ConflictException("Link already exists: {$name}");
             }
 
-            // Check that ifout exists (if specified)
-            if ($ifout !== null) {
-                $system_interfaces = $this->os->networkInterfaces();
-                if (! in_array($ifout, $system_interfaces)) {
-                    throw new InvalidArgumentException("Output interface does not exist: {$ifout}");
-                }
+            $system_interfaces = $this->os->networkInterfaces();
+            if (in_array($name, $system_interfaces, true)) {
+                throw new ConflictException("A network interface named {$name} already exists");
+            }
+            if ($ifout !== null && ! in_array($ifout, $system_interfaces, true)) {
+                throw new InvalidArgumentException("Output interface does not exist: {$ifout}");
             }
 
             $ifout = $ifout ?? $this->os->defaultOutboundInterface();
-            $port = $port ?? mt_rand(33000, 65000);
-            $this->validator->validatePort($port);
-
             $address = str_contains($ip, '/') ? $ip : "{$ip}/24";
+
+            $others = $this->otherLinks($name);
+            $port = $port ?? $this->freePort($others);
+            $this->validator->validatePort($port);
+            $this->assertNoClash($port, $address, $others);
             $privkey = $this->keys->genkey();
 
             $content = $this->configBuilder->buildConfFile($address, $privkey, $port, $ifout, [], $dns, $keepalive, $allowed_ips, $forward, $nat, $up);
@@ -147,11 +149,16 @@ class WireGuard
                 throw new NotFoundException("Link does not exist: {$name}");
             }
 
-            if ($iface !== null) {
+            try {
                 $this->os->stopInterface($name);
-                // PostDown normally removes the rules; this also covers hooks that no longer match
-                $this->os->clearFirewall($name);
+            } catch (CommandFailedException $e) {
+                // Only a running link must stop; for a stopped one this just tidies up
+                if ($iface !== null) {
+                    throw $e;
+                }
             }
+            // PostDown normally removes the rules; this also covers hooks that no longer match
+            $this->os->clearFirewall($name);
 
             $this->os->deleteConfig($name);
             $this->os->deleteClientConfigDir($name);
@@ -186,6 +193,14 @@ class WireGuard
             $meta = $this->os->parseConfig($name);
             if ($meta === null) {
                 throw new NotFoundException("Link does not exist: {$name}");
+            }
+
+            if (isset($params['port']) || isset($params['address'])) {
+                $this->assertNoClash(
+                    isset($params['port']) ? (int) $params['port'] : null,
+                    $params['address'] ?? null,
+                    $this->otherLinks($name),
+                );
             }
 
             $iface = $this->runtimeInterface($name);
@@ -231,8 +246,8 @@ class WireGuard
                 // PostUp installs the rules for the new state
                 $this->os->startInterface($name);
             } elseif ($running && $up && ($forward !== $current_forward || $nat !== $current_nat || $ifout !== $current_ifout)) {
-                $address = $meta['address'] ?? $this->os->interfaceAddress($iface) ?? '';
-                $this->os->applyFirewall($name, $iface, $address, $ifout, $forward, $nat);
+                // The rules come from the config rewritten above
+                $this->os->applyFirewall($name, $iface);
             }
 
             $link = $this->getLink($name) ?? throw new NotFoundException("Link does not exist: {$name}");
@@ -285,7 +300,7 @@ class WireGuard
 
             if ($iface !== null) {
                 // Piped through stdin so the preshared key never touches the disk
-                $this->shell->run('sudo wg addconf :iface /dev/stdin', ['iface' => $iface], $this->peerSection($peer));
+                $this->os->addPeer($iface, $this->peerSection($peer));
                 $this->rewriteConf($link_name, $iface);
             } else {
                 $this->rewriteConf($link_name, null, peers: fn (array $peers) => [...$peers, $peer]);
@@ -320,7 +335,7 @@ class WireGuard
             }
 
             if ($iface !== null) {
-                $this->shell->run('sudo wg set :iface peer :pubkey remove', ['iface' => $iface, 'pubkey' => $pubkey]);
+                $this->os->removePeer($iface, $pubkey);
                 $this->rewriteConf($link_name, $iface);
             } else {
                 $this->rewriteConf($link_name, null, peers: fn (array $peers) => array_values(
@@ -378,11 +393,7 @@ class WireGuard
                 $changes['ip'] = $bare_ip;
 
                 if ($iface !== null) {
-                    $this->shell->run('sudo wg set :iface peer :pubkey allowed-ips :ips', [
-                        'iface' => $iface,
-                        'pubkey' => $pubkey,
-                        'ips' => $allowed_ips,
-                    ]);
+                    $this->os->setPeerAllowedIps($iface, $pubkey, $allowed_ips);
                     $this->rewriteConf($link_name, $iface);
                 } else {
                     $this->rewriteConf($link_name, null, peers: fn (array $peers) => array_map(
@@ -475,12 +486,7 @@ class WireGuard
 
     protected function runningInterfaces(): array
     {
-        $output = $this->shell->tryRun('sudo wg show interfaces');
-        if ($output === null || $output === '') {
-            return [];
-        }
-
-        return preg_split('/\s+/', trim($output));
+        return $this->os->runningInterfaces();
     }
 
     protected function loadLink(string $name, ?string $iface): ?InterfaceInfo
@@ -492,8 +498,12 @@ class WireGuard
 
     protected function getLinkFromRuntime(string $name, string $iface): ?InterfaceInfo
     {
-        $output = $this->shell->tryRun('sudo wg show :iface dump', ['iface' => $iface]);
-        if ($output === null || $output === '') {
+        try {
+            $output = $this->os->interfaceDump($iface);
+        } catch (CommandFailedException) {
+            return null; // Stopped since it was listed
+        }
+        if ($output === '') {
             return null;
         }
 
@@ -509,7 +519,6 @@ class WireGuard
         return new InterfaceInfo(
             name: $name,
             public_key: $public_key,
-            private_key: $private_key,
             listen_port: (int) ($iface_parts[2] ?? 0),
             address: $this->os->interfaceAddress($iface) ?? $meta['address'] ?? '(none)',
             ifout: $meta['ifout'] ?? $this->os->defaultOutboundInterface(),
@@ -537,7 +546,6 @@ class WireGuard
         return new InterfaceInfo(
             name: $name,
             public_key: $private_key !== '' ? $this->keys->pubkey($private_key) : '',
-            private_key: $private_key,
             listen_port: (int) ($interface['ListenPort'] ?? 0),
             address: $metadata['address'] ?? $interface['Address'] ?? '(none)',
             ifout: $metadata['ifout'] ?? $this->os->defaultOutboundInterface(),
@@ -546,6 +554,61 @@ class WireGuard
             up: false,
             peers: array_map(fn (array $p) => $this->peerInfo($p), $this->confPeers($parsed['peers'])),
         );
+    }
+
+    // ─── Clash checks ────────────────────────────────────────────────
+
+    /**
+     * Listen port and address of every other link, from their configs.
+     *
+     * @return array<string, array{port: int, address: string}>
+     */
+    protected function otherLinks(string $name): array
+    {
+        $links = [];
+        foreach ($this->os->listConfigNames() as $other) {
+            if ($other === $name || ($content = $this->os->readConfig($other)) === null) {
+                continue;
+            }
+            $parsed = $this->configBuilder->parseConfContent($content);
+            $links[$other] = [
+                'port' => (int) ($parsed['interface']['ListenPort'] ?? 0),
+                'address' => $parsed['metadata']['address'] ?? $parsed['interface']['Address'] ?? '',
+            ];
+        }
+
+        return $links;
+    }
+
+    /**
+     * A random port in 33000-65000 that no other link listens on.
+     */
+    protected function freePort(array $others): int
+    {
+        $used = array_column($others, 'port');
+        for ($attempt = 0; $attempt < 100; $attempt++) {
+            $port = random_int(33000, 65000);
+            if (! in_array($port, $used, true)) {
+                return $port;
+            }
+        }
+
+        throw new ConflictException('No free listen port found.');
+    }
+
+    /**
+     * Two links can't listen on the same port or route overlapping subnets.
+     */
+    protected function assertNoClash(?int $port, ?string $address, array $others): void
+    {
+        foreach ($others as $other => $settings) {
+            if ($port !== null && $port === $settings['port']) {
+                throw new ConflictException("Port {$port} is already used by link {$other}");
+            }
+            if ($address !== null && $settings['address'] !== '' && IpAllocator::overlaps($address, $settings['address'])) {
+                throw new ConflictException("Subnet {$address} overlaps link {$other} ({$settings['address']})");
+            }
+        }
     }
 
     // ─── Config regeneration ─────────────────────────────────────────
@@ -590,7 +653,7 @@ class WireGuard
      */
     protected function dumpPeers(string $iface): array
     {
-        $output = $this->shell->run('sudo wg show :iface dump', ['iface' => $iface]);
+        $output = $this->os->interfaceDump($iface);
 
         return $this->parseDumpPeers(explode("\n", $output));
     }

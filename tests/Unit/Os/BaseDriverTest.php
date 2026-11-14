@@ -4,48 +4,67 @@ use App\Services\Os\LinuxDriver;
 use Tests\Fakes\CommandFailed;
 use Tests\Fakes\FakeShell;
 
-const INSTALL_FILE = 'sudo mkdir -p :dir && sudo cp :tmp :path && sudo chmod 600 :path';
+/*
+ * The privileged half of both drivers: everything goes through the root helper.
+ */
 
-it('stages a config as a private file under /tmp', function () {
-    $staged = null;
-    $shell = (new FakeShell)->on(INSTALL_FILE, function (array $b) use (&$staged) {
-        clearstatcache();
-        $staged = [
-            'bindings' => $b,
-            'mode' => sprintf('%04o', fileperms($b['tmp']) & 0777),
-            'content' => file_get_contents($b['tmp']),
-        ];
+function helperDriver(FakeShell $shell): LinuxDriver
+{
+    return new LinuxDriver($shell, '/usr/local/sbin/wgla-helper');
+}
 
-        return '';
-    });
+it('runs privileged operations through the helper with sudo -n', function () {
+    $shell = (new FakeShell)->otherwise(fn () => '');
+    $driver = helperDriver($shell);
 
-    (new LinuxDriver($shell))->writeConfig('wg0', 'secret');
+    $driver->writeConfig('wg0', 'secret');
+    $driver->startInterface('wg0');
+    $driver->applyFirewall('wg0', 'wg0');
+    $driver->removePeer('wg0', 'xTIBA5rboUvnH4htodjb6e697QjLERt1NAB4mZqp8Dg=');
 
-    // Literal /tmp: sudoers allows `cp /tmp/* ...`, and tempnam() would give /private/tmp on macOS
-    expect($staged['bindings'])->toMatchArray(['dir' => '/etc/wireguard', 'path' => '/etc/wireguard/wg0.conf'])
-        ->and($staged['bindings']['tmp'])->toMatch('#^/tmp/wgla_[0-9a-f]{16}$#')->not->toBeFile()
-        ->and($staged['mode'])->toBe('0600')
-        ->and($staged['content'])->toBe("secret\n");
+    expect(array_column($shell->calls, 'bound'))->toBe([
+        "sudo -n '/usr/local/sbin/wgla-helper' conf-write 'wg0'",
+        "sudo -n '/usr/local/sbin/wgla-helper' up 'wg0'",
+        "sudo -n '/usr/local/sbin/wgla-helper' firewall-up 'wg0' 'wg0'",
+        "sudo -n '/usr/local/sbin/wgla-helper' peer-remove 'wg0' 'xTIBA5rboUvnH4htodjb6e697QjLERt1NAB4mZqp8Dg='",
+    ]);
 });
 
-it('removes the staging file when the copy fails', function () {
-    $tmp = null;
-    $shell = (new FakeShell)->on(INSTALL_FILE, function (array $b) use (&$tmp) {
-        $tmp = $b['tmp'];
-        throw new CommandFailed('sudo: a password is required');
-    });
+it('hands config contents to the helper on stdin', function () {
+    $shell = (new FakeShell)->otherwise(fn () => '');
+    $driver = helperDriver($shell);
 
-    expect(fn () => (new LinuxDriver($shell))->writeClientConfig('wg0', 'abc', 'secret'))
-        ->toThrow(CommandFailed::class);
+    $driver->writeConfig('wg0', 'link secret');
+    $driver->writeClientConfig('wg0', 'abc', 'client secret');
+    $driver->addPeer('wg0', "[Peer]\n");
 
-    expect($tmp)->not->toBeFile();
+    expect(array_column($shell->calls, 'input'))->toBe(["link secret\n", "client secret\n", "[Peer]\n"])
+        ->and(implode("\n", array_column($shell->calls, 'bound')))->not->toContain('secret');
 });
 
-it('keeps client configs in a per-link directory', function () {
-    $shell = (new FakeShell)->on(INSTALL_FILE, fn () => '');
+it('reads a missing config as null', function () {
+    $shell = (new FakeShell)->otherwise(fn () => throw new CommandFailed('wgla-helper: no config for link wg0'));
+    $driver = helperDriver($shell);
 
-    (new LinuxDriver($shell))->writeClientConfig('wg0', 'abc', 'secret');
+    expect($driver->readConfig('wg0'))->toBeNull()
+        ->and($driver->configExists('wg0'))->toBeFalse()
+        ->and($driver->parseConfig('wg0'))->toBeNull()
+        ->and($driver->readClientConfig('wg0', 'abc'))->toBeNull()
+        ->and($driver->listConfigNames())->toBe([])
+        ->and($driver->runningInterfaces())->toBe([]);
+});
 
-    expect($shell->callsTo(INSTALL_FILE)[0]['bindings'])
-        ->toMatchArray(['dir' => '/etc/wireguard/clients/wg0', 'path' => '/etc/wireguard/clients/wg0/abc.conf']);
+it('lists configs and running interfaces', function () {
+    $shell = (new FakeShell)
+        ->on('sudo -n :helper conf-list', fn () => "wg0\nwg1\n")
+        ->on('sudo -n :helper interfaces', fn () => "wg0 wg1\n");
+
+    expect(helperDriver($shell)->listConfigNames())->toBe(['wg0', 'wg1'])
+        ->and(helperDriver($shell)->runningInterfaces())->toBe(['wg0', 'wg1']);
+});
+
+it('passes helper failures on with their message', function () {
+    $shell = (new FakeShell)->otherwise(fn () => throw new CommandFailed('sudo: a password is required'));
+
+    expect(fn () => helperDriver($shell)->startInterface('wg0'))->toThrow(CommandFailed::class, 'sudo: a password is required');
 });

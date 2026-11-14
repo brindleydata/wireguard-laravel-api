@@ -2,8 +2,6 @@
 
 namespace App\Services\Os;
 
-use App\Services\IpAllocator;
-
 class MacDriver extends BaseDriver
 {
     public function cpu(): array
@@ -93,105 +91,10 @@ class MacDriver extends BaseDriver
         return 'en0';
     }
 
-    public function configPath(): string
+    protected function hookPlaceholders(): array
     {
-        // Apple Silicon uses /opt/homebrew, Intel uses /usr/local
-        $arm_path = '/opt/homebrew/etc/wireguard';
-        $intel_path = '/usr/local/etc/wireguard';
-
-        if (is_dir($arm_path)) {
-            return $arm_path;
-        }
-
-        if (is_dir($intel_path)) {
-            return $intel_path;
-        }
-
-        // Fallback based on architecture
-        return php_uname('m') === 'arm64' ? $arm_path : $intel_path;
-    }
-
-    public function resolveInterface(string $link): string
-    {
-        // Written by wireguard-go (mode 0400, so it needs sudo) and removed by `wg-quick down`
-        $real = $this->shell->tryRun('sudo cat :path', ['path' => "/var/run/wireguard/{$link}.name"]);
-
-        return $real !== null && preg_match('/^utun\d+$/', $real) ? $real : $link;
-    }
-
-    /**
-     * Rules live in the pf anchor `wg/<link>`. In wg-quick hooks on macOS `%i` expands to the
-     * real utunN and `%I` to the link name, so the anchor uses `%I` (matching applyFirewall()
-     * and clearFirewall()) while the rules use `%i`.
-     */
-    public function interfaceSection(string $address, string $privkey, int $port, string $ifout, bool $forward = false, bool $nat = false): string
-    {
-        $lines = [
-            '[Interface]',
-            "Address = {$address}",
-            "PrivateKey = {$privkey}",
-            "ListenPort = {$port}",
-        ];
-
-        $rules = $this->firewallRules('%i', $address, $ifout, $forward, $nat);
-        if ($rules !== []) {
-            // A wg-quick value can't span lines, so printf emits one rule per line for pfctl.
-            // `&&` makes a rejected ruleset fail `wg-quick up` instead of passing silently.
-            $printf = "printf '%s\\n' ".implode(' ', array_map('escapeshellarg', $rules));
-            $lines[] = "PostUp = {$printf} | pfctl -a 'wg/%I' -f - && { pfctl -e 2>/dev/null || true; }";
-            $lines[] = "PostDown = pfctl -a 'wg/%I' -F all 2>/dev/null || true";
-        }
-
-        return implode("\n", $lines);
-    }
-
-    public function applyFirewall(string $link, string $iface, string $address, string $ifout, bool $forward, bool $nat): void
-    {
-        $rules = $this->firewallRules($iface, $address, $ifout, $forward, $nat);
-        if ($rules === []) {
-            $this->clearFirewall($link);
-
-            return;
-        }
-
-        // Loading a ruleset into an anchor replaces everything previously in it
-        $this->shell->run('sudo pfctl -a :anchor -f -', ['anchor' => "wg/{$link}"], implode("\n", $rules)."\n");
-        $this->shell->tryRun('sudo pfctl -e');
-    }
-
-    public function clearFirewall(string $link): void
-    {
-        $this->shell->tryRun('sudo pfctl -a :anchor -F all', ['anchor' => "wg/{$link}"]);
-    }
-
-    public function startInterface(string $name): void
-    {
-        $this->shell->run('sudo wg-quick up :name', ['name' => $name]);
-    }
-
-    public function stopInterface(string $name): void
-    {
-        $this->shell->run('sudo wg-quick down :name', ['name' => $name]);
-    }
-
-    /**
-     * pf rejects a ruleset whose translation (nat) rules come after filter (pass) rules.
-     */
-    protected function firewallRules(string $iface, string $address, string $ifout, bool $forward, bool $nat): array
-    {
-        $rules = [];
-
-        if ($nat) {
-            $network = IpAllocator::networkCidr($address);
-            $rules[] = "nat on {$ifout} from {$network} to any -> ({$ifout})";
-        }
-
-        if ($forward) {
-            $rules[] = "pass in on {$iface} all";
-            $rules[] = "pass out on {$iface} all";
-        }
-
-        return $rules;
+        // wg-quick on macOS expands %I to the link name and %i to the real utunN
+        return ['%I', '%i'];
     }
 
     protected function hexMaskToCidr(string $hex): int

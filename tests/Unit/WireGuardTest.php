@@ -47,7 +47,7 @@ it('applies peer changes on a running link live and saves them', function (strin
     expect($peer->allowed_ips)->toBe('10.0.0.2/32')
         ->and($rig->host->runtimePeers('wg0'))->toBe([$peer->public_key => '10.0.0.2/32'])
         ->and($rig->host->confPeers('wg0'))->toBe([$peer->public_key => '10.0.0.2/32'])
-        ->and($rig->shell->callsTo('sudo wg addconf :iface /dev/stdin')[0]['bindings']['iface'])->toBe($rig->host->interfaceOf('wg0'))
+        ->and($rig->shell->callsTo('sudo -n :helper peer-add :iface')[0]['bindings']['iface'])->toBe($rig->host->interfaceOf('wg0'))
         ->and($peer->client_config)->toContain('Endpoint = vpn.example.test:51820')
         ->and($rig->wg->getPeerConfig('wg0', $peer->public_key))->toBe($peer->client_config);
 
@@ -77,8 +77,8 @@ it('only edits the config for peer changes on a stopped link', function (string 
     expect($second->allowed_ips)->toBe('10.0.0.3/32')
         ->and($rig->host->confPeers('wg0'))->toBe([$first->public_key => '10.0.0.9/32'])
         ->and($rig->host->interfaceOf('wg0'))->toBeNull()
-        ->and($rig->shell->callsTo('sudo wg addconf :iface /dev/stdin'))->toBe([])
-        ->and($rig->shell->callsTo('sudo wg set :iface peer :pubkey remove'))->toBe([]);
+        ->and($rig->shell->callsTo('sudo -n :helper peer-add :iface'))->toBe([])
+        ->and($rig->shell->callsTo('sudo -n :helper peer-remove :iface :pubkey'))->toBe([]);
 
     // Starting the link loads the saved peers
     $link = $rig->wg->updateLink('wg0', ['up' => true]);
@@ -95,7 +95,7 @@ it('stops a deleted running link and removes its files', function (string $os) {
     $rig->wg->deleteLink('wg0');
 
     expect($rig->host->interfaces)->toBe([])
-        ->and($rig->host->files)->toBe([], 'Config, client configs and the macOS name file are gone')
+        ->and($rig->host->files())->toBe([], 'Config, client configs and the macOS name file are gone')
         ->and($rig->host->firewall)->toBe([])
         ->and($rig->host->enabledUnits)->toBe([])
         ->and($rig->wg->listLinks())->toBe([]);
@@ -135,15 +135,15 @@ it('leaves no rules behind when stopping while turning them off', function (stri
         ->and($rig->host->firewall)->toBe([]);
 })->with('os');
 
-it('targets the utun interface in the macOS link anchor', function () {
-    $rig = new Rig('mac');
+it('applies live firewall changes to the real interface', function (string $os) {
+    $rig = new Rig($os);
     $rig->wg->createLink('wg0', '10.0.0.1/24', 51820);
 
     $rig->wg->updateLink('wg0', ['forward' => true, 'nat' => true]);
 
-    expect($rig->host->anchors['wg/wg0'])
-        ->toBe("nat on en0 from 10.0.0.0/24 to any -> (en0)\npass in on utun4 all\npass out on utun4 all\n");
-});
+    expect($rig->shell->callsTo('sudo -n :helper firewall-up :link :iface')[0]['bindings'])
+        ->toMatchArray(['link' => 'wg0', 'iface' => $os === 'mac' ? 'utun4' : 'wg0']);
+})->with('os');
 
 it('restarts the link with its peers when address and port change', function (string $os) {
     $rig = new Rig($os);
@@ -181,14 +181,17 @@ it('lists unmanaged running interfaces once', function (string $os) {
     expect($rig->wg->listLinks())->toBe(['wg0', 'wg9']);
 })->with('os');
 
-it('stages files privately and keeps locks in the shared directory', function (string $os) {
+it('hands configs and peers to the helper on stdin and keeps locks in the shared directory', function (string $os) {
     $rig = new Rig($os);
     $rig->wg->createLink('wg0', '10.0.0.1/24', 51820);
-    $rig->wg->addPeer('wg0');
+    $peer = $rig->wg->addPeer('wg0');
 
-    expect($rig->host->stagedModes)->not->toBeEmpty()
-        ->and(array_values(array_unique($rig->host->stagedModes)))->toBe(['0600'])
-        ->and(glob("{$rig->tmp}/staging/*"))->toBe([], 'Staging files are removed')
+    // Secrets never appear on a command line or in a temp file
+    foreach ($rig->shell->calls as $call) {
+        expect($call['bound'])->not->toContain($peer->private_key)->not->toContain($peer->preshared_key);
+    }
+    expect($rig->shell->callsTo('sudo -n :helper conf-write :name')[0]['input'])->toContain('PrivateKey = ')
+        ->and($rig->shell->callsTo('sudo -n :helper peer-add :iface')[0]['input'])->toContain("PresharedKey = {$peer->preshared_key}")
         ->and("{$rig->tmp}/locks/wg0.lock")->toBeFile();
 })->with('os');
 
@@ -263,6 +266,56 @@ it('only accepts a free single host in the subnet as a peer address', function (
     'outside the subnet' => '10.0.1.5',
     'already taken' => '10.0.0.2',
 ]);
+
+it('refuses a link that clashes with another link or interface', function (string $os, array $link, string $message) {
+    $rig = new Rig($os);
+    $rig->wg->createLink('wg0', '10.0.0.1/24', 51820);
+
+    expect(fn () => $rig->wg->createLink(...$link))->toThrow(ConflictException::class, $message);
+})->with('os')->with([
+    'same port' => [['name' => 'wg1', 'ip' => '10.1.0.1/24', 'port' => 51820], 'Port 51820 is already used by link wg0'],
+    'overlapping subnet' => [['name' => 'wg1', 'ip' => '10.0.0.129/25', 'port' => 51821], 'overlaps link wg0'],
+    'enclosing subnet' => [['name' => 'wg1', 'ip' => '10.0.5.1/16', 'port' => 51821], 'overlaps link wg0'],
+]);
+
+it('refuses a link named after an existing network interface', function (string $os) {
+    $rig = new Rig($os);
+    $name = $os === 'mac' ? 'en0' : 'eth0';
+
+    expect(fn () => $rig->wg->createLink($name, '10.1.0.1/24', 51821))
+        ->toThrow(ConflictException::class, "A network interface named {$name} already exists");
+})->with('os');
+
+it('refuses to move a link onto another link\'s port or subnet', function () {
+    $rig = new Rig('linux');
+    $rig->wg->createLink('wg0', '10.0.0.1/24', 51820);
+    $rig->wg->createLink('wg1', '10.1.0.1/24', 51821);
+
+    expect(fn () => $rig->wg->updateLink('wg1', ['port' => 51820]))->toThrow(ConflictException::class, 'Port 51820')
+        ->and(fn () => $rig->wg->updateLink('wg1', ['address' => '10.0.0.200/24']))->toThrow(ConflictException::class, 'overlaps link wg0')
+        ->and($rig->wg->updateLink('wg1', ['port' => 51822])->listen_port)->toBe(51822);
+});
+
+it('picks a free random port', function () {
+    $rig = new Rig('linux');
+
+    $first = $rig->wg->createLink('wg0', '10.0.0.1/24');
+    $second = $rig->wg->createLink('wg1', '10.1.0.1/24');
+
+    expect($first->listen_port)->toBeGreaterThanOrEqual(33000)->toBeLessThanOrEqual(65000)
+        ->and($second->listen_port)->not->toBe($first->listen_port);
+});
+
+it('disables the unit of a stopped link when deleting it on Linux', function () {
+    $rig = new Rig('linux');
+    $rig->wg->createLink('wg0', '10.0.0.1/24', 51820, up: false);
+    $rig->host->enabledUnits[] = 'wg0'; // e.g. it failed to start at boot
+
+    $rig->wg->deleteLink('wg0');
+
+    expect($rig->host->enabledUnits)->toBe([])
+        ->and($rig->host->files())->toBe([]);
+});
 
 it('treats creating an existing link as a conflict', function () {
     $rig = new Rig('linux');

@@ -23,9 +23,11 @@ class WireGuardServiceProvider extends ServiceProvider
         $this->app->singleton(OsDriver::class, function ($app) {
             $shell = $app->make(Shell::class);
 
+            $helper = config('wireguard.helper');
+
             return match (PHP_OS_FAMILY) {
-                'Darwin' => new MacDriver($shell),
-                default => new LinuxDriver($shell),
+                'Darwin' => new MacDriver($shell, $helper),
+                default => new LinuxDriver($shell, $helper),
             };
         });
 
@@ -48,7 +50,6 @@ class WireGuardServiceProvider extends ServiceProvider
             config: config('wireguard'),
             os: $app->make(OsDriver::class),
             validator: $app->make(WireGuardValidator::class),
-            shell: $app->make(Shell::class),
             keys: $app->make(KeyManager::class),
             configBuilder: $app->make(ConfigBuilder::class),
             ipAllocator: $app->make(IpAllocator::class),

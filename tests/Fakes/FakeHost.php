@@ -5,20 +5,25 @@ namespace Tests\Fakes;
 use LogicException;
 
 /**
- * An in-memory host behind FakeShell, modelled on how the real tools behave:
+ * An in-memory host behind FakeShell. It plays the root helper's commands (bin/wgla-helper,
+ * whose own behaviour is covered by HelperTest) plus the unprivileged system tools:
  *
- * - Linux: `systemctl start wg-quick@<link>` creates an interface named after the link; one
- *   nftables table `inet wg_<link>` per link.
- * - macOS: `wg-quick up <link>` creates the next free utunN and records it in
- *   /var/run/wireguard/<link>.name (removed again by `wg-quick down`); one pf anchor `wg/<link>`.
+ * - Linux: `up` enables + starts wg-quick@<link>, which runs as an interface named after the link.
+ * - macOS: `up` runs wg-quick, which creates the next free utunN and records it (`resolve`).
  *
- * Starting a link rejects config lines wg-quick couldn't parse. PostUp/PostDown hooks are not
- * executed here (the driver tests run them in bash); their effect is modelled from the metadata.
+ * Starting a link rejects config lines wg-quick couldn't parse. The PostUp/PostDown hooks call the
+ * helper's firewall commands, so their effect is modelled from the config's metadata.
  */
 class FakeHost
 {
-    /** @var array<string, string> path => content */
-    public array $files = [];
+    /** @var array<string, string> link => .conf content */
+    public array $confs = [];
+
+    /** @var array<string, string> "link/key" => client config content */
+    public array $clients = [];
+
+    /** @var array<string, string> link => utunN (macOS wg-quick name files) */
+    public array $names = [];
 
     /** @var array<string, array{link: ?string, private_key: string, port: int, address: string, peers: array<string, array{psk: ?string, allowed_ips: string}>}> */
     public array $interfaces = [];
@@ -26,14 +31,8 @@ class FakeHost
     /** @var array<string, array{forward: bool, nat: bool}> live firewall state per link */
     public array $firewall = [];
 
-    /** @var array<string, string> pf anchor => loaded ruleset (macOS) */
-    public array $anchors = [];
-
     /** @var list<string> */
     public array $enabledUnits = [];
-
-    /** @var list<string> permission bits of each staging file when it was copied into place */
-    public array $stagedModes = [];
 
     /** Make the next link start fail, like a wg-quick error. */
     public bool $failNextStart = false;
@@ -43,24 +42,25 @@ class FakeHost
     public function __construct(
         public readonly string $os,
         public readonly FakeShell $shell,
-        public readonly string $configPath,
-        public readonly string $stagingDir,
     ) {
-        $this->registerFiles();
-        $this->registerWireGuard();
+        $this->registerHelper();
         $os === 'mac' ? $this->registerMac() : $this->registerLinux();
+        $this->shell
+            ->on('curl -4 -s --max-time 5 :url', fn () => '203.0.113.10')
+            ->on('curl -6 -s --max-time 5 :url', fn () => $this->fail());
     }
 
     // ─── Inspection helpers ──────────────────────────────────────────
 
     public function conf(string $link): ?string
     {
-        return $this->files["{$this->configPath}/{$link}.conf"] ?? null;
+        return $this->confs[$link] ?? null;
     }
 
-    public function clientConfig(string $link, string $safe_pubkey): ?string
+    /** Everything stored on the host: configs, client configs and macOS name files. */
+    public function files(): array
     {
-        return $this->files["{$this->configPath}/clients/{$link}/{$safe_pubkey}.conf"] ?? null;
+        return [...$this->confs, ...$this->clients, ...$this->names];
     }
 
     /** The OS interface a link runs as, or null when it is down. */
@@ -106,93 +106,100 @@ class FakeHost
         ];
     }
 
-    // ─── Files (config dir, client configs, /var/run/wireguard) ──────
+    // ─── The root helper ─────────────────────────────────────────────
 
-    protected function registerFiles(): void
+    protected function registerHelper(): void
     {
-        $this->shell
-            ->on('sudo cat :path', fn (array $b) => $this->files[$b['path']] ?? $this->fail())
-            ->on('sudo test -f :path && echo 1', fn (array $b) => isset($this->files[$b['path']]) ? '1' : $this->fail())
-            ->on('sudo ls :path', fn (array $b) => implode("\n", $this->ls($b['path'])))
-            ->on('sudo mkdir -p :dir && sudo cp :tmp :path && sudo chmod 600 :path', function (array $b) {
-                if (! str_starts_with($b['tmp'], $this->stagingDir.'/')) {
-                    throw new LogicException("Staging file {$b['tmp']} is outside {$this->stagingDir}; sudoers would reject the cp");
-                }
-                if (dirname($b['path']) !== $b['dir']) {
-                    throw new LogicException("mkdir {$b['dir']} does not create the parent of {$b['path']}");
-                }
+        $helper = fn (string $command, callable $handler) => $this->shell->on("sudo -n :helper {$command}", $handler);
 
-                clearstatcache();
-                $this->stagedModes[] = sprintf('%04o', fileperms($b['tmp']) & 0777);
-                $this->files[$b['path']] = file_get_contents($b['tmp']);
-
-                return '';
-            })
-            ->on('sudo rm -f :path', function (array $b) {
-                unset($this->files[$b['path']]);
-
-                return '';
-            })
-            ->on('sudo rm -rf :dir', function (array $b) {
-                foreach (array_keys($this->files) as $path) {
-                    if (str_starts_with($path, $b['dir'].'/')) {
-                        unset($this->files[$path]);
-                    }
-                }
-
-                return '';
-            })
-            ->on('curl -4 -s --max-time 5 :url', fn () => '203.0.113.10')
-            ->on('curl -6 -s --max-time 5 :url', fn () => $this->fail());
-    }
-
-    /** @return list<string> entries directly inside $dir */
-    protected function ls(string $dir): array
-    {
-        $entries = [];
-        foreach (array_keys($this->files) as $path) {
-            if (str_starts_with($path, $dir.'/')) {
-                $entries[] = explode('/', substr($path, strlen($dir) + 1))[0];
+        // Runtime state
+        $helper('interfaces', fn () => implode(' ', array_keys($this->interfaces)));
+        $helper('dump :iface', fn (array $b) => $this->dump($b['iface']));
+        $helper('peer-add :iface', function (array $b, ?string $input) {
+            $this->requireInterface($b['iface']);
+            foreach ($this->parse((string) $input)['peers'] as $peer) {
+                $this->interfaces[$b['iface']]['peers'][$peer['PublicKey']] = [
+                    'psk' => $peer['PresharedKey'] ?? null,
+                    'allowed_ips' => $peer['AllowedIPs'],
+                ];
             }
-        }
 
-        $entries = array_values(array_unique($entries));
-        sort($entries);
+            return '';
+        });
+        $helper('peer-remove :iface :pubkey', function (array $b) {
+            $this->requireInterface($b['iface']);
+            unset($this->interfaces[$b['iface']]['peers'][$b['pubkey']]);
 
-        return $entries;
-    }
+            return '';
+        });
+        $helper('peer-ips :iface :pubkey :ips', function (array $b) {
+            $this->requireInterface($b['iface']);
+            $this->interfaces[$b['iface']]['peers'][$b['pubkey']]['allowed_ips'] = $b['ips'];
 
-    // ─── wg ──────────────────────────────────────────────────────────
+            return '';
+        });
 
-    protected function registerWireGuard(): void
-    {
-        $this->shell
-            ->on('sudo wg show interfaces', fn () => implode(' ', array_keys($this->interfaces)))
-            ->on('sudo wg show :iface dump', fn (array $b) => $this->dump($b['iface']))
-            ->on('sudo wg addconf :iface /dev/stdin', function (array $b, ?string $input) {
-                $this->requireInterface($b['iface']);
-                foreach ($this->parse((string) $input)['peers'] as $peer) {
-                    $this->interfaces[$b['iface']]['peers'][$peer['PublicKey']] = [
-                        'psk' => $peer['PresharedKey'] ?? null,
-                        'allowed_ips' => $peer['AllowedIPs'],
-                    ];
+        // Link configs
+        $helper('conf-list', fn () => implode("\n", array_keys($this->confs)));
+        $helper('conf-read :name', fn (array $b) => $this->confs[$b['name']] ?? $this->fail("no config for link {$b['name']}"));
+        $helper('conf-write :name', function (array $b, ?string $input) {
+            $this->confs[$b['name']] = (string) $input;
+
+            return '';
+        });
+        $helper('conf-delete :name', function (array $b) {
+            unset($this->confs[$b['name']]);
+
+            return '';
+        });
+
+        // Client configs
+        $helper('client-read :link :key', fn (array $b) => $this->clients["{$b['link']}/{$b['key']}"] ?? $this->fail('no client config'));
+        $helper('client-write :link :key', function (array $b, ?string $input) {
+            $this->clients["{$b['link']}/{$b['key']}"] = (string) $input;
+
+            return '';
+        });
+        $helper('client-delete :link :key', function (array $b) {
+            unset($this->clients["{$b['link']}/{$b['key']}"]);
+
+            return '';
+        });
+        $helper('client-delete-all :link', function (array $b) {
+            foreach (array_keys($this->clients) as $key) {
+                if (str_starts_with($key, "{$b['link']}/")) {
+                    unset($this->clients[$key]);
                 }
+            }
 
-                return '';
-            })
-            ->on('sudo wg set :iface peer :pubkey remove', function (array $b) {
-                $this->requireInterface($b['iface']);
-                unset($this->interfaces[$b['iface']]['peers'][$b['pubkey']]);
+            return '';
+        });
 
-                return '';
-            })
-            ->on('sudo wg set :iface peer :pubkey allowed-ips :ips', function (array $b) {
-                $this->requireInterface($b['iface']);
-                $this->interfaces[$b['iface']]['peers'][$b['pubkey']] ??= ['psk' => null, 'allowed_ips' => ''];
-                $this->interfaces[$b['iface']]['peers'][$b['pubkey']]['allowed_ips'] = $b['ips'];
+        // Lifecycle: `down` is idempotent, like the real helper
+        $helper('up :name', function (array $b) {
+            $this->conf($b['name']) ?? $this->fail("no config for link {$b['name']}");
+            $this->os === 'mac' ? $this->wgQuickUp($b['name']) : $this->systemdUp($b['name']);
 
-                return '';
-            });
+            return '';
+        });
+        $helper('down :name', function (array $b) {
+            $this->os === 'mac' ? $this->wgQuickDown($b['name']) : $this->systemdDown($b['name']);
+
+            return '';
+        });
+        $helper('resolve :name', fn (array $b) => $this->os === 'mac' ? ($this->names[$b['name']] ?? $b['name']) : $b['name']);
+
+        // Firewall: rules come from the saved config, as in the real helper
+        $helper('firewall-up :link :iface', function (array $b) {
+            $this->applyFirewall($b['link']);
+
+            return '';
+        });
+        $helper('firewall-down :link', function (array $b) {
+            unset($this->firewall[$b['link']]);
+
+            return '';
+        });
     }
 
     protected function dump(string $iface): string
@@ -213,7 +220,54 @@ class FakeHost
         return $this->interfaces[$iface] ?? $this->fail("Unable to access interface: {$iface}");
     }
 
-    // ─── wg-quick lifecycle ──────────────────────────────────────────
+    protected function applyFirewall(string $link): void
+    {
+        $meta = $this->parse($this->conf($link) ?? $this->fail("no config for link {$link}"))['meta'];
+        $state = ['forward' => ($meta['forward'] ?? 'false') === 'true', 'nat' => ($meta['nat'] ?? 'false') === 'true'];
+
+        if ($state['forward'] || $state['nat']) {
+            $this->firewall[$link] = $state;
+        } else {
+            unset($this->firewall[$link]);
+        }
+    }
+
+    // ─── wg-quick ────────────────────────────────────────────────────
+
+    protected function systemdUp(string $link): void
+    {
+        $this->enabledUnits = array_values(array_unique([...$this->enabledUnits, $link]));
+        if (! isset($this->interfaces[$link])) {
+            $this->bringUp($link, $link);
+        }
+    }
+
+    protected function systemdDown(string $link): void
+    {
+        if (isset($this->interfaces[$link])) {
+            $this->bringDown($link, $link);
+        }
+        $this->enabledUnits = array_values(array_diff($this->enabledUnits, [$link]));
+    }
+
+    protected function wgQuickUp(string $link): void
+    {
+        if (isset($this->names[$link])) {
+            $this->fail("wg-quick: `{$link}' already exists");
+        }
+
+        $iface = 'utun'.$this->nextUtun++;
+        $this->bringUp($link, $iface);
+        $this->names[$link] = $iface;
+    }
+
+    protected function wgQuickDown(string $link): void
+    {
+        if (isset($this->names[$link])) {
+            $this->bringDown($link, $this->names[$link]);
+            unset($this->names[$link]);
+        }
+    }
 
     protected function bringUp(string $link, string $iface): void
     {
@@ -240,11 +294,9 @@ class FakeHost
             'peers' => $peers,
         ];
 
+        // PostUp = <helper> firewall-up …
         if (isset($parsed['interface']['PostUp'])) {
-            $this->firewall[$link] = [
-                'forward' => ($parsed['meta']['forward'] ?? 'false') === 'true',
-                'nat' => ($parsed['meta']['nat'] ?? 'false') === 'true',
-            ];
+            $this->applyFirewall($link);
         }
     }
 
@@ -252,6 +304,7 @@ class FakeHost
     {
         unset($this->interfaces[$iface]);
 
+        // PostDown = <helper> firewall-down …
         if (isset($this->parse($this->conf($link) ?? '')['interface']['PostDown'])) {
             unset($this->firewall[$link]);
         }
@@ -274,29 +327,11 @@ class FakeHost
         }
     }
 
-    // ─── Linux: systemd + iproute2 + nftables ────────────────────────
+    // ─── Unprivileged system tools ───────────────────────────────────
 
     protected function registerLinux(): void
     {
         $this->shell
-            ->on('sudo systemctl enable :unit && sudo systemctl start :unit', function (array $b) {
-                $link = $this->unitLink($b['unit']);
-                $this->enabledUnits = array_values(array_unique([...$this->enabledUnits, $link]));
-                if (! isset($this->interfaces[$link])) {
-                    $this->bringUp($link, $link);
-                }
-
-                return '';
-            })
-            ->on('sudo systemctl stop :unit && sudo systemctl disable :unit', function (array $b) {
-                $link = $this->unitLink($b['unit']);
-                if (isset($this->interfaces[$link])) {
-                    $this->bringDown($link, $link);
-                }
-                $this->enabledUnits = array_values(array_diff($this->enabledUnits, [$link]));
-
-                return '';
-            })
             ->on('ip address show dev :ifname', function (array $b) {
                 $interface = $this->requireInterface($b['ifname']);
 
@@ -312,84 +347,12 @@ class FakeHost
 
                 return implode("\n", $lines);
             })
-            ->on('ip route show default', fn () => 'default via 192.0.2.1 dev eth0 proto static')
-            ->on('sudo nft add table inet :table', function (array $b) {
-                $this->firewall[$this->tableLink($b['table'])] ??= ['forward' => false, 'nat' => false];
-
-                return '';
-            })
-            ->on("sudo nft add chain inet :table forward '{ type filter hook forward priority 0; }'", fn (array $b) => $this->nftChain($b['table'], 'forward'))
-            ->on("sudo nft add chain inet :table postrouting '{ type nat hook postrouting priority 100; }'", fn (array $b) => $this->nftChain($b['table'], 'nat'))
-            ->on('sudo nft add rule inet :table forward iifname :iface accept', fn (array $b) => $this->nftRule($b['table'], 'forward'))
-            ->on('sudo nft add rule inet :table forward oifname :iface accept', fn (array $b) => $this->nftRule($b['table'], 'forward'))
-            ->on('sudo nft add rule inet :table postrouting oifname :ifout masquerade', fn (array $b) => $this->nftRule($b['table'], 'nat'))
-            ->on('sudo nft delete table inet :table', function (array $b) {
-                $link = $this->tableLink($b['table']);
-                if (! isset($this->firewall[$link])) {
-                    $this->fail("No such file or directory: table {$b['table']}");
-                }
-                unset($this->firewall[$link]);
-
-                return '';
-            });
+            ->on('ip route show default', fn () => 'default via 192.0.2.1 dev eth0 proto static');
     }
-
-    protected function nftChain(string $table, string $kind): string
-    {
-        $link = $this->tableLink($table);
-        if (! isset($this->firewall[$link])) {
-            $this->fail("No such file or directory: table {$table}");
-        }
-        $this->firewall[$link][$kind] = true;
-
-        return '';
-    }
-
-    protected function nftRule(string $table, string $kind): string
-    {
-        if (! ($this->firewall[$this->tableLink($table)][$kind] ?? false)) {
-            $this->fail("No such file or directory: chain for {$kind} in {$table}");
-        }
-
-        return '';
-    }
-
-    protected function unitLink(string $unit): string
-    {
-        return str_starts_with($unit, 'wg-quick@') ? substr($unit, 9) : throw new LogicException("Unexpected unit {$unit}");
-    }
-
-    protected function tableLink(string $table): string
-    {
-        return str_starts_with($table, 'wg_') ? substr($table, 3) : throw new LogicException("Unexpected nft table {$table}");
-    }
-
-    // ─── macOS: wg-quick + utunN + pf ────────────────────────────────
 
     protected function registerMac(): void
     {
         $this->shell
-            ->on('sudo wg-quick up :name', function (array $b) {
-                $name_file = "/var/run/wireguard/{$b['name']}.name";
-                if (isset($this->files[$name_file])) {
-                    $this->fail("wg-quick: `{$b['name']}' already exists");
-                }
-
-                $iface = 'utun'.$this->nextUtun++;
-                $this->bringUp($b['name'], $iface);
-                $this->files[$name_file] = "{$iface}\n";
-
-                return '';
-            })
-            ->on('sudo wg-quick down :name', function (array $b) {
-                $name_file = "/var/run/wireguard/{$b['name']}.name";
-                $iface = trim($this->files[$name_file] ?? $this->fail("wg-quick: `{$b['name']}' is not a WireGuard interface"));
-
-                $this->bringDown($b['name'], $iface);
-                unset($this->files[$name_file]);
-
-                return '';
-            })
             ->on('ifconfig :ifname', function (array $b) {
                 [$ip, $mask] = explode('/', $this->requireInterface($b['ifname'])['address']);
                 $hex = sprintf('0x%08x', (0xFFFFFFFF << (32 - (int) $mask)) & 0xFFFFFFFF);
@@ -398,27 +361,7 @@ class FakeHost
                     ."\tinet {$ip} --> {$ip} netmask {$hex}";
             })
             ->on('ifconfig -l', fn () => implode(' ', ['lo0', 'en0', ...array_keys($this->interfaces)]))
-            ->on('route -n get default 2>/dev/null', fn () => "   route to: default\ndestination: default\n  interface: en0")
-            ->on('sudo pfctl -a :anchor -f -', function (array $b, ?string $input) {
-                $this->anchors[$b['anchor']] = (string) $input;
-                $this->firewall[$this->anchorLink($b['anchor'])] = [
-                    'forward' => str_contains((string) $input, 'pass '),
-                    'nat' => str_contains((string) $input, 'nat on '),
-                ];
-
-                return '';
-            })
-            ->on('sudo pfctl -a :anchor -F all', function (array $b) {
-                unset($this->anchors[$b['anchor']], $this->firewall[$this->anchorLink($b['anchor'])]);
-
-                return '';
-            })
-            ->on('sudo pfctl -e', fn () => '');
-    }
-
-    protected function anchorLink(string $anchor): string
-    {
-        return str_starts_with($anchor, 'wg/') ? substr($anchor, 3) : throw new LogicException("Unexpected pf anchor {$anchor}");
+            ->on('route -n get default 2>/dev/null', fn () => "   route to: default\ndestination: default\n  interface: en0");
     }
 
     // ─── Shared ──────────────────────────────────────────────────────

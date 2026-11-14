@@ -6,9 +6,9 @@ Stateless REST API and CLI for managing WireGuard VPN interfaces and peers. Buil
 
 - PHP 8.5+ with the `sodium` extension
 - `wireguard-tools` (`wg`, `wg-quick`)
-- `nftables` (Linux) or `pfctl` (macOS)
+- Linux: systemd and `nftables` (`iptables` too if Docker or ufw manage the firewall). macOS: Homebrew's `wireguard-go` and bash, and `pfctl`
 - `curl`
-- Passwordless `sudo` for the web server user (see [Sudoers Setup](#sudoers-setup))
+- The root helper `bin/wgla-helper`, installed root-owned and allowed in sudoers (see [Setup](#setup))
 - IP forwarding enabled (if using forward/NAT features)
 
 ## Quick Start
@@ -18,7 +18,7 @@ composer install
 cp .env.example .env
 php artisan key:generate
 
-# Set your API key
+# Set your API key (the API refuses every protected request without one)
 echo "API_KEY=$(openssl rand -hex 32)" >> .env
 
 # Show platform-specific setup instructions
@@ -28,69 +28,43 @@ php artisan wg:help
 php artisan serve --port=25420
 ```
 
-## Sudoers Setup
+## Setup
 
-The app runs under an isolated web server user and requires passwordless `sudo` for WireGuard management, firewall rules, and config file operations. All coreutils are path-restricted to the WireGuard config directory.
+The app runs as an unprivileged web server user. Everything that needs root goes through one small script, `bin/wgla-helper`, which is the only command that user may run with `sudo`:
 
-Run `php artisan wg:help` to see the full setup guide for your platform, or use the configs below.
+- **Strict arguments.** It accepts a fixed set of commands (`conf-write wg0`, `up wg0`, `peer-remove wg0 <key>`, …) and validates every argument.
+- **Strict configs.** It only writes wg-quick configs that contain what the app generates. The only hooks allowed are calls back into the helper's own firewall commands. So the web user can manage links, but it can't run other commands, read other files or plant `PostUp` hooks as root.
+- **Plain sudoers line.** One line with no argument wildcards, so it works with classic `sudo` and with `sudo-rs`, which is the default on Ubuntu 25.10 and later and rejects the wildcard-based rules this app used to need.
+
+`php artisan wg:help` prints these steps with the paths for your checkout. Replace `www-data` (Linux) or `_www` (macOS) with your web server user.
 
 ### Linux
 
-Replace `www-data` with your web server user.
-
-```
-www-data ALL=(root) NOPASSWD: \
-    /usr/bin/wg, \
-    /usr/bin/wg-quick, \
-    /usr/sbin/nft, \
-    /usr/bin/systemctl enable wg-quick@*, \
-    /usr/bin/systemctl disable wg-quick@*, \
-    /usr/bin/systemctl start wg-quick@*, \
-    /usr/bin/systemctl stop wg-quick@*, \
-    /usr/bin/cat /etc/wireguard/*, \
-    /usr/bin/test -f /etc/wireguard/*, \
-    /usr/bin/ls /etc/wireguard, \
-    /usr/bin/mkdir -p /etc/wireguard, \
-    /usr/bin/mkdir -p /etc/wireguard/clients/*, \
-    /usr/bin/cp /tmp/* /etc/wireguard/*, \
-    /usr/bin/chmod 600 /etc/wireguard/*, \
-    /usr/bin/rm -f /etc/wireguard/*, \
-    /usr/bin/rm -rf /etc/wireguard/clients/*
-```
-
-Install to `/etc/sudoers.d/wireguard` (mode `440`) and validate with `sudo visudo -cf /etc/sudoers.d/wireguard`.
-
-Enable IP forwarding:
-
 ```bash
+sudo apt install wireguard-tools nftables curl php-cli php-mbstring php-xml php-curl
+
+# IP forwarding (for forward/NAT)
 echo "net.ipv4.ip_forward=1" | sudo tee /etc/sysctl.d/99-wireguard.conf
 sudo sysctl --system
+
+# The root helper: install again after every update of this app
+sudo mkdir -p /usr/local/sbin
+sudo install -o root -g root -m 755 bin/wgla-helper /usr/local/sbin/wgla-helper
+
+echo 'www-data ALL=(root) NOPASSWD: /usr/local/sbin/wgla-helper' | sudo tee /etc/sudoers.d/wgla > /dev/null
+sudo chmod 440 /etc/sudoers.d/wgla
+sudo visudo -cf /etc/sudoers.d/wgla
 ```
 
-### macOS (Apple Silicon)
-
-Replace `_www` with your web server user. For Intel Macs, substitute `/opt/homebrew` with `/usr/local`.
-
-```
-_www ALL=(root) NOPASSWD: \
-    /opt/homebrew/bin/wg, \
-    /opt/homebrew/bin/wg-quick, \
-    /sbin/pfctl, \
-    /bin/cat /opt/homebrew/etc/wireguard/*, \
-    /bin/cat /var/run/wireguard/*, \
-    /usr/bin/test -f /opt/homebrew/etc/wireguard/*, \
-    /bin/ls /opt/homebrew/etc/wireguard, \
-    /bin/mkdir -p /opt/homebrew/etc/wireguard, \
-    /bin/mkdir -p /opt/homebrew/etc/wireguard/clients/*, \
-    /bin/cp /tmp/* /opt/homebrew/etc/wireguard/*, \
-    /bin/chmod 600 /opt/homebrew/etc/wireguard/*, \
-    /bin/rm -f /opt/homebrew/etc/wireguard/*, \
-    /bin/rm -rf /opt/homebrew/etc/wireguard/clients/*
-```
-
-Set up pfctl anchors (one-time):
+### macOS
 
 ```bash
+brew install wireguard-tools wireguard-go bash
+
+# IP forwarding (for forward/NAT)
+sudo sysctl -w net.inet.ip.forwarding=1
+
+# pf anchors for the forward/NAT rules (one-time)
 sudo bash -c 'cat >> /etc/pf.conf <<EOF
 
 # WireGuard NAT anchors
@@ -98,28 +72,21 @@ nat-anchor "wg/*"
 anchor "wg/*"
 EOF'
 sudo pfctl -f /etc/pf.conf
+
+# The root helper: install again after every update of this app
+sudo mkdir -p /usr/local/sbin
+sudo install -o root -g wheel -m 755 bin/wgla-helper /usr/local/sbin/wgla-helper
+
+echo '_www ALL=(root) NOPASSWD: /usr/local/sbin/wgla-helper' | sudo tee /etc/sudoers.d/wgla > /dev/null
+sudo chmod 440 /etc/sudoers.d/wgla
+sudo visudo -cf /etc/sudoers.d/wgla
 ```
 
-Enable IP forwarding: `sudo sysctl -w net.inet.ip.forwarding=1`
+### Firewall notes
 
-### Why These Permissions?
-
-| Command | Purpose |
-|---------|---------|
-| `wg` | Query/configure WireGuard interfaces and peers at runtime |
-| `wg-quick` | Bring interfaces up/down (macOS); used via `systemctl` on Linux |
-| `nft` | Manage nftables forward/NAT chains per interface (Linux) |
-| `pfctl` | Manage pf anchor rules for forward/NAT (macOS) |
-| `systemctl` | Enable/start/stop/disable `wg-quick@*` units (Linux) |
-| `cat` | Read `.conf` files from the WireGuard config directory; on macOS also the `utunN` name wg-quick records in `/var/run/wireguard/<link>.name` |
-| `test` | Check whether a `.conf` file exists |
-| `ls` | List `.conf` files in the WireGuard config directory |
-| `mkdir` | Create config directory and per-link client subdirectories |
-| `cp` | Copy temp files into the config directory (atomic write pattern) |
-| `chmod` | Set `0600` permissions on config files |
-| `rm` | Delete config files and client config directories |
-
-All file-management commands (`cat`, `test`, `ls`, `mkdir`, `cp`, `chmod`, `rm`) are restricted to the WireGuard config directory path in the sudoers rules.
+- **Rules per link.** `forward` and `nat` are per-link rules. Linux uses an nftables table `inet wg_<link>`, and NAT only masquerades the link's own subnet. macOS uses a pf anchor `wg/<link>`.
+- **Docker and ufw.** These drop forwarded traffic in iptables' `FORWARD` chain, which an nftables accept can't override. When that chain drops anything, the helper also adds two `ACCEPT` rules there, tagged `wgla:<link>`.
+- **firewalld.** It isn't handled. Add the WireGuard interface to a zone that allows forwarding.
 
 ## Configuration
 
@@ -132,6 +99,7 @@ All settings are in `.env` — see `.env.example`. Key options:
 | `WIREGUARD_DNS` | Default DNS for client configs (default: `8.8.8.8`) |
 | `WIREGUARD_KEEPALIVE` | Default PersistentKeepalive seconds (default: `25`) |
 | `WIREGUARD_ALLOWED_IPS` | Default AllowedIPs for clients (default: `0.0.0.0/0`) |
+| `WIREGUARD_HELPER` | Installed path of the root helper (default: `/usr/local/sbin/wgla-helper`) |
 
 ## API
 
@@ -164,7 +132,11 @@ Updating a peer (`PATCH /link/{link}/peer/{pubkey}`) accepts:
 
 When a link's `port`, `dns`, `keepalive` or `allowed_ips` change, the stored client configs of its peers are regenerated. Per-peer `dns`/`allowed_ips` overrides are kept.
 
-Errors are JSON `{"error": "..."}`: `403` for a missing or wrong API key (also when `API_KEY` is unset), `404` for an unknown link or peer, `409` for a conflict such as an existing link, `422` for invalid input, and `500` when a system command fails (the message includes its error output).
+Link responses include the OS `interface` the link runs as (`utunN` on macOS), and never the server's private key.
+
+A link can't reuse another link's listen port or overlap its subnet, and can't be named after an existing network interface. Without `port`, a free random port is picked.
+
+Errors are JSON `{"error": "..."}`: `403` for a missing or wrong API key (also when `API_KEY` is unset), `404` for an unknown link or peer, `409` for a conflict (existing link, port, subnet or interface name), `422` for invalid input, and `500` when a system command fails (the message includes its error output).
 
 ## CLI
 

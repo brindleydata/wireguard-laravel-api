@@ -2,8 +2,14 @@
 
 namespace App\Services\Os;
 
+/**
+ * Host operations. System information is read directly; everything privileged goes through the
+ * root helper (bin/wgla-helper), which validates every argument and config it is given.
+ */
 interface OsDriver
 {
+    // ─── System information ─────────────────────────────────────────
+
     /**
      * Get CPU info: cores, load, usage percentage.
      */
@@ -44,96 +50,101 @@ interface OsDriver
      */
     public function defaultOutboundInterface(): string;
 
+    // ─── WireGuard runtime state ────────────────────────────────────
+
     /**
-     * Get the OS-specific wg-quick config directory path.
+     * Names of the running WireGuard interfaces (`wg show interfaces`).
      */
-    public function configPath(): string;
+    public function runningInterfaces(): array;
+
+    /**
+     * `wg show <iface> dump`. Throws CommandFailedException when it can't be read.
+     */
+    public function interfaceDump(string $iface): string;
+
+    /**
+     * Add peers to a running interface from [Peer] sections (`wg addconf`).
+     */
+    public function addPeer(string $iface, string $section): void;
+
+    public function removePeer(string $iface, string $pubkey): void;
+
+    public function setPeerAllowedIps(string $iface, string $pubkey, string $allowed_ips): void;
+
+    // ─── Link lifecycle ─────────────────────────────────────────────
 
     /**
      * Map a link name to the OS interface wg-quick created for it.
      *
      * Linux: the link name itself. macOS: wg-quick always creates a fresh utunN and records it in
      * /var/run/wireguard/<link>.name; falls back to the link name when there is no mapping.
-     * The caller must still check `wg show interfaces` to know whether it is running.
+     * The caller must still check runningInterfaces() to know whether it is running.
      */
     public function resolveInterface(string $link): string;
 
     /**
-     * Generate the [Interface] section for a wg-quick config, with optional PostUp/PostDown for forwarding and NAT.
-     * The hooks must install the same rules as applyFirewall().
-     */
-    public function interfaceSection(string $address, string $privkey, int $port, string $ifout, bool $forward = false, bool $nat = false): string;
-
-    /**
-     * Replace the live forward/NAT rules of a running link with exactly the given state.
-     * Clears them when both $forward and $nat are false.
-     */
-    public function applyFirewall(string $link, string $iface, string $address, string $ifout, bool $forward, bool $nat): void;
-
-    /**
-     * Remove all live forward/NAT rules of a link. Never throws.
-     */
-    public function clearFirewall(string $link): void;
-
-    /**
-     * Write a wg-quick .conf file securely (chmod 0600).
-     */
-    public function writeConfig(string $name, string $content): void;
-
-    /**
-     * Delete a wg-quick .conf file.
-     */
-    public function deleteConfig(string $name): void;
-
-    /**
-     * Read a wg-quick .conf file, or null if it doesn't exist.
-     */
-    public function readConfig(string $name): ?string;
-
-    /**
-     * Check if a wg-quick .conf file exists.
-     */
-    public function configExists(string $name): bool;
-
-    /**
-     * List all interface names that have .conf files on disk.
-     */
-    public function listConfigNames(): array;
-
-    /**
-     * Parse metadata from comment headers in a wg-quick .conf file.
-     * Returns array with keys: address, ifout, and optionally dns, keepalive, allowed_ips.
-     * Returns null if the config file doesn't exist.
-     */
-    public function parseConfig(string $name): ?array;
-
-    /**
-     * Bring up a WireGuard interface via wg-quick or systemctl.
+     * Bring a link up (Linux: enable + start its wg-quick@ unit; macOS: wg-quick up).
      */
     public function startInterface(string $name): void;
 
     /**
-     * Bring down a WireGuard interface via wg-quick or systemctl.
+     * Bring a link down. Idempotent; on Linux it also disables the unit of a stopped link.
      */
     public function stopInterface(string $name): void;
 
+    // ─── Link configs ───────────────────────────────────────────────
+
     /**
-     * Write a client (peer) config file.
+     * The [Interface] section of a wg-quick config. With forward or NAT on, its PostUp/PostDown
+     * hooks call the helper's firewall commands (the only hooks the helper accepts).
      */
+    public function interfaceSection(string $address, string $privkey, int $port, string $ifout, bool $forward = false, bool $nat = false): string;
+
+    /**
+     * Write a wg-quick .conf (0600). The helper rejects anything the app wouldn't generate.
+     */
+    public function writeConfig(string $name, string $content): void;
+
+    public function deleteConfig(string $name): void;
+
+    /**
+     * Read a wg-quick .conf, or null if it doesn't exist.
+     */
+    public function readConfig(string $name): ?string;
+
+    public function configExists(string $name): bool;
+
+    /**
+     * Names of all links that have a .conf.
+     */
+    public function listConfigNames(): array;
+
+    /**
+     * Metadata from the comment header of a link's .conf: address, ifout, forward, nat, up and
+     * optionally dns, keepalive, allowed_ips. Null if the config doesn't exist.
+     */
+    public function parseConfig(string $name): ?array;
+
+    // ─── Client configs ─────────────────────────────────────────────
+
     public function writeClientConfig(string $link, string $key, string $content): void;
 
-    /**
-     * Read a client (peer) config file, or null if it doesn't exist.
-     */
     public function readClientConfig(string $link, string $key): ?string;
 
-    /**
-     * Delete a client (peer) config file.
-     */
     public function deleteClientConfig(string $link, string $key): void;
 
-    /**
-     * Delete the entire client config directory for a link.
-     */
     public function deleteClientConfigDir(string $link): void;
+
+    // ─── Firewall ───────────────────────────────────────────────────
+
+    /**
+     * Install the forward/NAT rules saved in the link's config for its running interface
+     * (clearing them when both are off). The PostUp hook does the same.
+     */
+    public function applyFirewall(string $link, string $iface): void;
+
+    /**
+     * Remove a link's forward/NAT rules. Never throws.
+     */
+    public function clearFirewall(string $link): void;
 }

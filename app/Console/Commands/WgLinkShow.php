@@ -25,7 +25,6 @@ class WgLinkShow extends WgCommand
         $this->info("Link {$link->name}");
         $this->line('Interface: '.($link->interface ?? '(down)'));
         $this->line("Public Key: {$link->public_key}");
-        $this->line("Private Key: {$link->private_key}");
         $this->line("Listen Port: {$link->listen_port}");
         $this->line("VPN Address: {$link->address}");
         $this->line('Forward: '.($link->forward ? 'enabled' : 'disabled'));

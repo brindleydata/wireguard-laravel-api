@@ -19,6 +19,19 @@ class IpAllocator
         return long2ip(ip2long($ip) & $netmask)."/{$mask}";
     }
 
+    /**
+     * Whether two IPv4 CIDRs share any address.
+     */
+    public static function overlaps(string $a, string $b): bool
+    {
+        [$ip_a, $mask_a] = array_pad(explode('/', $a, 2), 2, '32');
+        [$ip_b, $mask_b] = array_pad(explode('/', $b, 2), 2, '32');
+        $mask = min((int) $mask_a, (int) $mask_b);
+        $netmask = $mask === 0 ? 0 : (-1 << (32 - $mask)) & 0xFFFFFFFF;
+
+        return (ip2long($ip_a) & $netmask) === (ip2long($ip_b) & $netmask);
+    }
+
     public function findAvailableIp(string $interface_address, array $existing_peers): string
     {
         if (! str_contains($interface_address, '/')) {

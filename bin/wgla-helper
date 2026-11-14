@@ -1,0 +1,405 @@
+#!/bin/bash
+#
+# wgla-helper: the one command the web server user may run as root.
+#
+# The app never gets a general-purpose root shell. Every privileged operation is one of the
+# commands below, every argument is validated, and every wg-quick config is checked before it
+# is written: only known keys, and the only hooks allowed are calls back into this helper. So a
+# compromised web user can manage WireGuard links but can't run commands, read files or plant
+# hooks as root.
+#
+# Install root-owned, outside the web-writable app directory (see `php artisan wg:help`), and
+# reinstall after updating the app. Must stay compatible with macOS's bash 3.2.
+
+set -euo pipefail
+umask 077
+IFS=$' \t\n'
+
+VERSION=1
+SELF=$0
+MAX_SIZE=1048576
+
+die() { echo "wgla-helper: $*" >&2; exit 1; }
+
+# ─── Environment ─────────────────────────────────────────────────────────────
+
+if [ "$(id -u)" -eq 0 ]; then
+    # As root, nothing comes from the caller's environment
+    OS=$(uname -s)
+    PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    if [ "$OS" = Darwin ]; then
+        PATH=/opt/homebrew/bin:/opt/homebrew/sbin:$PATH
+    fi
+    WGLA_CONF_DIR='' WGLA_RUN_DIR='' TMPDIR=/tmp
+else
+    # Unprivileged runs can't do anything privileged; tests use them with stubs and temp dirs
+    OS=${WGLA_OS:-$(uname -s)}
+fi
+
+case "$OS" in
+    Linux)
+        CONF_DIR=${WGLA_CONF_DIR:-/etc/wireguard}
+        RUN_DIR=${WGLA_RUN_DIR:-/var/run/wireguard}
+        ;;
+    Darwin)
+        if [ -d /opt/homebrew ]; then default_conf=/opt/homebrew/etc/wireguard; else default_conf=/usr/local/etc/wireguard; fi
+        CONF_DIR=${WGLA_CONF_DIR:-$default_conf}
+        RUN_DIR=${WGLA_RUN_DIR:-/var/run/wireguard}
+        ;;
+    *) die "unsupported OS: $OS" ;;
+esac
+export PATH
+
+# ─── Validation ──────────────────────────────────────────────────────────────
+
+re_name='^[a-zA-Z][a-zA-Z0-9_-]{0,14}$'
+re_ifname='^[A-Za-z0-9_.-]{1,15}$'
+re_key='^[A-Za-z0-9+/]{42}[AEIMQUYcgkosw048]=$'
+re_safe_key='^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$'
+re_cidr4='^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})/([0-9]{1,2})$'
+re_ips='^[0-9A-Fa-f.:/]+(, ?[0-9A-Fa-f.:/]+)*$'
+re_dns='^[A-Za-z0-9.:-]+(, ?[A-Za-z0-9.:-]+)*$'
+re_number='^[0-9]{1,5}$'
+
+valid_cidr4() {
+    [[ $1 =~ $re_cidr4 ]] || return 1
+    [ "${BASH_REMATCH[1]}" -le 255 ] && [ "${BASH_REMATCH[2]}" -le 255 ] &&
+        [ "${BASH_REMATCH[3]}" -le 255 ] && [ "${BASH_REMATCH[4]}" -le 255 ] && [ "${BASH_REMATCH[5]}" -le 32 ]
+}
+valid_port() { [[ $1 =~ $re_number ]] && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]; }
+valid_keepalive() { [[ $1 =~ $re_number ]] && [ "$1" -le 65535 ]; }
+valid_bool() { [ "$1" = true ] || [ "$1" = false ]; }
+
+name_arg()    { [[ $1 =~ $re_name ]] || die "invalid link name: $1"; }
+iface_arg()   { [[ $1 =~ $re_name ]] || die "invalid interface name: $1"; }
+key_arg()     { [[ $1 =~ $re_key ]] || die "invalid public key: $1"; }
+safe_key_arg() { [[ $1 =~ $re_safe_key ]] || die "invalid client config key: $1"; }
+ips_arg()     { [[ $1 =~ $re_ips ]] || die "invalid allowed IPs: $1"; }
+args() { [ "$1" -eq "$2" ] || die "'$3' takes $1 argument(s)"; }
+
+# The only hooks a config may contain: calls back into this helper. On macOS wg-quick expands
+# %i to the real utunN and %I to the link name; on Linux only %i exists (the link name).
+hook() {
+    if [ "$OS" = Darwin ]; then
+        if [ "$1" = up ]; then echo "$SELF firewall-up %I %i"; else echo "$SELF firewall-down %I"; fi
+    else
+        if [ "$1" = up ]; then echo "$SELF firewall-up %i %i"; else echo "$SELF firewall-down %i"; fi
+    fi
+}
+
+# Copy stdin to a private temp file, refusing anything over MAX_SIZE
+read_input() {
+    local tmp=$1
+    head -c $((MAX_SIZE + 1)) > "$tmp"
+    [ "$(wc -c < "$tmp")" -le "$MAX_SIZE" ] || die "input larger than $MAX_SIZE bytes"
+}
+
+validate_meta() {
+    local line=$1 re='^# ([a-z_]+) = (.+)$' key value
+    [[ $line =~ $re ]] || die "malformed metadata comment: $line"
+    key=${BASH_REMATCH[1]} value=${BASH_REMATCH[2]}
+    case "$key" in
+        address) valid_cidr4 "$value" ;;
+        ifout) [[ $value =~ $re_ifname ]] ;;
+        forward | nat | up) valid_bool "$value" ;;
+        dns) [[ $value =~ $re_dns ]] ;;
+        keepalive) valid_keepalive "$value" ;;
+        allowed_ips) [[ $value =~ $re_ips ]] ;;
+        *) false ;;
+    esac || die "metadata not allowed: $line"
+}
+
+# A wg-quick config may only contain what the app writes
+validate_conf() {
+    local section='' line key value re='^([A-Za-z]+) = (.+)$'
+    while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in
+            '') continue ;;
+            '[Interface]')
+                [ -z "$section" ] || die "[Interface] must come first, once"
+                section=interface
+                continue
+                ;;
+            '[Peer]')
+                [ -n "$section" ] || die "[Peer] before [Interface]"
+                section=peer
+                continue
+                ;;
+            '#'*)
+                [ -z "$section" ] || die "comments are only allowed before [Interface]"
+                validate_meta "$line"
+                continue
+                ;;
+        esac
+
+        [[ $line =~ $re ]] || die "malformed line: $line"
+        key=${BASH_REMATCH[1]} value=${BASH_REMATCH[2]}
+        case "$section:$key" in
+            interface:Address) valid_cidr4 "$value" ;;
+            interface:PrivateKey) [[ $value =~ $re_key ]] ;;
+            interface:ListenPort) valid_port "$value" ;;
+            interface:PostUp) [ "$value" = "$(hook up)" ] || die "PostUp must be exactly: $(hook up)" ;;
+            interface:PostDown) [ "$value" = "$(hook down)" ] || die "PostDown must be exactly: $(hook down)" ;;
+            peer:PublicKey | peer:PresharedKey) [[ $value =~ $re_key ]] ;;
+            peer:AllowedIPs) [[ $value =~ $re_ips ]] ;;
+            *) false ;;
+        esac || die "not allowed in a link config: $line"
+    done < "$1"
+
+    [ -n "$section" ] || die "missing [Interface]"
+}
+
+# A peer for `wg addconf`: [Peer] sections with keys and allowed IPs only
+validate_peer() {
+    local line key value re='^([A-Za-z]+) = (.+)$'
+    while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in '' | '[Peer]') continue ;; esac
+        [[ $line =~ $re ]] || die "malformed line: $line"
+        key=${BASH_REMATCH[1]} value=${BASH_REMATCH[2]}
+        case "$key" in
+            PublicKey | PresharedKey) [[ $value =~ $re_key ]] ;;
+            AllowedIPs) [[ $value =~ $re_ips ]] ;;
+            *) false ;;
+        esac || die "not allowed in a peer: $line"
+    done < "$1"
+}
+
+# ─── Files ───────────────────────────────────────────────────────────────────
+
+TMP=''
+cleanup() { if [ -n "$TMP" ]; then rm -f "$TMP"; fi; }
+trap cleanup EXIT
+
+# Validate stdin with $2 (a function or `true`), then move it into place atomically
+install_input() {
+    local target=$1 check=$2 dir
+    dir=$(dirname "$target")
+    mkdir -p "$dir"
+    TMP=$(mktemp "$dir/.wgla.XXXXXX")
+    read_input "$TMP"
+    $check "$TMP"
+    chmod 600 "$TMP"
+    mv -f "$TMP" "$target"
+    TMP=''
+}
+
+conf_file() { echo "$CONF_DIR/$1.conf"; }
+client_file() { echo "$CONF_DIR/clients/$1/$2.conf"; }
+
+# Metadata value from a link config (validated again before use)
+meta() { sed -n "s/^# $2 = //p" "$1" | head -n 1; }
+
+network_of() {
+    valid_cidr4 "$1" || die "invalid address: $1"
+    local a=${BASH_REMATCH[1]} b=${BASH_REMATCH[2]} c=${BASH_REMATCH[3]} d=${BASH_REMATCH[4]} mask=${BASH_REMATCH[5]}
+    local ip=$(((a << 24) | (b << 16) | (c << 8) | d))
+    local net=$((ip & ((0xFFFFFFFF << (32 - mask)) & 0xFFFFFFFF)))
+    echo "$(((net >> 24) & 255)).$(((net >> 16) & 255)).$(((net >> 8) & 255)).$((net & 255))/$mask"
+}
+
+# ─── Firewall ────────────────────────────────────────────────────────────────
+#
+# Rules come from the link's saved config, so the PostUp hook and live updates install the
+# same thing. Linux: one nftables table per link (inet wg_<link>). macOS: pf anchor wg/<link>.
+
+firewall_state() {
+    local conf
+    conf=$(conf_file "$1")
+    [ -f "$conf" ] || die "no config for link $1"
+    FORWARD=$(meta "$conf" forward) NAT=$(meta "$conf" nat) IFOUT=$(meta "$conf" ifout) ADDRESS=$(meta "$conf" address)
+    if ! valid_bool "${FORWARD:-false}" || ! valid_bool "${NAT:-false}"; then die "invalid forward/nat in $conf"; fi
+    if [ "${NAT:-false}" = true ]; then
+        [[ $IFOUT =~ $re_ifname ]] || die "invalid ifout in $conf"
+        NETWORK=$(network_of "$ADDRESS")
+    fi
+}
+
+# Firewalls driven by iptables (Docker, ufw) drop forwarded traffic in their own FORWARD
+# chain, which an accept in our nftables table can't override. Add tagged accepts there too.
+iptables_forward() {
+    local link=$1 iface=$2 enable=$3 listing rule
+    command -v iptables > /dev/null 2>&1 || return 0
+    listing=$(iptables -S FORWARD 2> /dev/null) || return 0
+
+    # Remove our previous rules. They're rebuilt from their parts rather than re-using the listed
+    # line: iptables -S quotes the comment ("wgla:wg0"), and listing text is never evaluated.
+    local ours="^-A FORWARD -([io]) ([^ ]+) -m comment --comment \"?wgla:$link\"? -j ACCEPT\$"
+    while IFS= read -r rule; do
+        if [[ $rule =~ $ours ]]; then
+            iptables -D FORWARD "-${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" -m comment --comment "wgla:$link" -j ACCEPT
+        fi
+    done <<< "$listing"
+
+    [ "$enable" = true ] || return 0
+    # Nothing in iptables drops forwarded traffic: leave it alone
+    [ "$(iptables -S FORWARD)" != '-P FORWARD ACCEPT' ] || return 0
+    iptables -I FORWARD 1 -o "$iface" -m comment --comment "wgla:$link" -j ACCEPT
+    iptables -I FORWARD 1 -i "$iface" -m comment --comment "wgla:$link" -j ACCEPT
+}
+
+firewall_up_linux() {
+    local link=$1 iface=$2 table="wg_$1"
+    {
+        # Creating then deleting makes the replace atomic and work whether or not it exists
+        echo "table inet $table"
+        echo "delete table inet $table"
+        if [ "${FORWARD:-false}" = true ] || [ "${NAT:-false}" = true ]; then
+            echo "table inet $table {"
+            if [ "${FORWARD:-false}" = true ]; then
+                echo "    chain forward { type filter hook forward priority 0; iifname \"$iface\" accept; oifname \"$iface\" accept; }"
+            fi
+            if [ "${NAT:-false}" = true ]; then
+                echo "    chain postrouting { type nat hook postrouting priority 100; ip saddr $NETWORK oifname \"$IFOUT\" masquerade; }"
+            fi
+            echo "}"
+        fi
+    } | nft -f -
+    iptables_forward "$link" "$iface" "${FORWARD:-false}"
+}
+
+firewall_down_linux() {
+    nft delete table inet "wg_$1" 2> /dev/null || true
+    iptables_forward "$1" '' false
+}
+
+firewall_up_darwin() {
+    local link=$1 iface=$2 rules=''
+    # pf rejects a ruleset whose translation (nat) rules come after filter (pass) rules
+    if [ "${NAT:-false}" = true ]; then
+        rules="nat on $IFOUT from $NETWORK to any -> ($IFOUT)"$'\n'
+    fi
+    if [ "${FORWARD:-false}" = true ]; then
+        rules="${rules}pass in on $iface all"$'\n'"pass out on $iface all"$'\n'
+    fi
+
+    if [ -z "$rules" ]; then
+        firewall_down_darwin "$link"
+        return
+    fi
+    printf '%s' "$rules" | pfctl -a "wg/$link" -f -
+    pfctl -e > /dev/null 2>&1 || true
+}
+
+firewall_down_darwin() { pfctl -a "wg/$1" -F all > /dev/null 2>&1 || true; }
+
+# ─── Commands ────────────────────────────────────────────────────────────────
+
+command=${1:-}
+shift || true
+
+case "$command" in
+    version)
+        echo "$VERSION"
+        ;;
+
+    # Runtime state (wg)
+    interfaces)
+        args 0 $# "$command"
+        wg show interfaces
+        ;;
+    dump)
+        args 1 $# "$command"; iface_arg "$1"
+        wg show "$1" dump
+        ;;
+    peer-add)
+        args 1 $# "$command"; iface_arg "$1"
+        TMP=$(mktemp "${TMPDIR:-/tmp}/wgla.XXXXXX")
+        read_input "$TMP"
+        validate_peer "$TMP"
+        wg addconf "$1" /dev/stdin < "$TMP"
+        ;;
+    peer-remove)
+        args 2 $# "$command"; iface_arg "$1"; key_arg "$2"
+        wg set "$1" peer "$2" remove
+        ;;
+    peer-ips)
+        args 3 $# "$command"; iface_arg "$1"; key_arg "$2"; ips_arg "$3"
+        wg set "$1" peer "$2" allowed-ips "$3"
+        ;;
+
+    # Link configs
+    conf-list)
+        args 0 $# "$command"
+        for file in "$CONF_DIR"/*.conf; do
+            [ -e "$file" ] || continue
+            name=$(basename "$file" .conf)
+            if [[ $name =~ $re_name ]]; then echo "$name"; fi
+        done
+        ;;
+    conf-read)
+        args 1 $# "$command"; name_arg "$1"
+        file=$(conf_file "$1")
+        [ -f "$file" ] || die "no config for link $1"
+        cat "$file"
+        ;;
+    conf-write)
+        args 1 $# "$command"; name_arg "$1"
+        install_input "$(conf_file "$1")" validate_conf
+        ;;
+    conf-delete)
+        args 1 $# "$command"; name_arg "$1"
+        rm -f "$(conf_file "$1")"
+        ;;
+
+    # Client (peer) configs: served to clients, never run here, so only paths are checked
+    client-read)
+        args 2 $# "$command"; name_arg "$1"; safe_key_arg "$2"
+        file=$(client_file "$1" "$2")
+        [ -f "$file" ] || die "no client config $2 for link $1"
+        cat "$file"
+        ;;
+    client-write)
+        args 2 $# "$command"; name_arg "$1"; safe_key_arg "$2"
+        install_input "$(client_file "$1" "$2")" true
+        ;;
+    client-delete)
+        args 2 $# "$command"; name_arg "$1"; safe_key_arg "$2"
+        rm -f "$(client_file "$1" "$2")"
+        ;;
+    client-delete-all)
+        args 1 $# "$command"; name_arg "$1"
+        rm -rf "${CONF_DIR:?}/clients/$1"
+        ;;
+
+    # Lifecycle
+    up)
+        args 1 $# "$command"; name_arg "$1"
+        [ -f "$(conf_file "$1")" ] || die "no config for link $1"
+        if [ "$OS" = Darwin ]; then
+            wg-quick up "$(conf_file "$1")"
+        else
+            systemctl enable --now "wg-quick@$1"
+        fi
+        ;;
+    down)
+        # Idempotent: stopping a stopped link succeeds (and on Linux also disables its unit)
+        args 1 $# "$command"; name_arg "$1"
+        if [ "$OS" = Darwin ]; then
+            if [ -f "$RUN_DIR/$1.name" ]; then wg-quick down "$(conf_file "$1")"; fi
+        else
+            systemctl disable --now "wg-quick@$1"
+        fi
+        ;;
+    resolve)
+        # The OS interface of a link: on macOS wg-quick runs it as a fresh utunN
+        args 1 $# "$command"; name_arg "$1"
+        real=''
+        if [ "$OS" = Darwin ] && [ -f "$RUN_DIR/$1.name" ]; then real=$(head -n 1 "$RUN_DIR/$1.name"); fi
+        if [[ $real =~ ^utun[0-9]+$ ]]; then echo "$real"; else echo "$1"; fi
+        ;;
+
+    # Firewall (also called by the PostUp/PostDown hooks)
+    firewall-up)
+        args 2 $# "$command"; name_arg "$1"; iface_arg "$2"
+        firewall_state "$1"
+        if [ "$OS" = Darwin ]; then firewall_up_darwin "$1" "$2"; else firewall_up_linux "$1" "$2"; fi
+        ;;
+    firewall-down)
+        args 1 $# "$command"; name_arg "$1"
+        if [ "$OS" = Darwin ]; then firewall_down_darwin "$1"; else firewall_down_linux "$1"; fi
+        ;;
+
+    *)
+        die "unknown command '$command' (helper version $VERSION). If the app was updated, reinstall the helper: see php artisan wg:help"
+        ;;
+esac

@@ -2,6 +2,10 @@
 
 return [
     'api_key' => env('API_KEY'),
+
+    // Root helper installed from bin/wgla-helper: the one command sudoers allows (see wg:help)
+    'helper' => env('WIREGUARD_HELPER', '/usr/local/sbin/wgla-helper'),
+
     'ip_service' => env('IP_SERVICE', 'http://ifconfig.me/ip'),
     'hostname' => env('WIREGUARD_HOSTNAME'),
     'default_dns' => env('WIREGUARD_DNS', '8.8.8.8'),
