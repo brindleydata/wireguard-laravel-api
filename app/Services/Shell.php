@@ -19,9 +19,8 @@ class Shell
     {
         $command = $this->bind($command, $bindings);
 
-        $process = Process::fromShellCommandline($command);
+        $process = $this->process($command);
         $process->setTimeout($timeout);
-        $process->setEnv(['PATH' => self::PATH]);
 
         if ($input !== null) {
             $process->setInput($input);
@@ -54,9 +53,8 @@ class Shell
      */
     public function interactive(string $command): int
     {
-        $process = Process::fromShellCommandline($command);
+        $process = $this->process($command);
         $process->setTimeout(null);
-        $process->setEnv(['PATH' => self::PATH]);
 
         if (Process::isTtySupported()) {
             $process->setTty(true);
@@ -67,6 +65,19 @@ class Shell
         return $process->run(function (string $type, string $output) {
             fwrite($type === Process::ERR ? STDERR : STDOUT, $output);
         });
+    }
+
+    /**
+     * Always from /: commands use absolute paths, and the caller's directory may be one the
+     * process user can't enter (e.g. `sudo -u www-data php /srv/wgla/artisan …` run from a home
+     * directory), which makes every command fail.
+     */
+    protected function process(string $command): Process
+    {
+        $process = Process::fromShellCommandline($command, '/');
+        $process->setEnv(['PATH' => self::PATH]);
+
+        return $process;
     }
 
     protected function bind(string $command, array $bindings): string

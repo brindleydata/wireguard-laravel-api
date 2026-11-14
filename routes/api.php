@@ -4,10 +4,13 @@ use App\Http\Controllers\WireGuard;
 use App\Http\Middleware\AuthenticateByApiKey;
 use Illuminate\Support\Facades\Route;
 
-Route::get('/status', [WireGuard::class, 'status']);
-Route::get('/ip', [WireGuard::class, 'ip']);
+// Public: only whether the API can do its job (for load balancers and monitoring)
+Route::get('/health', [WireGuard::class, 'health']);
 
 Route::middleware(AuthenticateByApiKey::class)->group(function () {
+    Route::get('/status', [WireGuard::class, 'status']);
+    Route::get('/ip', [WireGuard::class, 'ip']);
+
     // Link routes
     Route::get('/links', [WireGuard::class, 'links']);
     Route::get('/link/{name}', [WireGuard::class, 'link']);

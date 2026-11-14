@@ -28,6 +28,20 @@ it('reports the exit code and stderr of a failed command', function () {
     }
 });
 
+it('runs commands from / whatever the caller\'s directory', function () {
+    $here = getcwd();
+    $dir = sys_get_temp_dir().'/wgla_cwd_'.bin2hex(random_bytes(4));
+    mkdir($dir);
+    chdir($dir);
+
+    try {
+        expect((new Shell)->run('pwd'))->toBe('/');
+    } finally {
+        chdir($here);
+        rmdir($dir);
+    }
+});
+
 it('returns null from tryRun when the command fails', function () {
     expect((new Shell)->tryRun('sh -c :script', ['script' => 'exit 1']))->toBeNull();
 });

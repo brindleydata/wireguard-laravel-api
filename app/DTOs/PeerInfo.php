@@ -4,13 +4,35 @@ namespace App\DTOs;
 
 class PeerInfo
 {
+    /** WireGuard re-handshakes every 2 minutes while traffic flows, and drops a session after 3. */
+    public const CONNECTED_WITHIN = 180;
+
+    /**
+     * The stats come from the running interface (`wg show dump`); they are null while the link is down.
+     *
+     * @param  int|null  $latest_handshake  Unix time; null when it never happened
+     */
     public function __construct(
         public readonly string $public_key,
         public readonly ?string $preshared_key = null,
         public readonly ?string $allowed_ips = null,
         public readonly ?string $private_key = null,
         public readonly ?string $client_config = null,
+        public readonly ?string $endpoint = null,
+        public readonly ?int $latest_handshake = null,
+        public readonly ?int $transfer_rx = null,
+        public readonly ?int $transfer_tx = null,
     ) {}
+
+    /** Null while the link is down: there is nothing to know. */
+    public function connected(?int $now = null): ?bool
+    {
+        if ($this->transfer_rx === null) {
+            return null;
+        }
+
+        return $this->latest_handshake !== null && ($now ?? time()) - $this->latest_handshake < self::CONNECTED_WITHIN;
+    }
 
     public function toArray(): array
     {
@@ -18,6 +40,11 @@ class PeerInfo
             'public_key' => $this->public_key,
             'preshared_key' => $this->preshared_key,
             'allowed_ips' => $this->allowed_ips,
+            'endpoint' => $this->endpoint,
+            'latest_handshake_at' => $this->latest_handshake === null ? null : gmdate('Y-m-d\TH:i:s\Z', $this->latest_handshake),
+            'connected' => $this->connected(),
+            'transfer_rx' => $this->transfer_rx,
+            'transfer_tx' => $this->transfer_tx,
         ];
 
         if ($this->private_key !== null) {

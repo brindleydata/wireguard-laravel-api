@@ -32,12 +32,24 @@ abstract class BaseDriver implements OsDriver
 
     public function publicIpv4(string $ip_service): ?string
     {
-        return $this->shell->tryRun('curl -4 -s --max-time 5 :url', ['url' => $ip_service]);
+        return $this->publicIp($ip_service, '-4', FILTER_FLAG_IPV4);
     }
 
     public function publicIpv6(string $ip_service): ?string
     {
-        return $this->shell->tryRun('curl -6 -s --max-time 5 :url', ['url' => $ip_service]);
+        return $this->publicIp($ip_service, '-6', FILTER_FLAG_IPV6);
+    }
+
+    /**
+     * Only an address of the asked family counts: without real IPv6, `curl -6` can still get an
+     * answer (e.g. DNS hands out IPv4-mapped ::ffff:a.b.c.d addresses, or NAT64), and the service
+     * then reports the IPv4 address. Error pages and other junk don't count either.
+     */
+    protected function publicIp(string $ip_service, string $flag, int $family): ?string
+    {
+        $answer = trim((string) $this->shell->tryRun("curl {$flag} -s --max-time 5 :url", ['url' => $ip_service]));
+
+        return filter_var($answer, FILTER_VALIDATE_IP, $family) !== false ? $answer : null;
     }
 
     // ─── WireGuard runtime state ────────────────────────────────────

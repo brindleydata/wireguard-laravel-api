@@ -76,6 +76,34 @@ it('rejects unknown steps', function () {
         ->assertFailed();
 });
 
+// ─── Wrong-user guard ───────────────────────────────────────────────
+
+it('runs link and peer commands only as the web user', function () {
+    config(['wireguard.web_user' => 'someone-else']);
+
+    $this->artisan('wg:links')
+        ->expectsOutputToContain('Run this as someone-else, the user the API runs as')
+        ->expectsOutputToContain('sudo -u someone-else php artisan wg:links')
+        ->assertFailed();
+});
+
+it('lets the deploy user run help, install and update', function () {
+    config(['wireguard.web_user' => 'someone-else']);
+    setupShell($this->shell);
+
+    $this->artisan('wg:help')->assertSuccessful();
+    $this->artisan('wg:install', ['--step' => ['bogus']])->expectsOutputToContain('Unknown step')->assertFailed();
+    $this->artisan('wg:update', ['--yes' => true])->doesntExpectOutputToContain('Run this as')->assertFailed();
+});
+
+it('does not guard before a web user is configured', function () {
+    config(['wireguard.web_user' => null]);
+    setupShell($this->shell);
+
+    $this->artisan('wg:help')->assertSuccessful();
+    $this->artisan('wg:links')->doesntExpectOutputToContain('Run this as');
+});
+
 // ─── wg:update ──────────────────────────────────────────────────────
 
 it('only updates a git checkout', function () {

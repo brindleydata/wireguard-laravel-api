@@ -123,3 +123,19 @@ it('reports the helper state', function (?string $installed, bool $sudoAllowed, 
     'missing' => [null, true, 'missing'],
     'outdated' => ["#!/bin/bash\nVERSION=0\n", true, 'outdated'],
 ]);
+
+// ─── Public IP ──────────────────────────────────────────────────────
+
+it('only reports a public IP of the asked family', function (string $flag, string $answer, ?string $expected) {
+    $shell = (new FakeShell)->on("curl {$flag} -s --max-time 5 :url", fn () => $answer);
+    $driver = helperDriver($shell);
+
+    expect($flag === '-4' ? $driver->publicIpv4('http://ip.test') : $driver->publicIpv6('http://ip.test'))->toBe($expected);
+})->with([
+    'IPv4' => ['-4', '203.0.113.10', '203.0.113.10'],
+    'IPv6' => ['-6', '2001:db8::7', '2001:db8::7'],
+    // No real IPv6: DNS gave an IPv4-mapped address (::ffff:…), the service saw IPv4
+    'IPv4 when asked for IPv6' => ['-6', '203.0.113.10', null],
+    'IPv6 when asked for IPv4' => ['-4', '2001:db8::7', null],
+    'an error page' => ['-4', '<html>502 Bad Gateway</html>', null],
+]);

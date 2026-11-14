@@ -40,19 +40,18 @@ class Health extends Step
 
         if ($this->server->applies($ctx)) {
             [$url, $options] = $this->server->localUrl($ctx);
-            $state = null;
-            for ($attempt = 0; $attempt < 15 && $state === null; $attempt++) {
-                $body = $this->shell->tryRun("curl -s --fail --max-time 3 {$options} :url", ['url' => "{$url}/status"]);
-                $state = $body === null ? null : (json_decode($body, true)['helper']['state'] ?? 'unknown');
-                if ($state === null && $attempt < 14) {
+            $code = '000';
+            for ($attempt = 0; $attempt < 15 && $code === '000'; $attempt++) {
+                $code = $this->shell->tryRun("curl -s -o /dev/null -w '%{http_code}' --max-time 3 {$options} :url", ['url' => "{$url}/health"]) ?? '000';
+                if ($code === '000' && $attempt < 14) {
                     sleep(1);
                 }
             }
 
-            if ($state === null) {
+            if ($code === '000') {
                 $problems[] = "The API doesn't answer at {$url}";
-            } elseif ($state !== 'ok') {
-                $problems[] = "The API reports the root helper as: {$state}";
+            } elseif ($code !== '200') {
+                $problems[] = "The API answers {$code} at {$url}/health: run php artisan wg:status as {$ctx->webUser()} for details";
             }
         }
 

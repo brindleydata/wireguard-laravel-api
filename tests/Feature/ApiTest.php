@@ -39,7 +39,10 @@ it('runs a link and peer through their lifecycle', function () {
         ->json();
     $safe = KeyManager::pubkeyToSafe($peer['public_key']);
 
-    $this->getJson('/link/wg0/peers', $this->auth)->assertOk()->assertJsonCount(1);
+    $this->getJson('/link/wg0/peers', $this->auth)->assertOk()->assertJsonCount(1)
+        ->assertJsonPath('0.connected', false)
+        ->assertJsonPath('0.latest_handshake_at', null)
+        ->assertJsonPath('0.transfer_rx', 0);
     $this->getJson("/link/wg0/peer/{$safe}/config", $this->auth)
         ->assertOk()
         ->assertJsonPath('config', $peer['client_config']);
@@ -59,6 +62,20 @@ it('reports a missing root helper as a 500 that says how to fix it', function ()
         ->assertJsonPath('error', 'The root helper is not installed at /nonexistent/wgla-helper. Install it with: php artisan wg:install');
 });
 
+it('shows only health publicly, and status and IP behind the API key', function () {
+    $this->getJson('/health')->assertOk()->assertExactJson(['status' => 'ok']);
+
+    $this->getJson('/status')->assertForbidden();
+    $this->getJson('/ip')->assertForbidden();
+    $this->getJson('/ip', $this->auth)->assertOk()->assertJsonPath('ipv4', '203.0.113.10');
+});
+
+it('reports itself unavailable when the root helper is not usable', function () {
+    config(['wireguard.helper' => '/nonexistent/wgla-helper']);
+
+    $this->getJson('/health')->assertStatus(503)->assertExactJson(['status' => 'unavailable']);
+});
+
 it('rejects requests without the right API key', function () {
     $this->getJson('/links')->assertForbidden();
     $this->getJson('/links', ['api-key' => 'wrong'])->assertForbidden();
@@ -69,7 +86,7 @@ it('locks the API instead of opening it when no API key is set', function () {
 
     $this->getJson('/links')->assertForbidden();
     $this->getJson('/links', ['api-key' => ''])->assertForbidden();
-    $this->getJson('/ip')->assertOk()->assertJsonPath('ipv4', '203.0.113.10'); // public routes still work
+    $this->getJson('/health')->assertOk(); // public routes still work
 });
 
 it('maps errors to status codes with a message', function () {

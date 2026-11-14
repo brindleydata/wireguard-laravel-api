@@ -31,6 +31,12 @@ class WgInstall extends WgCommand
 
     protected $description = 'Set up this server step by step (re-run any time to check it)';
 
+    /** Runs as the deploy user, who owns the code. */
+    protected function runsAsWebUser(): bool
+    {
+        return false;
+    }
+
     public function handle(WireGuard $wg): int
     {
         $installer = app(Installer::class);

@@ -38,6 +38,18 @@ class Server
         ];
     }
 
+    /** The user this process runs as. */
+    public function processUser(): string
+    {
+        return function_exists('posix_getpwuid') ? (posix_getpwuid(posix_geteuid())['name'] ?? '') : get_current_user();
+    }
+
+    /** Whether the API can do its job: the root helper is installed, current and allowed by sudo. */
+    public function healthy(): bool
+    {
+        return $this->os->helperStatus()['state'] === 'ok';
+    }
+
     public function interfaces(): array
     {
         return $this->os->networkInterfaces();

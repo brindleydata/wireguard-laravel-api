@@ -2,6 +2,7 @@
 
 namespace Tests\Support;
 
+use App\Services\Backup;
 use App\Services\ConfigBuilder;
 use App\Services\IpAllocator;
 use App\Services\KeyManager;
@@ -27,18 +28,20 @@ final class Rig
 
     public readonly WireGuard $wg;
 
+    public readonly Backup $backup;
+
     public readonly string $tmp;
 
     /** @var list<string> */
     private static array $dirs = [];
 
-    public function __construct(public readonly string $os)
+    public function __construct(public readonly string $os, string $hostname = 'vpn.example.test')
     {
         $this->tmp = sys_get_temp_dir().'/wgla_test_'.bin2hex(random_bytes(6));
         mkdir($this->tmp, 0700, true);
         self::$dirs[] = $this->tmp;
 
-        $config = array_merge(require dirname(__DIR__, 2).'/config/wireguard.php', ['hostname' => 'vpn.example.test']);
+        $config = array_merge(require dirname(__DIR__, 2).'/config/wireguard.php', ['hostname' => $hostname]);
 
         $this->shell = new FakeShell;
         $driver = $os === 'mac' ? new MacDriver($this->shell, $config['helper']) : new LinuxDriver($this->shell, $config['helper']);
@@ -49,10 +52,11 @@ final class Rig
             os: $driver,
             validator: new WireGuardValidator,
             keys: new KeyManager,
-            configBuilder: new ConfigBuilder($config, $driver),
+            configBuilder: $configBuilder = new ConfigBuilder($config, $driver),
             ipAllocator: new IpAllocator,
             lockPath: "{$this->tmp}/locks",
         );
+        $this->backup = new Backup($this->wg, $configBuilder, $config, 'v1.0.0');
     }
 
     /**

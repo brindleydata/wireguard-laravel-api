@@ -15,6 +15,14 @@ class WireGuard extends Controller
         protected Server $server,
     ) {}
 
+    /** 200 or 503, nothing else: it's public. */
+    public function health(): JsonResponse
+    {
+        $healthy = $this->server->healthy();
+
+        return response()->json(['status' => $healthy ? 'ok' : 'unavailable'], $healthy ? 200 : 503);
+    }
+
     public function status(): array
     {
         return $this->server->status()->toArray();

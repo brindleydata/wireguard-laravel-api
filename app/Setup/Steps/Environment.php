@@ -48,6 +48,9 @@ class Environment extends Step
         if ($env->get('WIREGUARD_HOSTNAME') !== (string) $ctx->answer('hostname')) {
             $problems[] = 'WIREGUARD_HOSTNAME is not '.$ctx->answer('hostname');
         }
+        if (($version = $this->version($ctx)) !== null && $env->get('APP_VERSION') !== $version) {
+            $problems[] = "APP_VERSION is not {$version} (the checked-out release)";
+        }
         if ($env->get('OCTANE_SERVER') !== 'frankenphp') {
             $problems[] = 'OCTANE_SERVER is not frankenphp';
         }
@@ -81,11 +84,20 @@ class Environment extends Step
                 }
                 $env->set('WIREGUARD_HOSTNAME', (string) $ctx->answer('hostname'));
                 $env->set('OCTANE_SERVER', 'frankenphp');
+                if (($version = $this->version($ctx)) !== null) {
+                    $env->set('APP_VERSION', $version);
+                }
             }),
             $ctx->separateWebUser()
                 ? Action::command("Let {$ctx->webUser()} read .env, nobody else", 'sudo chgrp '.self::q($ctx->webGroup())." {$path} && chmod 640 {$path}")
                 : Action::command('Make .env private', "chmod 600 {$path}"),
         ];
+    }
+
+    /** The checked-out release (tag, or tag-N-gHASH, -dirty with local changes); null outside a git checkout. */
+    public function version(Context $ctx): ?string
+    {
+        return $this->shell->tryRun('git -C :app describe --tags --always --dirty', ['app' => $ctx->app()]) ?: null;
     }
 
     public function env(Context $ctx): EnvFile

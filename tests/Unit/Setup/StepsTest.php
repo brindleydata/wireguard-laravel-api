@@ -69,7 +69,7 @@ it('edits .env values in place and keeps everything else', function () {
 
 it('creates .env with fresh keys and makes it private', function (bool $separate) {
     $ctx = setupContext(answers: ['hostname' => 'vpn.example.com', 'web_user' => $separate ? 'www-data' : 'deploy']);
-    $step = new Environment(new FakeShell);
+    $step = new Environment((new FakeShell)->otherwise(fn () => throw new CommandFailed('not a git checkout')));
 
     expect($step->check($ctx))->toBe(['There is no .env file']);
 
@@ -90,6 +90,22 @@ it('creates .env with fresh keys and makes it private', function (bool $separate
     ($step->plan($ctx)[0]->callback)($ctx);
     expect($env->get('API_KEY'))->toBe($key);
 })->with(['separate web user' => true, 'same user (macOS dev)' => false]);
+
+it('records the checked-out release as APP_VERSION', function () {
+    $ctx = setupContext(answers: ['hostname' => 'vpn.example.com']);
+    $release = 'v1.2.0';
+    $step = new Environment((new FakeShell)->on('git -C :app describe --tags --always --dirty', function () use (&$release) {
+        return $release;
+    }));
+    ($step->plan($ctx)[0]->callback)($ctx);
+    chmod($ctx->app('.env'), 0640);
+
+    expect((new EnvFile($ctx->app('.env')))->get('APP_VERSION'))->toBe('v1.2.0')
+        ->and($step->check($ctx))->not->toContain('APP_VERSION is not v1.2.0 (the checked-out release)');
+
+    $release = 'v1.3.0';
+    expect($step->check($ctx))->toContain('APP_VERSION is not v1.3.0 (the checked-out release)');
+});
 
 // ─── Helper and sudoers ─────────────────────────────────────────────
 

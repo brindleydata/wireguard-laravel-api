@@ -2,6 +2,7 @@
 
 namespace App\Providers;
 
+use App\Services\Backup;
 use App\Services\ConfigBuilder;
 use App\Services\IpAllocator;
 use App\Services\KeyManager;
@@ -55,6 +56,13 @@ class WireGuardServiceProvider extends ServiceProvider
             configBuilder: $app->make(ConfigBuilder::class),
             ipAllocator: $app->make(IpAllocator::class),
             lockPath: storage_path('framework/locks'),
+        ));
+
+        $this->app->singleton(Backup::class, fn ($app) => new Backup(
+            wg: $app->make(WireGuard::class),
+            configBuilder: $app->make(ConfigBuilder::class),
+            config: config('wireguard'),
+            appVersion: (string) config('app.version'),
         ));
     }
 }

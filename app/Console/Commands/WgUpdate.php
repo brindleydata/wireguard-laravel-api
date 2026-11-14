@@ -28,7 +28,7 @@ class WgUpdate extends WgCommand
     use RunsSetupSteps;
 
     /** Installer steps an update can affect. */
-    private const STEPS = ['helper', 'sudoers', 'server', 'health'];
+    private const STEPS = ['environment', 'helper', 'sudoers', 'server', 'health'];
 
     protected $signature = 'wg:update
         {--to= : A release tag (or any git ref) to move to; default: the latest release}
@@ -37,6 +37,12 @@ class WgUpdate extends WgCommand
         {--finish= : (internal) Finish an update that came from this commit}';
 
     protected $description = 'Update the app to the latest release (or --to / --branch)';
+
+    /** Runs as the deploy user, who owns the code. */
+    protected function runsAsWebUser(): bool
+    {
+        return false;
+    }
 
     public function handle(WireGuard $wg): int
     {

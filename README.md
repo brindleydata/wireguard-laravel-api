@@ -80,7 +80,26 @@ Run it as the deploy user. It refuses to overwrite local changes to the code. Be
 1. checks out the release and runs `composer install --no-dev`;
 2. in a fresh process with the new code, reinstalls the helper if it changed, updates the sudo rule and the service, reloads the API without dropping connections, and runs the health check.
 
-If any of that fails, it goes back to the previous version by itself. Updates are never unattended: an update installs code that runs as root.
+If any of that fails, it goes back to the previous version by itself. Updates are never unattended: an update installs code that runs as root. The release it ends up on is what `/status` reports as the version.
+
+## Backup and restore
+
+```bash
+sudo -u www-data php artisan wg:backup                     # to storage/app/backups/wgla-<time>.backup (0600)
+sudo -u www-data php artisan wg:backup - > server.backup   # or to stdout
+sudo -u www-data php artisan wg:restore server.backup      # (- for stdin)
+```
+
+A backup holds every link, its keys and the stored client configs. It is encrypted with a passphrase you choose (Argon2id + libsodium), so it can only be restored with that passphrase, on this server or another one. Pass the passphrase with `--passphrase-file=` or `WGLA_BACKUP_PASSPHRASE`, or type it when asked. Backups exist only on the command line: the API never hands out private keys this way.
+
+What a restore does:
+- **Before changing anything,** it checks every link.
+  - A link that already exists here is skipped or replaced, as you choose. Without a terminal, pass `--existing=skip|replace`; otherwise nothing is restored.
+  - A link that would clash with one that stays (same port, overlapping subnet) can only be skipped.
+- **Each link is rebuilt for this server.**
+  - Links that were running start again.
+  - If the outbound interface (e.g. `eth0`) doesn't exist here, the default route's interface is used, and the restore says so.
+  - Client configs point at this server's `WIREGUARD_HOSTNAME`, keeping per-peer overrides. If the hostname changed, peers need their new config.
 
 ## Firewall notes
 
@@ -103,12 +122,13 @@ All settings are in `.env` — see `.env.example`. Key options:
 
 ## API
 
-All protected routes require the `api-key` header.
+Every route except `/health` requires the `api-key` header.
 
 | Method | Route | Auth | Description |
 |--------|-------|------|-------------|
-| GET | `/status` | No | System status |
-| GET | `/ip` | No | Server public IP |
+| GET | `/health` | No | `200 {"status":"ok"}` or `503 {"status":"unavailable"}`, for load balancers and monitoring |
+| GET | `/status` | Yes | Version, system stats, root helper state |
+| GET | `/ip` | Yes | Server public IP |
 | GET | `/links` | Yes | List all interfaces |
 | POST | `/link` | Yes | Create interface |
 | GET | `/link/{name}` | Yes | Get interface details |
@@ -121,6 +141,15 @@ All protected routes require the `api-key` header.
 | GET | `/link/{link}/peer/{pubkey}/config` | Yes | Get peer client config |
 
 `{pubkey}` is the peer's public key in URL-safe base64 without padding (`+/` → `-_`, `=` removed).
+
+Peers of a running link include live stats from WireGuard. All of these are `null` while the link is down:
+
+| Field | Meaning |
+|-------|---------|
+| `endpoint` | Where the peer last connected from (`ip:port`) |
+| `latest_handshake_at` | Time of the last handshake (ISO 8601, UTC), `null` if it never connected |
+| `connected` | Whether that handshake was within the last 3 minutes |
+| `transfer_rx`, `transfer_tx` | Bytes received from and sent to the peer since the link started |
 
 Updating a peer (`PATCH /link/{link}/peer/{pubkey}`) accepts:
 
@@ -155,4 +184,8 @@ php artisan wg:peer:create       # Create peer
 php artisan wg:peer:update       # Update peer (--ip, --dns, --allowed-ips)
 php artisan wg:peer:delete       # Delete peer
 php artisan wg:peer              # Show peer client config
+php artisan wg:backup [file]     # Encrypted backup of every link
+php artisan wg:restore {file}    # Restore from a backup
 ```
+
+Except for `wg:help`, `wg:install` and `wg:update`, these run as the web server user (`sudo -u www-data php artisan …`), like the API. They refuse to run as anyone else once `wg:install` has set the user.

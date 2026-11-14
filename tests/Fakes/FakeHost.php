@@ -94,6 +94,13 @@ class FakeHost
         return $peers;
     }
 
+    /** Live stats `wg show dump` reports for a peer of a running link. */
+    public function setPeerStats(string $link, string $pubkey, string $endpoint, int $handshake, int $rx, int $tx): void
+    {
+        $iface = $this->interfaceOf($link) ?? throw new LogicException("{$link} is not running");
+        $this->interfaces[$iface]['peers'][$pubkey]['stats'] = compact('endpoint', 'handshake', 'rx', 'tx');
+    }
+
     /** Add a running WireGuard interface that no .conf manages. */
     public function addUnmanagedInterface(string $iface): void
     {
@@ -111,6 +118,8 @@ class FakeHost
     protected function registerHelper(): void
     {
         $helper = fn (string $command, callable $handler) => $this->shell->on("sudo -n :helper {$command}", $handler);
+
+        $helper('version', fn () => '1');
 
         // Runtime state
         $helper('interfaces', fn () => implode(' ', array_keys($this->interfaces)));
@@ -209,7 +218,8 @@ class FakeHost
 
         $lines = ["{$interface['private_key']}\t{$public_key}\t{$interface['port']}\toff"];
         foreach ($interface['peers'] as $pubkey => $peer) {
-            $lines[] = implode("\t", [$pubkey, $peer['psk'] ?? '(none)', '(none)', $peer['allowed_ips'], '0', '0', '0', 'off']);
+            $stats = $peer['stats'] ?? ['endpoint' => '(none)', 'handshake' => 0, 'rx' => 0, 'tx' => 0];
+            $lines[] = implode("\t", [$pubkey, $peer['psk'] ?? '(none)', $stats['endpoint'], $peer['allowed_ips'], $stats['handshake'], $stats['rx'], $stats['tx'], 'off']);
         }
 
         return implode("\n", $lines);

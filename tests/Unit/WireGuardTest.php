@@ -1,5 +1,6 @@
 <?php
 
+use App\DTOs\PeerInfo;
 use App\Exceptions\ConflictException;
 use App\Exceptions\SystemException;
 use Tests\Support\Rig;
@@ -328,6 +329,41 @@ it('disables the unit of a stopped link when deleting it on Linux', function () 
 
     expect($rig->host->enabledUnits)->toBe([])
         ->and($rig->host->files())->toBe([]);
+});
+
+it('reports live peer stats while the link runs', function (string $os) {
+    $rig = new Rig($os);
+    $rig->wg->createLink('wg0', '10.0.0.1/24', 51820);
+    $online = $rig->wg->addPeer('wg0');
+    $never = $rig->wg->addPeer('wg0');
+    $rig->host->setPeerStats('wg0', $online->public_key, '198.51.100.7:40122', time() - 30, 1048576, 2048);
+
+    $peers = collect($rig->wg->getLink('wg0')->peers)->keyBy('public_key');
+
+    expect($peers[$online->public_key])
+        ->endpoint->toBe('198.51.100.7:40122')
+        ->transfer_rx->toBe(1048576)
+        ->transfer_tx->toBe(2048)
+        ->and($peers[$online->public_key]->connected())->toBeTrue()
+        ->and($peers[$online->public_key]->toArray()['latest_handshake_at'])->toMatch('/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$/')
+        ->and($peers[$never->public_key]->toArray())->toMatchArray([
+            'endpoint' => null, 'latest_handshake_at' => null, 'connected' => false, 'transfer_rx' => 0, 'transfer_tx' => 0,
+        ]);
+
+    // Down: nothing live to report
+    $rig->wg->updateLink('wg0', ['up' => false]);
+    expect($rig->wg->getLink('wg0')->peers[0]->toArray())->toMatchArray([
+        'endpoint' => null, 'latest_handshake_at' => null, 'connected' => null, 'transfer_rx' => null, 'transfer_tx' => null,
+    ]);
+})->with('os');
+
+it('counts a peer as connected for 3 minutes after its last handshake', function () {
+    $peer = fn (?int $handshake) => new PeerInfo('KEY', latest_handshake: $handshake, transfer_rx: 0, transfer_tx: 0);
+
+    expect($peer(1000)->connected(now: 1000 + 179))->toBeTrue()
+        ->and($peer(1000)->connected(now: 1000 + 180))->toBeFalse()
+        ->and($peer(null)->connected(now: 1000))->toBeFalse()
+        ->and((new PeerInfo('KEY'))->connected())->toBeNull();
 });
 
 it('treats creating an existing link as a conflict', function () {

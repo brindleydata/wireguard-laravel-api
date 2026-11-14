@@ -56,6 +56,8 @@ printf '[Interface]\nAddress = 10.9.0.1/24\nPrivateKey = xTIBA5rboUvnH4htodjb6e6
 check "the helper refuses a config with a planted hook" "! as_web sudo -n $HELPER conf-write e2eevil < /tmp/wgla-e2e-evil.conf"
 check "... so it never runs" "! as_web sudo -n $HELPER up e2eevil && [ ! -e /tmp/wgla-e2e-pwned ]"
 check "the API reports the helper ok" "[ \"\$(api $URL/status)\" = 200 ] && grep -q '\"state\":\"ok\"' /tmp/wgla-e2e-body"
+check "/health is public and ok" "[ \"\$(curl -s ${CURL_OPTS[*]} -o /dev/null -w '%{http_code}' $URL/health)\" = 200 ]"
+check "/status needs the API key" "[ \"\$(curl -s ${CURL_OPTS[*]} -o /dev/null -w '%{http_code}' $URL/status)\" = 403 ]"
 
 step "A link with forward + NAT, out to a third network"
 ip netns add e2e-far
@@ -87,6 +89,7 @@ ip netns exec e2e-client wg setconf e2ec0 <(wg-quick strip /tmp/wgla-e2e-c0.conf
 ip netns exec e2e-client sh -c 'ip addr add 10.80.0.2/32 dev e2ec0; ip link set e2ec0 up; ip route add 10.80.0.0/24 dev e2ec0; ip route add 10.98.0.0/24 dev e2ec0'
 check "the client reaches the server through the tunnel" "ip netns exec e2e-client ping -c1 -W3 10.80.0.1"
 check "and the far network (forward + NAT)" "ip netns exec e2e-client ping -c1 -W3 10.98.0.2"
+check "the API shows the peer connected, from its endpoint, with traffic" "[ \"\$(api $URL/link/e2e0/peers)\" = 200 ] && grep -q '\"connected\":true' /tmp/wgla-e2e-body && grep -q '\"endpoint\":\"10.99.0.2:' /tmp/wgla-e2e-body && grep -q '\"transfer_rx\":[1-9]' /tmp/wgla-e2e-body"
 
 step "A FORWARD DROP policy like Docker or ufw set"
 iptables -P FORWARD DROP
@@ -124,6 +127,16 @@ check "a port clash -> 409" "[ \"\$(api -X POST $URL/link -d '{\"name\":\"e2e3\"
 check "a line break in dns -> 422" "[ \"\$(api -X POST $URL/link -d '{\"name\":\"e2e3\",\"ip\":\"10.83.0.1/24\",\"dns\":\"1.1.1.1\\\\nPostUp = id\"}')\" = 422 ]"
 check "no API key -> 403" "[ \"\$(curl -s ${CURL_OPTS[*]} -o /dev/null -w '%{http_code}' $URL/links)\" = 403 ]"
 check "DELETE /link/e2e2 -> 200" "[ \"\$(api -X DELETE $URL/link/e2e2)\" = 200 ]"
+
+step "Backup and restore"
+printf 'correct horse battery staple\n' > /tmp/wgla-e2e-pass && chmod 644 /tmp/wgla-e2e-pass
+KEY0=$(wg show e2e0 public-key)
+check "a backup, as the web user, with no key in clear" "\"\${ART[@]}\" wg:backup - --passphrase-file=/tmp/wgla-e2e-pass > /tmp/wgla-e2e.backup && grep -q '\"format\": \"wgla-backup\"' /tmp/wgla-e2e.backup && ! grep -q PrivateKey /tmp/wgla-e2e.backup"
+"${ART[@]}" wg:link:delete e2e0 > /dev/null
+check "the link is gone" "! wg show interfaces | grep -qw e2e0 && [ ! -e /etc/wireguard/e2e0.conf ]"
+check "restore it" "\"\${ART[@]}\" wg:restore - --passphrase-file=/tmp/wgla-e2e-pass --existing=skip --yes --no-interaction < /tmp/wgla-e2e.backup"
+check "same keys, running again" "[ \"\$(wg show e2e0 public-key)\" = \"$KEY0\" ] && systemctl is-active -q wg-quick@e2e0"
+check "the client's existing config connects again" "for i in \$(seq 25); do ip netns exec e2e-client ping -c1 -W1 10.80.0.1 && break; done"
 
 step "Delete everything"
 "${ART[@]}" wg:link:delete e2e0 > /dev/null
