@@ -3,6 +3,7 @@ name: CI
 on:
   push:
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -67,6 +68,9 @@ jobs:
       - name: End-to-end checks
         run: sudo WGLA_E2E=1 /srv/wgla/tests/e2e/linux.sh /srv/wgla
 
-      - name: Service log on failure
+      - name: Logs on failure
         if: failure()
-        run: sudo journalctl -u wgla -n 100 --no-pager
+        run: |
+          echo "=== wgla (API)"; sudo journalctl -u wgla -n 60 --no-pager
+          echo "=== wg-quick units"; sudo journalctl -u 'wg-quick@*' -n 100 --no-pager
+          echo "=== kernel and firewall"; uname -a; sudo nft --version; sudo iptables --version; sudo iptables -S FORWARD

@@ -28,6 +28,17 @@ esac
 
 ART=(sudo -u "$WEB" php "$APP/artisan")
 PASS=0; FAIL=0
+# Run an artisan command as the web user; when it fails, show why on stderr (its output is often discarded)
+cli() {
+    local out status
+    out=$("${ART[@]}" "$@" 2>&1); status=$?
+    if [ "$status" -ne 0 ]; then
+        echo "  ! php artisan $* failed ($status):" >&2
+        printf '%s\n' "$out" | sed 's/^/    | /' >&2
+    fi
+    printf '%s\n' "$out"
+    return "$status"
+}
 step()  { echo; echo "=== $*"; }
 check() { if eval "$2" >/dev/null 2>&1; then echo "  ok   $1"; PASS=$((PASS + 1)); else echo "  FAIL $1"; FAIL=$((FAIL + 1)); fi; }
 peer_key() { sed -n 's/^Added peer //p'; }
@@ -65,7 +76,7 @@ ip link add e2e-fh type veth peer name e2e-fn
 ip link set e2e-fn netns e2e-far
 ip addr add 10.98.0.1/24 dev e2e-fh; ip link set e2e-fh up
 ip netns exec e2e-far sh -c 'ip addr add 10.98.0.2/24 dev e2e-fn; ip link set e2e-fn up; ip link set lo up'
-"${ART[@]}" wg:link:create e2e0 10.80.0.1/24 --port=51880 --forward=true --nat=true --ifout=e2e-fh > /dev/null
+cli wg:link:create e2e0 10.80.0.1/24 --port=51880 --forward=true --nat=true --ifout=e2e-fh > /dev/null
 check "running as a systemd unit" "wg show interfaces | grep -qw e2e0 && systemctl is-active -q wg-quick@e2e0"
 check "config is 0600 root" "[ \"\$(stat -c %a:%U /etc/wireguard/e2e0.conf)\" = 600:root ]"
 check "hooks call the helper" "grep -qx 'PostUp = $HELPER firewall-up %i %i' /etc/wireguard/e2e0.conf"
@@ -73,7 +84,7 @@ check "nftables: forward rules" "nft list table inet wg_e2e0 | grep -q 'iifname 
 check "nftables: NAT only for the VPN subnet" "nft list table inet wg_e2e0 | grep -q 'ip saddr 10.80.0.0/24 oifname \"e2e-fh\" masquerade'"
 
 step "A peer, and a real handshake from a client namespace"
-PEER=$("${ART[@]}" wg:peer:create e2e0 | peer_key)
+PEER=$(cli wg:peer:create e2e0 | peer_key)
 CLIENT=/etc/wireguard/clients/e2e0/$(safe "$PEER").conf
 check "peer live and saved" "wg show e2e0 allowed-ips | grep -q \"$PEER.*10.80.0.2/32\" && grep -q \"PublicKey = $PEER\" /etc/wireguard/e2e0.conf"
 check "client config is 0600" "[ \"\$(stat -c %a \"$CLIENT\")\" = 600 ]"
@@ -93,14 +104,14 @@ check "the API shows the peer connected, from its endpoint, with traffic" "[ \"\
 
 step "A FORWARD DROP policy like Docker or ufw set"
 iptables -P FORWARD DROP
-"${ART[@]}" wg:link:update e2e0 --forward=false > /dev/null
-"${ART[@]}" wg:link:update e2e0 --forward=true > /dev/null
+cli wg:link:update e2e0 --forward=false > /dev/null
+cli wg:link:update e2e0 --forward=true > /dev/null
 check "the helper added two tagged iptables accepts" "[ \"\$(iptables -S FORWARD | grep -c wgla:e2e0)\" = 2 ]"
 check "forwarding works through the DROP policy" "ip netns exec e2e-client ping -c1 -W3 10.98.0.2"
 systemctl restart wg-quick@e2e0
 check "a restart (PostUp) restores them without duplicates" "[ \"\$(iptables -S FORWARD | grep -c wgla:e2e0)\" = 2 ]"
 check "the client reconnects to the restarted server" "for i in \$(seq 25); do ip netns exec e2e-client ping -c1 -W1 10.98.0.2 && break; done"
-"${ART[@]}" wg:link:update e2e0 --forward=false > /dev/null
+cli wg:link:update e2e0 --forward=false > /dev/null
 check "turning forward off removes them" "! iptables -S FORWARD | grep -q wgla:e2e0"
 iptables -P FORWARD ACCEPT
 
@@ -110,14 +121,14 @@ check "an overlapping subnet is refused" "! \"\${ART[@]}\" wg:link:create e2e1 1
 check "nothing was written" "[ ! -e /etc/wireguard/e2e1.conf ]"
 
 step "Peers on a stopped link"
-"${ART[@]}" wg:link:create e2e1 10.81.0.1/24 --port=51881 --up=false > /dev/null
-P1=$("${ART[@]}" wg:peer:create e2e1 | peer_key)
+cli wg:link:create e2e1 10.81.0.1/24 --port=51881 --up=false > /dev/null
+P1=$(cli wg:peer:create e2e1 | peer_key)
 check "the link is not running, the peer is saved" "! wg show interfaces | grep -qw e2e1 && grep -q \"PublicKey = $P1\" /etc/wireguard/e2e1.conf"
-"${ART[@]}" wg:link:update e2e1 --up=true > /dev/null
+cli wg:link:update e2e1 --up=true > /dev/null
 check "the peer is loaded when the link starts" "wg show e2e1 peers | grep -q \"$P1\""
-"${ART[@]}" wg:link:update e2e1 --up=false > /dev/null
+cli wg:link:update e2e1 --up=false > /dev/null
 systemctl enable wg-quick@e2e1 > /dev/null 2>&1
-"${ART[@]}" wg:link:delete e2e1 > /dev/null
+cli wg:link:delete e2e1 > /dev/null
 check "deleting it also disables a leftover unit" "! systemctl is-enabled -q wg-quick@e2e1 && [ ! -e /etc/wireguard/e2e1.conf ]"
 
 step "HTTP API ($URL)"
@@ -132,16 +143,20 @@ step "Backup and restore"
 printf 'correct horse battery staple\n' > /tmp/wgla-e2e-pass && chmod 644 /tmp/wgla-e2e-pass
 KEY0=$(wg show e2e0 public-key)
 check "a backup, as the web user, with no key in clear" "\"\${ART[@]}\" wg:backup - --passphrase-file=/tmp/wgla-e2e-pass > /tmp/wgla-e2e.backup && grep -q '\"format\": \"wgla-backup\"' /tmp/wgla-e2e.backup && ! grep -q PrivateKey /tmp/wgla-e2e.backup"
-"${ART[@]}" wg:link:delete e2e0 > /dev/null
+cli wg:link:delete e2e0 > /dev/null
 check "the link is gone" "! wg show interfaces | grep -qw e2e0 && [ ! -e /etc/wireguard/e2e0.conf ]"
 check "restore it" "\"\${ART[@]}\" wg:restore - --passphrase-file=/tmp/wgla-e2e-pass --existing=skip --yes --no-interaction < /tmp/wgla-e2e.backup"
 check "same keys, running again" "[ \"\$(wg show e2e0 public-key)\" = \"$KEY0\" ] && systemctl is-active -q wg-quick@e2e0"
 check "the client's existing config connects again" "for i in \$(seq 25); do ip netns exec e2e-client ping -c1 -W1 10.80.0.1 && break; done"
 
 step "Delete everything"
-"${ART[@]}" wg:link:delete e2e0 > /dev/null
+cli wg:link:delete e2e0 > /dev/null
 check "no e2e links, configs, units or rules left" "! wg show interfaces | grep -q e2e && [ -z \"\$(find /etc/wireguard -name 'e2e*.conf')\" ] && ! nft list tables | grep -q wg_e2e && ! iptables -S FORWARD | grep -q wgla:e2e"
 
 echo
 echo "RESULT: $PASS passed, $FAIL failed"
+if [ "$FAIL" -ne 0 ]; then
+    echo; echo "=== wg-quick journal (failed run)"
+    journalctl -u 'wg-quick@e2e*' -n 60 --no-pager -o cat 2>&1 | sed 's/^/  | /'
+fi
 [ "$FAIL" -eq 0 ]
