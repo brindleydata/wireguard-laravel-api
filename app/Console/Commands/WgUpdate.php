@@ -26,7 +26,7 @@ class WgUpdate extends WgCommand
     use RunsSetupSteps;
 
     /** Installer steps an update can affect. */
-    private const STEPS = ['environment', 'helper', 'sudoers', 'server', 'health'];
+    private const STEPS = ['environment', 'helper', 'sudoers', 'apparmor', 'server', 'health'];
 
     protected $signature = 'wg:update
         {--to= : A release tag (or any git ref) to move to; default: the latest release}

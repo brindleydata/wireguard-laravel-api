@@ -70,7 +70,7 @@ it('rejects malformed arguments before running anything', function (array $args,
 ]);
 
 it('reports its version', function () {
-    expect((new HelperSandbox)->run(['version'])['stdout'])->toBe("1\n");
+    expect((new HelperSandbox)->run(['version'])['stdout'])->toBe(helperVersion()."\n");
 });
 
 // ─── Link configs ───────────────────────────────────────────────────

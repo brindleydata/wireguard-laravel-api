@@ -3,6 +3,7 @@
 use App\Setup\Context;
 use App\Setup\EnvFile;
 use App\Setup\Installer;
+use App\Setup\Steps\AppArmor;
 use App\Setup\Steps\Environment;
 use App\Setup\Steps\Forwarding;
 use App\Setup\Steps\Helper;
@@ -119,9 +120,9 @@ it('wants the bundled helper installed, owned by root', function () {
         );
 
     mkdir(dirname($ctx->helperPath), 0755, true);
-    file_put_contents($ctx->helperPath, str_replace('VERSION=1', 'VERSION=0', file_get_contents($ctx->bundledHelper)));
+    file_put_contents($ctx->helperPath, str_replace('VERSION='.helperVersion(), 'VERSION=0', file_get_contents($ctx->bundledHelper)));
 
-    expect($step->check($ctx))->toContain("{$ctx->helperPath} differs from the bundled helper (installed v0, app v1)")
+    expect($step->check($ctx))->toContain("{$ctx->helperPath} differs from the bundled helper (installed v0, app v".helperVersion().')')
         // Owned by the test user, not root
         ->toContain("{$ctx->helperPath} must be owned by root and writable by nobody else");
 });
@@ -229,6 +230,50 @@ it('only applies when the API runs as its own user', function () {
     expect((new Permissions(new FakeShell))->applies(setupContext()))->toBeTrue()
         ->and((new Permissions(new FakeShell))->applies(setupContext(answers: ['web_user' => 'deploy'])))->toBeFalse();
 });
+
+// ─── AppArmor ───────────────────────────────────────────────────────
+
+it('lets wg-quick run the helper where Ubuntu confines it with AppArmor', function () {
+    $ctx = setupContext();
+    $step = new AppArmor(new FakeShell);
+    expect($step->applies($ctx))->toBeFalse('No wg-quick profile, nothing to do');
+
+    mkdir($ctx->system('/etc/apparmor.d/local'), 0755, true);
+    touch($ctx->system('/etc/apparmor.d/wg-quick'));
+    file_put_contents($ctx->system('/etc/apparmor.d/local/wg-quick'), "# the admin's own rule\n/usr/bin/foo ix,\n");
+
+    expect($step->applies($ctx))->toBeTrue()
+        ->and($step->applies(setupContext('mac')))->toBeFalse()
+        ->and($step->check($ctx))->toBe(["AppArmor doesn't let wg-quick run the root helper: links with forward or NAT can't start"]);
+
+    $command = $step->plan($ctx)[0]->command;
+    expect($command)
+        ->toContain($ctx->helperPath.' Ux,')
+        ->toContain('cat "$backup"') // the admin's own rules are kept
+        ->and(strpos($command, 'apparmor_parser -Q'))->toBeInt()->toBeLessThan(strpos($command, 'apparmor_parser -r'));
+
+    file_put_contents($ctx->system('/etc/apparmor.d/local/wg-quick'), "/usr/bin/foo ix,\n{$ctx->helperPath} Ux,\n", FILE_APPEND);
+    expect($step->check($ctx))->toBe([]);
+});
+
+it('rolls the AppArmor rule back when the profile no longer compiles', function (bool $compiles) {
+    $ctx = setupContext();
+    mkdir($ctx->system('/etc/apparmor.d/local'), 0755, true);
+    touch($ctx->system('/etc/apparmor.d/wg-quick'));
+    file_put_contents($ctx->system('/etc/apparmor.d/local/wg-quick'), "/usr/bin/foo ix,\n");
+    $command = (new AppArmor(new FakeShell))->plan($ctx)[0]->command;
+
+    // A stub sudo runs commands as us; its apparmor_parser accepts or rejects the profile
+    mkdir("{$this->tmp}/bin");
+    file_put_contents("{$this->tmp}/bin/sudo", "#!/bin/sh\n[ \"\$1\" = apparmor_parser ] && exit ".($compiles ? 0 : 1)."\n[ \"\$1\" = install ] && { shift; while [ \"\${1#-}\" != \"\$1\" ]; do [ \"\$1\" = -D ] && shift || shift 2; done; mkdir -p \"\$(dirname \"\$2\")\"; cp \"\$1\" \"\$2\"; exit; }\nexec \"\$@\"\n");
+    chmod("{$this->tmp}/bin/sudo", 0755);
+    exec('PATH='.escapeshellarg("{$this->tmp}/bin").':/usr/bin:/bin sh -c '.escapeshellarg($command).' 2>/dev/null', result_code: $rc);
+
+    expect($rc === 0)->toBe($compiles)
+        ->and(file_get_contents($ctx->system('/etc/apparmor.d/local/wg-quick')))->toBe($compiles
+            ? "/usr/bin/foo ix,\n# Lets wg-quick run the WireGuard API root helper from PostUp/PostDown (php artisan wg:install)\n{$ctx->helperPath} Ux,\n"
+            : "/usr/bin/foo ix,\n");
+})->with(['compiles' => true, 'rejected' => false]);
 
 // ─── Web user and server ────────────────────────────────────────────
 

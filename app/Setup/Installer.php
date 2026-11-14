@@ -3,6 +3,7 @@
 namespace App\Setup;
 
 use App\Services\Shell;
+use App\Setup\Steps\AppArmor;
 use App\Setup\Steps\Environment;
 use App\Setup\Steps\Forwarding;
 use App\Setup\Steps\Health;
@@ -51,6 +52,7 @@ class Installer
             new PfAnchors($this->shell),
             new Helper($this->shell),
             new Sudoers($this->shell),
+            new AppArmor($this->shell),
             $server,
             new Health($this->shell, $server),
         ];

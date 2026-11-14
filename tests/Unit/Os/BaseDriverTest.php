@@ -106,8 +106,8 @@ it('refuses a missing or different helper before running anything', function (?s
         ->and($shell->calls)->toBe([]);
 })->with([
     'missing' => [null, 'The root helper is not installed at'],
-    'an older version' => [str_replace('VERSION=1', 'VERSION=0', file_get_contents(__DIR__.'/../../../bin/wgla-helper')), 'differs from the one this app ships (installed: v0, app: v1)'],
-    'edited, same version' => [file_get_contents(__DIR__.'/../../../bin/wgla-helper')."\n# local edit\n", '(installed: v1, app: v1)'],
+    'an older version' => [str_replace('VERSION='.helperVersion(), 'VERSION=0', file_get_contents(__DIR__.'/../../../bin/wgla-helper')), 'differs from the one this app ships (installed: v0, app: v'.helperVersion().')'],
+    'edited, same version' => [file_get_contents(__DIR__.'/../../../bin/wgla-helper')."\n# local edit\n", '(installed: v'.helperVersion().', app: v'.helperVersion().')'],
 ]);
 
 it('reports the helper state', function (?string $installed, bool $sudoAllowed, string $state) {
@@ -116,7 +116,7 @@ it('reports the helper state', function (?string $installed, bool $sudoAllowed, 
     $status = driftDriver($shell, $installed)->helperStatus();
 
     expect($status['state'])->toBe($state)
-        ->and($status['bundled'])->toBe('1');
+        ->and($status['bundled'])->toBe(helperVersion());
 })->with([
     'ok' => [file_get_contents(__DIR__.'/../../../bin/wgla-helper'), true, 'ok'],
     'sudoers missing' => [file_get_contents(__DIR__.'/../../../bin/wgla-helper'), false, 'not-allowed'],

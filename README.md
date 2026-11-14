@@ -33,13 +33,14 @@ php artisan wg:install
 6. **pf anchors** (macOS only).
 7. **The root helper** (see below).
 8. **The sudo rule:** one line, checked with `visudo` before it's installed.
-9. **The API server:** Octane + FrankenPHP as a systemd service, which serves HTTPS itself. You choose how:
+9. **AppArmor** (Ubuntu 26.04 and later, which confine `wg-quick`): one rule in `/etc/apparmor.d/local/wg-quick` that lets the `PostUp`/`PostDown` hooks run the helper. Without it, links with forwarding or NAT can't start. The profile is compiled with the rule before it's reloaded, and a rule it rejects is rolled back.
+10. **The API server:** Octane + FrankenPHP as a systemd service, which serves HTTPS itself. You choose how:
    - a Let's Encrypt certificate for a domain;
    - your own certificate files;
    - plain HTTP on a local port behind your own reverse proxy.
 
    You also choose the port. The installer explains the downsides of anything other than 443.
-10. **Health check:** the web user can use the helper, and the API answers.
+11. **Health check:** the web user can use the helper, and the API answers.
 
 Run it again any time: finished steps just show ✓, so it doubles as a health check. Other ways to run it:
 
@@ -78,7 +79,7 @@ php artisan wg:update --branch=master  # follow a branch (for testing)
 Run it as the deploy user. It refuses to overwrite local changes to the code. Before changing anything it shows the version change, the changelog and any change to the root helper, which runs as root, so review it. It then:
 
 1. checks out the release and runs `composer install --no-dev`;
-2. in a fresh process with the new code, reinstalls the helper if it changed, updates the sudo rule and the service, reloads the API without dropping connections, and runs the health check.
+2. in a fresh process with the new code, reinstalls the helper if it changed, updates the sudo rule, the AppArmor rule and the service, reloads the API without dropping connections, and runs the health check.
 
 If you deploy code another way, such as a plain `git pull` or rsync, run `php artisan wg:install` afterwards. It notices that the API still runs the old code and reloads it. (The API reports the code it booted with, and the wizard compares that with what's on disk.)
 

@@ -19,6 +19,14 @@ dataset('firewall states', [
     'forward + nat' => [true, true],
 ]);
 
+/** VERSION of the bundled root helper, so tests don't change with every helper release. */
+function helperVersion(): string
+{
+    preg_match('/^VERSION=(\S+)$/m', (string) file_get_contents(__DIR__.'/../bin/wgla-helper'), $match);
+
+    return $match[1];
+}
+
 /*
  * A pf ruleset the real pfctl accepts (parse only: no root needed). Skipped where pfctl is missing.
  */

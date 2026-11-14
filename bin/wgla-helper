@@ -15,7 +15,7 @@ set -euo pipefail
 umask 077
 IFS=$' \t\n'
 
-VERSION=1
+VERSION=2
 SELF=$0
 MAX_SIZE=1048576
 
@@ -306,7 +306,10 @@ case "$command" in
         TMP=$(mktemp "${TMPDIR:-/tmp}/wgla.XXXXXX")
         read_input "$TMP"
         validate_peer "$TMP"
-        wg addconf "$1" /dev/stdin < "$TMP"
+        # Through a pipe, like wg-quick does: Ubuntu's AppArmor profile for wg only lets it open
+        # files under /etc/wireguard, so it can't read a temp file in /tmp
+        # shellcheck disable=SC2002
+        cat "$TMP" | wg addconf "$1" /dev/stdin
         ;;
     peer-remove)
         args 2 $# "$command"; iface_arg "$1"; key_arg "$2"
