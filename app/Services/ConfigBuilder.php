@@ -7,6 +7,9 @@ use App\Services\Os\OsDriver;
 
 class ConfigBuilder
 {
+    /** Header of a disabled peer's section: the whole section is commented out. */
+    public const DISABLED_PEER = '# [Peer] disabled';
+
     public function __construct(
         protected array $config,
         protected OsDriver $os,
@@ -37,15 +40,21 @@ class ConfigBuilder
         // Interface section from OS driver
         $lines[] = $this->os->interfaceSection($address6 === null ? $address : "{$address}, {$address6}", $privkey, $port, $ifout, $forward, $nat);
 
-        // Peer sections
+        // Peer sections. A disabled peer is commented out, so wg-quick doesn't load it; its name is
+        // a comment either way.
         foreach ($peers as $peer) {
+            $disabled = ($peer['enabled'] ?? true) === false;
+            $prefix = $disabled ? '# ' : '';
             $lines[] = '';
-            $lines[] = '[Peer]';
-            $lines[] = "PublicKey = {$peer['public_key']}";
-            if (! empty($peer['preshared_key'])) {
-                $lines[] = "PresharedKey = {$peer['preshared_key']}";
+            $lines[] = $disabled ? self::DISABLED_PEER : '[Peer]';
+            if (($peer['name'] ?? null) !== null) {
+                $lines[] = "# name = {$peer['name']}";
             }
-            $lines[] = "AllowedIPs = {$peer['allowed_ips']}";
+            $lines[] = "{$prefix}PublicKey = {$peer['public_key']}";
+            if (! empty($peer['preshared_key'])) {
+                $lines[] = "{$prefix}PresharedKey = {$peer['preshared_key']}";
+            }
+            $lines[] = "{$prefix}AllowedIPs = {$peer['allowed_ips']}";
         }
 
         return implode("\n", $lines);
@@ -148,6 +157,24 @@ class ConfigBuilder
                 if (preg_match('/^#\s*(\w+)\s*=\s*(.+)$/', $trimmed, $matches)) {
                     $metadata[trim($matches[1])] = trim($matches[2]);
                 }
+
+                continue;
+            }
+
+            // A disabled peer: its section is commented out
+            if ($trimmed === self::DISABLED_PEER) {
+                $current_section = 'disabled';
+                $peers[] = ['disabled' => true];
+
+                continue;
+            }
+            if (in_array($current_section, ['peer', 'disabled'], true) && preg_match('/^#\s*name\s*=\s*(.+)$/', $trimmed, $matches)) {
+                $peers[count($peers) - 1]['name'] = trim($matches[1]);
+
+                continue;
+            }
+            if ($current_section === 'disabled' && preg_match('/^#\s*(PublicKey|PresharedKey|AllowedIPs)\s*=\s*(.+)$/', $trimmed, $matches)) {
+                $peers[count($peers) - 1][$matches[1]] = trim($matches[2]);
 
                 continue;
             }

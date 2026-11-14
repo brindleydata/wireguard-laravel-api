@@ -28,7 +28,8 @@ class WgCommand extends Command
 
         if ($this->runsAsWebUser() && $web && $user !== $web) {
             $this->error("Run this as {$web}, the user the API runs as:");
-            $this->line("  sudo -u {$web} php artisan {$this->getName()} ...");
+            $this->line('  wgla '.substr($this->getName(), 3).' ...');
+            $this->line("  (or: sudo -u {$web} php artisan {$this->getName()} ...)");
 
             return self::FAILURE;
         }
@@ -54,9 +55,12 @@ class WgCommand extends Command
 
               php artisan wg:update           shows the changes (and any root helper diff) first
 
-            Everything else runs as the web server user, e.g.:
+            Once installed, `wgla` runs any of these commands as the right user:
 
-              sudo -u www-data php artisan wg:links
+              wgla                            the commands
+              wgla links                      = sudo -u <web user> php artisan wg:links
+              wgla peer:create wg0 --qr
+              wgla update                     as the deploy user
             HELP);
 
         return Command::SUCCESS;

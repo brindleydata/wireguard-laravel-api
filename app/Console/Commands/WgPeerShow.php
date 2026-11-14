@@ -2,12 +2,13 @@
 
 namespace App\Console\Commands;
 
+use App\Services\QrCode;
 use App\Services\WireGuard;
 use Illuminate\Console\Command;
 
 class WgPeerShow extends WgCommand
 {
-    protected $signature = 'wg:peer {link : Interface name} {pubkey : Peer public key}';
+    protected $signature = 'wg:peer {link : Interface name} {pubkey : Peer public key} {--qr : Print it as a QR code, for the WireGuard apps}';
 
     protected $description = 'Show WireGuard peer configuration';
 
@@ -21,6 +22,12 @@ class WgPeerShow extends WgCommand
             $this->error("Could not find configuration for peer {$pubkey} on {$link}.");
 
             return Command::FAILURE;
+        }
+
+        if ($this->option('qr')) {
+            $this->line(app(QrCode::class)->terminal($config));
+
+            return Command::SUCCESS;
         }
 
         $this->info("Peer {$pubkey} configuration:");

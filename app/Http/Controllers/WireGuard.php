@@ -2,10 +2,12 @@
 
 namespace App\Http\Controllers;
 
+use App\Services\QrCode;
 use App\Services\Server;
 use App\Services\WireGuard as WireGuardService;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
+use Illuminate\Http\Response;
 use Illuminate\Routing\Controller;
 
 class WireGuard extends Controller
@@ -131,9 +133,11 @@ class WireGuard extends Controller
     {
         $data = $request->validate([
             'ip' => 'nullable|string',
+            'name' => 'nullable|string',      // a label
+            'networks' => 'nullable|string',  // networks behind the peer (site-to-site)
         ]);
 
-        $peer = $this->wg->addPeer($link, $data['ip'] ?? null);
+        $peer = $this->wg->addPeer($link, $data['ip'] ?? null, $data['name'] ?? null, $data['networks'] ?? null);
 
         return response()->json($peer->toArray(), 201);
     }
@@ -152,9 +156,17 @@ class WireGuard extends Controller
             'ip' => 'nullable|string',          // tunnel address (server AllowedIPs + client Address)
             'dns' => 'nullable|string',         // client config DNS
             'allowed_ips' => 'nullable|string', // client config AllowedIPs (routes)
+            'name' => 'nullable|string',        // a label; null removes it
+            'enabled' => 'nullable|boolean',    // false takes the peer off the interface
+            'networks' => 'nullable|string',    // networks behind the peer; null removes them
         ]);
 
         $params = array_filter($data, fn ($v) => $v !== null);
+        foreach (['name', 'networks'] as $field) {
+            if ($request->exists($field)) {
+                $params[$field] = $data[$field] ?? null;
+            }
+        }
         $decoded = WireGuardService::safeToPubkey($pubkey);
 
         $peer = $this->wg->updatePeer($link, $decoded, $params);
@@ -172,5 +184,17 @@ class WireGuard extends Controller
         }
 
         return ['config' => $config];
+    }
+
+    /** The client config as a QR code (SVG) for the WireGuard apps. It holds the private key. */
+    public function peerQr(QrCode $qr, string $link, string $pubkey): Response
+    {
+        $config = $this->wg->getPeerConfig($link, WireGuardService::safeToPubkey($pubkey));
+
+        if ($config === null) {
+            abort(404, "Configuration not found for peer on {$link}");
+        }
+
+        return response($qr->svg($config), 200, ['Content-Type' => 'image/svg+xml', 'Cache-Control' => 'no-store']);
     }
 }

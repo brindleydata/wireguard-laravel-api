@@ -35,7 +35,7 @@ class WgLinkShow extends WgCommand
         $this->line('');
 
         foreach ($link->peers as $peer) {
-            $this->info("Peer {$peer->public_key}");
+            $this->info("Peer {$peer->public_key}".($peer->name === null ? '' : " ({$peer->name})").($peer->enabled ? '' : ' [disabled]'));
             $this->line("Allowed IPs: {$peer->allowed_ips}");
             $this->line('PSK: '.($peer->preshared_key ?? '(none)'));
             $this->line('');

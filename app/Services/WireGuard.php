@@ -295,9 +295,16 @@ class WireGuard
     // On a running link a change is applied with `wg` and the .conf is then regenerated from the
     // live interface. On a stopped link only the .conf is edited; wg-quick loads it on the next start.
 
-    public function addPeer(string $link_name, ?string $ip = null): PeerInfo
+    /**
+     * Add a peer: the next free address unless $ip is given, an optional label, and optional
+     * networks behind it (site-to-site), which wg-quick routes to it.
+     */
+    public function addPeer(string $link_name, ?string $ip = null, ?string $name = null, ?string $networks = null): PeerInfo
     {
-        return $this->withLock($link_name, function () use ($link_name, $ip) {
+        $name = $name === null || $name === '' ? null : $this->validator->peerName($name);
+        $networks = $networks === null || $networks === '' ? [] : $this->validator->networks($networks);
+
+        return $this->withLock($link_name, function () use ($link_name, $ip, $name, $networks) {
             $iface = $this->runtimeInterface($link_name);
             $link = $this->loadLink($link_name, $iface);
             if ($link === null) {
@@ -312,6 +319,7 @@ class WireGuard
             // Validate peer IP
             $existing_ips = array_map(fn (PeerInfo $p) => $p->allowed_ips, $link->peers);
             $this->validator->validateNewPeerIp($bare_ip, $link->address, $existing_ips, $link->address6);
+            $this->assertNetworksFree($link, $networks);
 
             // Generate keys (base64)
             $privkey = $this->keys->genkey();
@@ -321,15 +329,18 @@ class WireGuard
             $peer = [
                 'public_key' => $pubkey,
                 'preshared_key' => $psk,
-                'allowed_ips' => IpAllocator::peerAllowedIps($bare_ip, $link->address, $link->address6),
+                'allowed_ips' => implode(', ', [IpAllocator::peerAllowedIps($bare_ip, $link->address, $link->address6), ...$networks]),
+                'name' => $name,
             ];
 
-            if ($iface !== null) {
+            if ($iface !== null && $networks === []) {
                 // Piped through stdin so the preshared key never touches the disk
                 $this->os->addPeer($iface, $this->peerSection($peer));
-                $this->rewriteConf($link_name, $iface);
-            } else {
-                $this->rewriteConf($link_name, null, peers: fn (array $peers) => [...$peers, $peer]);
+            }
+            $this->rewriteConf($link_name, $iface, peers: fn (array $peers) => $this->putPeer($peers, $peer));
+            if ($iface !== null && $networks !== []) {
+                // wg-quick routes the networks when the link starts
+                $this->restart($link_name);
             }
 
             $client_config = $this->configBuilder->buildClientConfig($link, $privkey, $bare_ip, $pubkey, $psk);
@@ -343,6 +354,8 @@ class WireGuard
                 allowed_ips: $peer['allowed_ips'],
                 private_key: $privkey,
                 client_config: $client_config,
+                name: $name,
+                networks: $networks === [] ? null : implode(', ', $networks),
             );
         });
     }
@@ -356,18 +369,18 @@ class WireGuard
                 throw new NotFoundException("Link does not exist: {$link_name}");
             }
 
-            if ($this->findPeer($link, $pubkey) === null) {
+            $target = $this->findPeer($link, $pubkey);
+            if ($target === null) {
                 throw new NotFoundException("Peer not found: {$pubkey}");
             }
 
-            if ($iface !== null) {
+            // A disabled peer isn't on the interface
+            if ($iface !== null && $target->enabled) {
                 $this->os->removePeer($iface, $pubkey);
-                $this->rewriteConf($link_name, $iface);
-            } else {
-                $this->rewriteConf($link_name, null, peers: fn (array $peers) => array_values(
-                    array_filter($peers, fn (array $p) => $p['public_key'] !== $pubkey),
-                ));
             }
+            $this->rewriteConf($link_name, $iface, peers: fn (array $peers) => array_values(
+                array_filter($peers, fn (array $p) => $p['public_key'] !== $pubkey),
+            ));
 
             $this->os->deleteClientConfig($link_name, self::pubkeyToSafe($pubkey));
         });
@@ -384,10 +397,20 @@ class WireGuard
      * - `ip` moves its tunnel address: the server-side AllowedIPs and the client config's Address.
      * - `dns` and `allowed_ips` only change what its client config hands out (per-peer overrides of
      *   the link's client defaults), just like `allowed_ips` on a link.
+     * - `name` labels it (null or '' removes the label).
+     * - `enabled` false takes it off the interface but keeps its keys, address and client config.
+     * - `networks` are routed to it (site-to-site; null or '' removes them). wg-quick sets up the
+     *   routes, so a change to the routed networks restarts a running link.
      */
     public function updatePeer(string $link_name, string $pubkey, array $params): PeerInfo
     {
         $this->validateSettings($params);
+        if (array_key_exists('name', $params)) {
+            $params['name'] = $params['name'] === null || $params['name'] === '' ? null : $this->validator->peerName((string) $params['name']);
+        }
+        if (array_key_exists('networks', $params)) {
+            $params['networks'] = $params['networks'] === null || $params['networks'] === '' ? [] : $this->validator->networks((string) $params['networks']);
+        }
 
         return $this->withLock($link_name, function () use ($link_name, $pubkey, $params) {
             $iface = $this->runtimeInterface($link_name);
@@ -408,25 +431,48 @@ class WireGuard
             }
 
             $changes = array_intersect_key($params, array_flip(['dns', 'allowed_ips']));
+            $old_networks = IpAllocator::networksOf($target->allowed_ips, $link->address6);
+            $networks = $params['networks'] ?? $old_networks;
             $allowed_ips = $target->allowed_ips;
 
-            if (isset($params['ip'])) {
-                $bare_ip = $this->validator->peerAddress($params['ip']);
-                $others = array_filter($link->peers, fn (PeerInfo $p) => $p->public_key !== $pubkey);
-                $this->validator->validateNewPeerIp($bare_ip, $link->address, array_map(fn (PeerInfo $p) => $p->allowed_ips, $others), $link->address6);
-
-                $allowed_ips = IpAllocator::peerAllowedIps($bare_ip, $link->address, $link->address6);
-                $changes['ip'] = $bare_ip;
-
-                if ($iface !== null) {
-                    $this->os->setPeerAllowedIps($iface, $pubkey, $allowed_ips);
-                    $this->rewriteConf($link_name, $iface);
-                } else {
-                    $this->rewriteConf($link_name, null, peers: fn (array $peers) => array_map(
-                        fn (array $p) => $p['public_key'] === $pubkey ? array_merge($p, ['allowed_ips' => $allowed_ips]) : $p,
-                        $peers,
-                    ));
+            if (isset($params['ip']) || array_key_exists('networks', $params)) {
+                $bare_ip = IpAllocator::tunnelIp($target->allowed_ips);
+                if (isset($params['ip'])) {
+                    $bare_ip = $this->validator->peerAddress($params['ip']);
+                    $others = array_filter($link->peers, fn (PeerInfo $p) => $p->public_key !== $pubkey);
+                    $this->validator->validateNewPeerIp($bare_ip, $link->address, array_map(fn (PeerInfo $p) => $p->allowed_ips, $others), $link->address6);
+                    $changes['ip'] = $bare_ip;
                 }
+                if ($bare_ip === null) {
+                    throw new InvalidArgumentException("Peer {$pubkey} has no IPv4 tunnel address; give it one with `ip`.");
+                }
+                $this->assertNetworksFree($link, $networks, $pubkey);
+                $allowed_ips = implode(', ', [IpAllocator::peerAllowedIps($bare_ip, $link->address, $link->address6), ...$networks]);
+            }
+
+            $enabled = array_key_exists('enabled', $params) ? (bool) $params['enabled'] : $target->enabled;
+            $peer = [
+                'public_key' => $pubkey,
+                'preshared_key' => $target->preshared_key,
+                'allowed_ips' => $allowed_ips,
+                'name' => array_key_exists('name', $params) ? $params['name'] : $target->name,
+                'enabled' => $enabled,
+            ];
+
+            // Live changes, unless the routed networks change: then the link restarts with the config
+            $reroute = $iface !== null && ($target->enabled ? $old_networks : []) != ($enabled ? $networks : []);
+            if ($iface !== null && ! $reroute) {
+                if ($target->enabled && ! $enabled) {
+                    $this->os->removePeer($iface, $pubkey);
+                } elseif (! $target->enabled && $enabled) {
+                    $this->os->addPeer($iface, $this->peerSection($peer));
+                } elseif ($enabled && $allowed_ips !== $target->allowed_ips) {
+                    $this->os->setPeerAllowedIps($iface, $pubkey, $allowed_ips);
+                }
+            }
+            $this->rewriteConf($link_name, $iface, peers: fn (array $peers) => $this->putPeer($peers, $peer));
+            if ($reroute) {
+                $this->restart($link_name);
             }
 
             $meta = $this->os->parseConfig($link_name) ?? [];
@@ -438,6 +484,9 @@ class WireGuard
                 preshared_key: $client['PresharedKey'] ?? $target->preshared_key,
                 allowed_ips: $allowed_ips,
                 client_config: $client_config,
+                name: $peer['name'],
+                enabled: $enabled,
+                networks: $networks === [] ? null : implode(', ', $networks),
             );
         });
     }
@@ -685,7 +734,10 @@ class WireGuard
         $private_key = $iface_parts[0] ?? '';
         $public_key = $private_key !== '' && $private_key !== '(none)' ? $this->keys->pubkey($private_key) : '';
 
-        $meta = $this->os->parseConfig($name) ?? [];
+        // Names and disabled peers only live in the config
+        $parsed = $this->configBuilder->parseConfContent($this->os->readConfig($name) ?? '');
+        $meta = $parsed['metadata'];
+        $peers = $this->livePeers($this->parseDumpPeers($lines), $this->confPeers($parsed['peers']));
 
         return new InterfaceInfo(
             name: $name,
@@ -696,7 +748,7 @@ class WireGuard
             forward: ($meta['forward'] ?? 'false') === 'true',
             nat: ($meta['nat'] ?? 'false') === 'true',
             up: true,
-            peers: array_map(fn (array $p) => $this->peerInfo($p), $this->parseDumpPeers($lines)),
+            peers: array_map(fn (array $p) => $this->peerInfo($p, $meta['address6'] ?? null), $peers),
             interface: $iface,
             address6: $meta['address6'] ?? null,
         );
@@ -724,7 +776,7 @@ class WireGuard
             forward: ($metadata['forward'] ?? 'false') === 'true',
             nat: ($metadata['nat'] ?? 'false') === 'true',
             up: false,
-            peers: array_map(fn (array $p) => $this->peerInfo($p), $this->confPeers($parsed['peers'])),
+            peers: array_map(fn (array $p) => $this->peerInfo($p, $metadata['address6'] ?? null), $this->confPeers($parsed['peers'])),
             address6: $metadata['address6'] ?? null,
         );
     }
@@ -734,7 +786,7 @@ class WireGuard
     /**
      * Listen port and address of every other link, from their configs.
      *
-     * @return array<string, array{port: int, address: string, address6: string}>
+     * @return array<string, array{port: int, address: string, address6: string, peers: list<string>}>
      */
     protected function otherLinks(string $name): array
     {
@@ -748,6 +800,11 @@ class WireGuard
                 'port' => (int) ($parsed['interface']['ListenPort'] ?? 0),
                 'address' => $parsed['metadata']['address'] ?? trim(explode(',', $parsed['interface']['Address'] ?? '')[0]),
                 'address6' => $parsed['metadata']['address6'] ?? '',
+                // Every allowed IP of its peers: tunnel addresses and networks behind them
+                'peers' => array_merge(...array_map(
+                    fn (array $p) => array_map('trim', explode(',', $p['AllowedIPs'] ?? '')),
+                    $parsed['peers'],
+                ) ?: [[]]),
             ];
         }
 
@@ -785,7 +842,57 @@ class WireGuard
             if ($address6 !== null && ($settings['address6'] ?? '') !== '' && IpAllocator::overlaps($address6, $settings['address6'])) {
                 throw new ConflictException("Prefix {$address6} overlaps link {$other} ({$settings['address6']})");
             }
+            foreach ($settings['peers'] ?? [] as $network) {
+                foreach (array_filter([$address, $address6]) as $own) {
+                    if ($network !== '' && IpAllocator::overlaps($own, $network)) {
+                        throw new ConflictException("{$own} overlaps {$network}, routed to a peer of link {$other}");
+                    }
+                }
+            }
         }
+    }
+
+    /**
+     * Networks behind a peer can't overlap the link's own addresses, another peer's addresses or
+     * networks, or another link's subnets and peers: each route can only lead to one peer.
+     *
+     * @param  list<string>  $networks
+     * @param  string|null  $pubkey  the peer they're for, when it exists already
+     */
+    protected function assertNetworksFree(InterfaceInfo $link, array $networks, ?string $pubkey = null): void
+    {
+        foreach ($networks as $network) {
+            foreach (array_filter([$link->address, $link->address6]) as $own) {
+                if (IpAllocator::overlaps($network, $own)) {
+                    throw new InvalidArgumentException("{$network} overlaps the link's own addresses ({$own}).");
+                }
+            }
+            foreach ($link->peers as $peer) {
+                foreach ($peer->public_key === $pubkey ? [] : array_map('trim', explode(',', (string) $peer->allowed_ips)) as $entry) {
+                    if ($entry !== '' && IpAllocator::overlaps($network, $entry)) {
+                        throw new ConflictException("{$network} overlaps {$entry} of peer ".($peer->name ?? $peer->public_key));
+                    }
+                }
+            }
+            foreach ($this->otherLinks($link->name) as $other => $settings) {
+                foreach (array_filter([$settings['address'], $settings['address6'], ...$settings['peers']]) as $entry) {
+                    if (IpAllocator::overlaps($network, $entry)) {
+                        throw new ConflictException("{$network} overlaps {$entry} of link {$other}");
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Stop and start a running link, so wg-quick applies its config (routes included). PostUp
+     * installs the firewall rules again.
+     */
+    protected function restart(string $name): void
+    {
+        $this->os->stopInterface($name);
+        $this->os->clearFirewall($name);
+        $this->os->startInterface($name);
     }
 
     /**
@@ -848,6 +955,13 @@ class WireGuard
             if ($address6 !== null && IpAllocator::mirror($ip, $address, $address6) === $link_ip6) {
                 throw new InvalidArgumentException("Peer {$ip} would get the link's IPv6 address {$link_ip6}. Move the peer first (its `ip`).");
             }
+            foreach (array_filter(array_map('trim', explode(',', (string) $peer->networks))) as $network) {
+                foreach (array_filter([$address, $address6]) as $own) {
+                    if (IpAllocator::overlaps($network, $own)) {
+                        throw new InvalidArgumentException("{$own} would overlap {$network}, routed to peer {$ip}.");
+                    }
+                }
+            }
         }
     }
 
@@ -870,7 +984,8 @@ class WireGuard
         $meta = array_merge($parsed['metadata'], $overrides);
         $interface = $parsed['interface'];
 
-        $current = $iface !== null ? $this->dumpPeers($iface) : $this->confPeers($parsed['peers']);
+        $saved = $this->confPeers($parsed['peers']);
+        $current = $iface !== null ? $this->livePeers($this->dumpPeers($iface), $saved) : $saved;
 
         $this->os->writeConfig($name, $this->configBuilder->buildConfFile(
             address: $meta['address'] ?? trim(explode(',', $interface['Address'] ?? '')[0]),
@@ -942,6 +1057,8 @@ class WireGuard
             $peer = [
                 'public_key' => $section['PublicKey'] ?? '',
                 'allowed_ips' => $section['AllowedIPs'] ?? '',
+                'name' => $section['name'] ?? null,
+                'enabled' => ! ($section['disabled'] ?? false),
             ];
             if (! empty($section['PresharedKey'])) {
                 $peer['preshared_key'] = $section['PresharedKey'];
@@ -952,8 +1069,10 @@ class WireGuard
         return $peers;
     }
 
-    protected function peerInfo(array $peer): PeerInfo
+    protected function peerInfo(array $peer, ?string $address6): PeerInfo
     {
+        $networks = IpAllocator::networksOf($peer['allowed_ips'], $address6);
+
         return new PeerInfo(
             public_key: $peer['public_key'],
             preshared_key: $peer['preshared_key'] ?? null,
@@ -962,7 +1081,50 @@ class WireGuard
             latest_handshake: $peer['latest_handshake'] ?? null,
             transfer_rx: $peer['transfer_rx'] ?? null,
             transfer_tx: $peer['transfer_tx'] ?? null,
+            name: $peer['name'] ?? null,
+            enabled: $peer['enabled'] ?? true,
+            networks: $networks === [] ? null : implode(', ', $networks),
         );
+    }
+
+    /**
+     * Peers of a running link: the live ones (from `wg show dump`), with their names from the
+     * config, plus the disabled ones (only in the config), in the config's order.
+     *
+     * @param  list<array>  $live
+     * @param  list<array>  $saved  from confPeers()
+     */
+    protected function livePeers(array $live, array $saved): array
+    {
+        $live = array_column($live, null, 'public_key');
+        $peers = [];
+        foreach ($saved as $peer) {
+            if (isset($live[$peer['public_key']])) {
+                $peers[] = [...$live[$peer['public_key']], 'name' => $peer['name'] ?? null, 'enabled' => true];
+                unset($live[$peer['public_key']]);
+            } elseif (! $peer['enabled']) {
+                $peers[] = $peer;
+            }
+            // An enabled peer that isn't live any more was removed from the interface
+        }
+
+        return [...$peers, ...array_values($live)];
+    }
+
+    /**
+     * $peers with $peer merged into the one with its public key, or appended.
+     */
+    protected function putPeer(array $peers, array $peer): array
+    {
+        foreach ($peers as $i => $existing) {
+            if ($existing['public_key'] === $peer['public_key']) {
+                $peers[$i] = array_merge($existing, $peer);
+
+                return $peers;
+            }
+        }
+
+        return [...$peers, $peer];
     }
 
     protected function findPeer(InterfaceInfo $link, string $pubkey): ?PeerInfo
@@ -978,12 +1140,12 @@ class WireGuard
 
     protected function peerSection(array $peer): string
     {
-        return implode("\n", [
+        return implode("\n", array_filter([
             '[Peer]',
             "PublicKey = {$peer['public_key']}",
-            "PresharedKey = {$peer['preshared_key']}",
+            empty($peer['preshared_key']) ? null : "PresharedKey = {$peer['preshared_key']}",
             "AllowedIPs = {$peer['allowed_ips']}",
-        ])."\n";
+        ]))."\n";
     }
 
     // ─── Locking ─────────────────────────────────────────────────────

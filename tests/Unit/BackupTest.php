@@ -114,6 +114,25 @@ it('restores a dual-stack link with its IPv6 prefix and peer addresses', functio
     expect($taken->backup->clashes($payload, 'wg0'))->toBe(['prefix fd12::1/64 overlaps wg5 (fd12::5/64)']);
 })->with(['Linux' => 'linux', 'macOS' => 'mac']);
 
+it('restores peer names, disabled peers and networks behind peers', function (string $to) {
+    $old = new Rig('linux');
+    $old->wg->createLink('wg0', '10.0.0.1/24', 51820, forward: true);
+    $branch = $old->wg->addPeer('wg0', name: 'branch', networks: '192.168.1.0/24');
+    $laptop = $old->wg->addPeer('wg0', name: 'laptop');
+    $old->wg->updatePeer('wg0', $laptop->public_key, ['enabled' => false]);
+    $new = new Rig($to, hostname: 'new.example.test');
+
+    $new->backup->restore($old->backup->create(), ['wg0' => 'restore']);
+
+    $peers = $new->wg->getLink('wg0')->peers;
+    expect(array_map(fn (PeerInfo $p) => [$p->name, $p->enabled, $p->networks], $peers))->toBe([
+        ['branch', true, '192.168.1.0/24'],
+        ['laptop', false, null],
+    ])
+        ->and($new->host->runtimePeers('wg0'))->toBe([$branch->public_key => '10.0.0.2/32, 192.168.1.0/24'])
+        ->and($new->wg->getPeerConfig('wg0', $laptop->public_key))->toContain('Endpoint = new.example.test:51820');
+})->with(['Linux' => 'linux', 'macOS' => 'mac']);
+
 it("falls back to this server's outbound interface when the old one doesn't exist here", function () {
     [$old] = backedUpServer('mac'); // NAT out of en0
     $new = new Rig('linux');

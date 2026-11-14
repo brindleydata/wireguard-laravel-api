@@ -130,6 +130,28 @@ else
     echo "  skip no iptables on this host"; SKIP=$((SKIP + 6))
 fi
 
+step "Peer names, a disabled peer, networks behind a peer, QR codes"
+cli wg:peer:update e2e0 "$PEER" --name="e2e client" > /dev/null
+check "a name is a comment wg-quick ignores" "grep -qx '# name = e2e client' /etc/wireguard/e2e0.conf && systemctl restart wg-quick@e2e0 && wg show e2e0 peers | grep -q \"$PEER\""
+cli wg:peer:update e2e0 "$PEER" --enabled=false > /dev/null
+check "a disabled peer is off the interface, commented out in the config" "! wg show e2e0 peers | grep -q \"$PEER\" && grep -qx '# \[Peer\] disabled' /etc/wireguard/e2e0.conf"
+check "... so it can't connect" "! ip netns exec e2e-client ping -c1 -W2 10.80.0.1"
+systemctl restart wg-quick@e2e0
+check "... not even after a restart" "! wg show e2e0 peers | grep -q \"$PEER\""
+cli wg:peer:update e2e0 "$PEER" --enabled=true > /dev/null
+check "enabled again, it connects with the same client config" "for i in \$(seq 25); do ip netns exec e2e-client ping -c1 -W1 10.80.0.1 && break; done"
+# The client is a branch router: a LAN behind it
+ip netns exec e2e-client sh -c 'ip link add e2e-lan type dummy; ip addr add 192.168.77.1/24 dev e2e-lan; ip link set e2e-lan up'
+cli wg:peer:update e2e0 "$PEER" --networks=192.168.77.0/24 > /dev/null
+check "wg-quick routes the network behind the peer" "ip route show 192.168.77.0/24 | grep -q 'dev e2e0'"
+# The restart forgot the client's endpoint: the server can only send once the client has (keepalive)
+check "the branch reconnects to the restarted server" "for i in \$(seq 25); do ip netns exec e2e-client ping -c1 -W1 10.80.0.1 && break; done"
+check "the server reaches that network through the peer" "ping -c1 -W3 192.168.77.1"
+cli wg:peer:update e2e0 "$PEER" --networks= > /dev/null
+check "removing it removes the route" "[ -z \"\$(ip route show 192.168.77.0/24)\" ]"
+check "the client config as a QR code in the terminal" "cli wg:peer e2e0 \"$PEER\" --qr | grep -q '▀'"
+check "... and from the API as SVG" "[ \"\$(curl -s ${CURL_OPTS[*]} -o /tmp/wgla-e2e-qr -w '%{content_type}' -H \"api-key: $API_KEY\" $URL/link/e2e0/peer/\$(safe \"$PEER\")/qr)\" = image/svg+xml ] && grep -q '<svg' /tmp/wgla-e2e-qr"
+
 step "Clashes"
 check "the same port is refused" "! \"\${ART[@]}\" wg:link:create e2e1 10.81.0.1/24 --port=51880"
 check "an overlapping subnet is refused" "! \"\${ART[@]}\" wg:link:create e2e1 10.80.0.129/25 --port=51881"
@@ -165,6 +187,11 @@ check "restore it" "\"\${ART[@]}\" wg:restore - --passphrase-file=/tmp/wgla-e2e-
 check "same keys, running again" "[ \"\$(wg show e2e0 public-key)\" = \"$KEY0\" ] && systemctl is-active -q wg-quick@e2e0"
 check "the client's existing config connects again" "for i in \$(seq 25); do ip netns exec e2e-client ping -c1 -W1 10.80.0.1 && break; done"
 check "... over IPv6 too" "ip netns exec e2e-client ping -6 -c1 -W3 fd80::1"
+
+step "The wgla shortcut (wg:install)"
+check "wgla runs link commands as the web user" "wgla links | grep -qw e2e0 && wgla link e2e0 | grep -q 'Interface: e2e0'"
+check "... and takes a backup passphrase through sudo" "WGLA_BACKUP_PASSPHRASE='correct horse battery staple' wgla backup - | grep -q '\"format\": \"wgla-backup\"'"
+check "wgla help shows a command's options" "wgla help peer:create | grep -q -- '--networks'"
 
 step "Delete everything"
 cli wg:link:delete e2e0 > /dev/null

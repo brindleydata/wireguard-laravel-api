@@ -16,7 +16,7 @@ class WgInstall extends WgCommand
     use RunsSetupSteps;
 
     protected $signature = 'wg:install
-        {--step=* : Only these steps: packages, web-user, permissions, environment, forwarding, pf, helper, sudoers, apparmor, server, health}
+        {--step=* : Only these steps: packages, web-user, permissions, environment, forwarding, pf, helper, sudoers, apparmor, shortcut, server, health}
         {--print : Print the commands as a shell script instead of checking and running anything}
         {--yes : Fix everything without asking (needs passwordless sudo)}
         {--user= : User that runs the API}

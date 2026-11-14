@@ -126,6 +126,52 @@ it('adds, shows and removes a link\'s IPv6 address', function () {
     $this->deleteJson('/link/wg0', [], $this->auth)->assertOk();
 });
 
+it('names, disables and routes networks to peers', function () {
+    $this->postJson('/link', ['name' => 'wg0', 'ip' => '10.0.0.1/24', 'port' => 51820], $this->auth)->assertCreated();
+    $peer = $this->postJson('/link/wg0/peers', ['name' => 'branch', 'networks' => '192.168.1.0/24'], $this->auth)
+        ->assertCreated()
+        ->assertJsonPath('name', 'branch')
+        ->assertJsonPath('enabled', true)
+        ->assertJsonPath('networks', '192.168.1.0/24')
+        ->assertJsonPath('allowed_ips', '10.0.0.2/32, 192.168.1.0/24')
+        ->json();
+    $safe = KeyManager::pubkeyToSafe($peer['public_key']);
+
+    $this->patchJson("/link/wg0/peer/{$safe}", ['enabled' => false, 'name' => 'branch office'], $this->auth)
+        ->assertOk()
+        ->assertJsonPath('enabled', false)
+        ->assertJsonPath('name', 'branch office');
+    $this->getJson('/link/wg0/peers', $this->auth)
+        ->assertJsonPath('0.enabled', false)
+        ->assertJsonPath('0.connected', null);
+
+    // Leaving fields out keeps them; null removes them
+    $this->patchJson("/link/wg0/peer/{$safe}", ['enabled' => true], $this->auth)
+        ->assertJsonPath('name', 'branch office')
+        ->assertJsonPath('networks', '192.168.1.0/24');
+    $this->patchJson("/link/wg0/peer/{$safe}", ['name' => null, 'networks' => null], $this->auth)
+        ->assertJsonPath('name', null)
+        ->assertJsonPath('networks', null)
+        ->assertJsonPath('allowed_ips', '10.0.0.2/32');
+
+    $this->patchJson("/link/wg0/peer/{$safe}", ['networks' => '0.0.0.0/0'], $this->auth)->assertUnprocessable();
+    $this->deleteJson('/link/wg0', [], $this->auth)->assertOk();
+});
+
+it('serves a peer config as a QR code', function () {
+    $this->postJson('/link', ['name' => 'wg0', 'ip' => '10.0.0.1/24', 'port' => 51820], $this->auth)->assertCreated();
+    $safe = KeyManager::pubkeyToSafe($this->postJson('/link/wg0/peers', [], $this->auth)->json('public_key'));
+
+    $response = $this->get("/link/wg0/peer/{$safe}/qr", $this->auth)->assertOk();
+
+    expect($response->headers->get('Content-Type'))->toStartWith('image/svg+xml')
+        ->and($response->headers->get('Cache-Control'))->toContain('no-store')
+        ->and($response->getContent())->toContain('<svg');
+    $this->get('/link/wg0/peer/'.str_repeat('A', 43).'/qr', $this->auth)->assertNotFound();
+    $this->get("/link/wg0/peer/{$safe}/qr")->assertForbidden();
+    $this->deleteJson('/link/wg0', [], $this->auth)->assertOk();
+});
+
 it('maps errors to status codes with a message', function () {
     $link = ['name' => 'wg0', 'ip' => '10.0.0.1/24', 'port' => 51820];
 

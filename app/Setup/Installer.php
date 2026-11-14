@@ -12,6 +12,7 @@ use App\Setup\Steps\Packages;
 use App\Setup\Steps\Permissions;
 use App\Setup\Steps\PfAnchors;
 use App\Setup\Steps\Server;
+use App\Setup\Steps\Shortcut;
 use App\Setup\Steps\Sudoers;
 use App\Setup\Steps\WebUser;
 
@@ -53,6 +54,7 @@ class Installer
             new Helper($this->shell),
             new Sudoers($this->shell),
             new AppArmor($this->shell),
+            new Shortcut($this->shell),
             $server,
             new Health($this->shell, $server),
         ];

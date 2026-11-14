@@ -61,3 +61,9 @@ it('generates random unique local /64 prefixes', function () {
     }
     expect(array_unique($prefixes))->toHaveCount(20);
 });
+
+it('tells the networks behind a peer from its tunnel addresses', function () {
+    expect(IpAllocator::networksOf('10.0.0.2/32, fd12::2/128, 192.168.1.0/24, 2001:db8::/48', 'fd12::1/64'))->toBe(['192.168.1.0/24', '2001:db8::/48'])
+        ->and(IpAllocator::networksOf('10.0.0.2/32, fd12::2/128', null))->toBe(['fd12::2/128'], 'Without a link prefix, a /128 is a network')
+        ->and(IpAllocator::networksOf('10.0.0.2/32', null))->toBe([]);
+});

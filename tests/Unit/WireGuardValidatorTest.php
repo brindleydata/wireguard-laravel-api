@@ -78,3 +78,30 @@ it('rejects IPv6 addresses a link cannot use', function (string $cidr, string $e
     'too small for the IPv4 subnet' => ['fd12::1/120', 'too small for 10.0.0.1/16'],
     'a line break' => ["fd12::1/64\nPostUp = id", 'Invalid IPv6 address'],
 ]);
+
+it('takes any printable peer name, trimmed', function (string $name, string $stored) {
+    expect((new WireGuardValidator)->peerName($name))->toBe($stored);
+})->with([
+    ['laptop', 'laptop'],
+    ['  Ана\'s phone (#2)  ', 'Ана\'s phone (#2)'],
+    [str_repeat('я', 64), str_repeat('я', 64)],
+]);
+
+it('rejects peer names that could break a config line', function (string $name) {
+    expect(fn () => (new WireGuardValidator)->peerName($name))->toThrow(InvalidArgumentException::class);
+})->with([
+    'empty' => '   ',
+    'a line break' => "laptop\nPostUp = id",
+    'an escape sequence' => "laptop\e[2J",
+    'too long' => str_repeat('a', 65),
+    'invalid UTF-8' => "lap\xfftop",
+]);
+
+it('takes networks behind a peer as network addresses', function () {
+    expect((new WireGuardValidator)->networks('192.168.1.7/24, 192.168.1.0/24,10.20.0.0/16, 2001:db8:1::5/48'))
+        ->toBe(['192.168.1.0/24', '10.20.0.0/16', '2001:db8:1::/48']);
+});
+
+it('rejects networks that would hijack the server', function (string $networks) {
+    expect(fn () => (new WireGuardValidator)->networks($networks))->toThrow(InvalidArgumentException::class);
+})->with(['0.0.0.0/0', '::/0', '127.0.0.0/8', '169.254.0.0/16', 'fe80::/64', '224.0.0.0/8', '192.168.1.0/33', '']);

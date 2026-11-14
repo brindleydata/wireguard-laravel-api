@@ -115,6 +115,23 @@ class IpAllocator
     }
 
     /**
+     * Networks behind a peer: its AllowedIPs besides its tunnel addresses (the IPv4 /32 and, on a
+     * dual-stack link, the /128 in the link's prefix).
+     *
+     * @return list<string>
+     */
+    public static function networksOf(?string $allowed_ips, ?string $address6): array
+    {
+        $ip = self::tunnelIp($allowed_ips);
+
+        return array_values(array_filter(
+            array_map('trim', explode(',', (string) $allowed_ips)),
+            fn (string $entry) => $entry !== '' && $entry !== "{$ip}/32"
+                && ! ($address6 !== null && str_ends_with($entry, '/128') && self::overlaps($entry, $address6)),
+        ));
+    }
+
+    /**
      * A random RFC 4193 unique local /64 (fd + 40 random bits + subnet 0), e.g. fd3c:91a2:5e07::/64.
      */
     public static function randomUlaPrefix(): string

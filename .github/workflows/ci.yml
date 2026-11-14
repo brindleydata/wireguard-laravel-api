@@ -27,7 +27,7 @@ jobs:
 
       - run: ./vendor/bin/pint --test
 
-      - run: shellcheck -s bash bin/wgla-helper tests/e2e/linux.sh
+      - run: shellcheck -s bash bin/wgla-helper tests/e2e/linux.sh && shellcheck -s sh bin/wgla
 
   # Both supported LTS releases: 24.04 has classic sudo; 26.04 has sudo-rs and AppArmor profiles
   # that confine wg and wg-quick.

@@ -11,6 +11,7 @@ arch('frontends only use the WireGuard, Server and Backup services')
         'App\Services\WireGuard',
         'App\Services\Server',
         'App\Services\Backup',
+        'App\Services\QrCode', // presentation only: no system access
         'App\DTOs',
         'App\Console\Commands', // the WgCommand base class
         'App\Setup', // wg:install / wg:update: setting up the host is their job

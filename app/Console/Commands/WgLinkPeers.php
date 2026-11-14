@@ -33,7 +33,8 @@ class WgLinkPeers extends WgCommand
         $this->line('');
 
         foreach ($link->peers as $peer) {
-            $this->line("  {$peer->allowed_ips}  {$peer->public_key}  ".$this->state($peer));
+            $name = $peer->name === null ? '' : "{$peer->name}  ";
+            $this->line("  {$name}{$peer->allowed_ips}  {$peer->public_key}  ".$this->state($peer));
         }
 
         return Command::SUCCESS;
@@ -41,6 +42,10 @@ class WgLinkPeers extends WgCommand
 
     protected function state(PeerInfo $peer): string
     {
+        if (! $peer->enabled) {
+            return 'disabled';
+        }
+
         return match ($peer->connected()) {
             null => '(link down)',
             false => $peer->latest_handshake === null ? 'never connected' : 'last seen '.$this->ago($peer->latest_handshake),

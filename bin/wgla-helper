@@ -15,7 +15,7 @@ set -euo pipefail
 umask 077
 IFS=$' \t\n'
 
-VERSION=3
+VERSION=4
 SELF=$0
 MAX_SIZE=1048576
 
@@ -127,9 +127,13 @@ validate_meta() {
     esac || die "metadata not allowed: $line"
 }
 
-# A wg-quick config may only contain what the app writes
+# A peer's label (a comment): any characters but control ones, at most 256 bytes
+valid_peer_name() { [ -n "$1" ] && [ "${#1}" -le 256 ] && [[ $1 != *[[:cntrl:]]* ]]; }
+
+# A wg-quick config may only contain what the app writes. A disabled peer is a commented-out
+# [Peer] section (wg-quick ignores it); peers may carry a "# name = …" label.
 validate_conf() {
-    local section='' line key value re='^([A-Za-z]+) = (.+)$'
+    local section='' line key value re='^([A-Za-z]+) = (.+)$' disabled='^# ([A-Za-z]+ = .+)$'
     while IFS= read -r line || [ -n "$line" ]; do
         case "$line" in
             '') continue ;;
@@ -138,17 +142,27 @@ validate_conf() {
                 section=interface
                 continue
                 ;;
-            '[Peer]')
+            '[Peer]' | '# [Peer] disabled')
                 [ -n "$section" ] || die "[Peer] before [Interface]"
-                section=peer
+                if [ "$line" = '[Peer]' ]; then section=peer; else section=disabled; fi
                 continue
                 ;;
-            '#'*)
-                [ -z "$section" ] || die "comments are only allowed before [Interface]"
-                validate_meta "$line"
-                continue
+            '# name = '*)
+                if [ "$section" = peer ] || [ "$section" = disabled ]; then
+                    valid_peer_name "${line#'# name = '}" || die "invalid peer name: $line"
+                    continue
+                fi
                 ;;
         esac
+        if [ "$section" = disabled ]; then
+            # The disabled peer's own lines, checked like a live peer's
+            [[ $line =~ $disabled ]] || die "malformed line in a disabled peer: $line"
+            line=${BASH_REMATCH[1]}
+        elif [[ $line == '#'* ]]; then
+            [ -z "$section" ] || die "comments are only allowed before [Interface]"
+            validate_meta "$line"
+            continue
+        fi
 
         [[ $line =~ $re ]] || die "malformed line: $line"
         key=${BASH_REMATCH[1]} value=${BASH_REMATCH[2]}
@@ -158,8 +172,8 @@ validate_conf() {
             interface:ListenPort) valid_port "$value" ;;
             interface:PostUp) [ "$value" = "$(hook up)" ] || die "PostUp must be exactly: $(hook up)" ;;
             interface:PostDown) [ "$value" = "$(hook down)" ] || die "PostDown must be exactly: $(hook down)" ;;
-            peer:PublicKey | peer:PresharedKey) [[ $value =~ $re_key ]] ;;
-            peer:AllowedIPs) [[ $value =~ $re_ips ]] ;;
+            peer:PublicKey | peer:PresharedKey | disabled:PublicKey | disabled:PresharedKey) [[ $value =~ $re_key ]] ;;
+            peer:AllowedIPs | disabled:AllowedIPs) [[ $value =~ $re_ips ]] ;;
             *) false ;;
         esac || die "not allowed in a link config: $line"
     done < "$1"

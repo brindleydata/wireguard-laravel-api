@@ -12,7 +12,10 @@ class WgPeerUpdate extends WgCommand
         {pubkey : Peer public key}
         {--ip= : New tunnel address within the link subnet}
         {--dns= : DNS servers for this peer\'s client config}
-        {--allowed-ips= : Routes for this peer\'s client config (AllowedIPs)}';
+        {--allowed-ips= : Routes for this peer\'s client config (AllowedIPs)}
+        {--name= : A label for the peer ("" removes it)}
+        {--enabled= : false takes the peer off the interface, true puts it back}
+        {--networks= : Networks behind the peer, routed to it ("" removes them)}';
 
     protected $description = 'Update a WireGuard peer';
 
@@ -32,6 +35,15 @@ class WgPeerUpdate extends WgCommand
         if ($this->option('allowed-ips') !== null) {
             $params['allowed_ips'] = $this->option('allowed-ips');
         }
+        if ($this->option('name') !== null) {
+            $params['name'] = $this->option('name');
+        }
+        if ($this->option('enabled') !== null) {
+            $params['enabled'] = filter_var($this->option('enabled'), FILTER_VALIDATE_BOOLEAN);
+        }
+        if ($this->option('networks') !== null) {
+            $params['networks'] = $this->option('networks');
+        }
 
         if (empty($params)) {
             $this->warn('No options provided. Nothing to update.');
@@ -47,8 +59,9 @@ class WgPeerUpdate extends WgCommand
             return Command::FAILURE;
         }
 
-        $this->info("Updated peer {$peer->public_key}");
+        $this->info("Updated peer {$peer->public_key}".($peer->name === null ? '' : " ({$peer->name})"));
         $this->line("Allowed IPs: {$peer->allowed_ips}");
+        $this->line('Enabled: '.($peer->enabled ? 'yes' : 'no'));
 
         if ($peer->client_config !== null) {
             $this->line('');

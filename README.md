@@ -1,208 +1,141 @@
-# WireGuard Laravel API (WGLA)
+# WireGuard Laravel API
 
-Stateless REST API and CLI for managing WireGuard VPN interfaces and peers. Built on Laravel 13 / PHP 8.5+. No database — all state lives in WireGuard `.conf` files and the kernel module.
+A REST API and CLI for WireGuard servers: links (interfaces), peers, client configs and QR codes, forwarding and NAT, site-to-site networks, over IPv4 and IPv6. There is no database: the state is the wg-quick configs and the live interfaces.
 
-## Requirements
+- The API runs as an unprivileged user. One small, strict root helper does the privileged work.
+- A guided installer, an updater that rolls itself back on failure, and encrypted backups that restore on another server.
+- Linux with systemd in production (CI installs and tests it on Ubuntu 24.04 and 26.04), macOS for development.
 
-- Linux with systemd (production; the installer automates Debian/Ubuntu via apt, and CI installs and tests it on Ubuntu 24.04 and 26.04) or macOS with Homebrew (development)
-- PHP 8.5+ with the `sodium`, `mbstring` and `dom` extensions, Composer and git
-- `wireguard-tools`; on Linux `nftables` (`iptables` too if Docker or ufw manage the firewall); on macOS `wireguard-go`, Homebrew's bash and `pfctl`
-- IP forwarding enabled (if using forward/NAT features)
+## Install
 
-`php artisan wg:install` checks all of these and installs what's missing.
-
-## Setup
-
-Clone the app as the **deploy user**: the account that owns the code and runs installs and updates. Put it outside home directories so the web server user can reach it, e.g. `/srv/wgla`. Then run the installer as that user, not as root:
+As the **deploy user**, the account that owns the code (not root), somewhere the web server user can reach:
 
 ```bash
 sudo install -d -o "$USER" /srv/wgla
 git clone https://github.com/brindleydata/wireguard-laravel-api.git /srv/wgla
-cd /srv/wgla
-composer install --no-dev --optimize-autoloader
+cd /srv/wgla && composer install --no-dev --optimize-autoloader
 php artisan wg:install
 ```
 
-`wg:install` goes through the setup step by step. For each step it checks the machine, shows the exact commands that would fix what's missing, and then runs them (using `sudo` where needed), lets you run them yourself, or skips the step. The steps:
+This needs PHP 8.5+ with `sodium`, `mbstring` and `dom`, Composer and git. The installer adds the rest. For each step it checks the machine, shows the commands that would fix it, then runs them (with `sudo`), lets you run them yourself, or skips the step:
 
-1. **Packages:** WireGuard tools, nftables, PHP extensions, git, Composer.
-2. **Web server user:** default `www-data`. The API runs as this user, never as root.
-3. **File ownership:** the code stays owned by the deploy user and read-only for the web user, and only `storage/` is writable by it. A compromised web process can't change the code it runs.
-4. **`.env`:** generates `APP_KEY` and `API_KEY`, and sets the hostname clients connect to. `.env` is readable only by the web user's group.
-5. **IP forwarding:** IPv4, and IPv6 where the kernel has it. If the kernel itself learns the server's IPv6 route from router advertisements (`accept_ra = 1`, e.g. Debian's ifupdown with SLAAC), IPv6 forwarding would make it ignore them, so that interface gets `accept_ra = 2`. systemd-networkd (netplan) and NetworkManager handle router advertisements themselves and aren't affected.
-6. **pf anchors** (macOS only).
-7. **The root helper** (see below).
-8. **The sudo rule:** one line, checked with `visudo` before it's installed.
-9. **AppArmor** (Ubuntu 26.04 and later, which confine `wg-quick`): one rule in `/etc/apparmor.d/local/wg-quick` that lets the `PostUp`/`PostDown` hooks run the helper. Without it, links with forwarding or NAT can't start. The profile is compiled with the rule before it's reloaded, and a rule it rejects is rolled back.
-10. **The API server:** Octane + FrankenPHP as a systemd service, which serves HTTPS itself. You choose how:
-   - a Let's Encrypt certificate for a domain;
-   - your own certificate files;
-   - plain HTTP on a local port behind your own reverse proxy.
+| Step | Sets up |
+|------|---------|
+| Packages | WireGuard tools, nftables, PHP extensions (`wireguard-go` and bash on macOS) |
+| Web user | Default `www-data`. The API never runs as root |
+| Ownership | The code is read-only for the web user, which can only write `storage/` |
+| `.env` | `APP_KEY`, `API_KEY`, the hostname clients connect to |
+| Forwarding | IPv4 and IPv6, kept across reboots[^ra] |
+| pf anchors | macOS only |
+| Root helper | Installed root-owned in `/usr/local/sbin` |
+| sudo rule | One line, checked with `visudo` |
+| AppArmor | Ubuntu 26.04+: lets the `wg-quick` hooks run the helper |
+| `wgla` | The [CLI](#cli) shortcut in `/usr/local/bin` |
+| API server | Octane + FrankenPHP as a systemd service, with Let's Encrypt, your own certificate, or plain HTTP behind a proxy, on any port |
+| Health | The web user can use the helper, and the API answers |
 
-   You also choose the port. The installer explains the downsides of anything other than 443.
-11. **Health check:** the web user can use the helper, and the API answers.
+[^ra]: Where the kernel itself learns the IPv6 route from router advertisements (`accept_ra = 1`), forwarding would make it drop them, so that interface gets `accept_ra = 2`. netplan/networkd and NetworkManager aren't affected.
 
-Run it again any time: finished steps just show ✓, so it doubles as a health check. Other ways to run it:
+Run it again any time: finished steps show ✓, so it doubles as a health check.
 
 ```bash
-php artisan wg:install --print     # the same commands as a shell script, to review or run yourself
+php artisan wg:install --print          # the commands as a script, to review or run yourself
+php artisan wg:install --step=helper    # only some steps
 php artisan wg:install --yes --user=www-data --hostname=vpn.example.com --forward=true \
-    --tls=letsencrypt --domain=api.example.com --port=443      # unattended (needs passwordless sudo)
-php artisan wg:install --step=helper --step=health             # only some steps
+    --tls=letsencrypt --domain=api.example.com --port=443    # unattended
 ```
 
-On **macOS** (development) the API runs as you, and there's no service. Start it with `php artisan octane:start --server=frankenphp --port=8000` (or `php artisan serve`).
+On macOS the API runs as you, without a service: `php artisan octane:start --server=frankenphp --port=8000`.
 
-### The root helper
-
-Everything that needs root goes through one small script, `bin/wgla-helper`, installed root-owned at `/usr/local/sbin/wgla-helper`. It's the only command the web server user may run with `sudo`:
-
-```
-www-data ALL=(root) NOPASSWD: /usr/local/sbin/wgla-helper
-```
-
-- **Strict arguments.** It accepts a fixed set of commands (`conf-write wg0`, `up wg0`, `peer-remove wg0 <key>`, …) and validates every argument.
-- **Strict configs.** It only writes wg-quick configs that contain what the app generates. The only hooks allowed are calls back into the helper's own firewall commands. So the web user can manage links, but it can't run other commands, read other files or plant `PostUp` hooks as root.
-- **Plain sudoers line.** It has no argument wildcards, so it works with classic `sudo` and with `sudo-rs`, which is the default on Ubuntu 25.10 and later.
-
-The app refuses to use an installed helper that differs from the bundled one. That can happen after an update without a reinstall. `/status` and `wg:status` report the helper's state, and `wg:install` fixes it.
-
-## Updating
+## Update
 
 ```bash
-cd /srv/wgla
-php artisan wg:update                  # to the latest release (tags vX.Y.Z)
-php artisan wg:update --to=v1.4.0      # to a specific release, also an older one
-php artisan wg:update --branch=master  # follow a branch (for testing)
+wgla update                     # the latest release (vX.Y.Z tags)
+wgla update --to=v1.4.0         # a specific release, also an older one
+wgla update --branch=master     # a branch, for testing
 ```
 
-Run it as the deploy user. It refuses to overwrite local changes to the code. Before changing anything it shows the version change, the changelog and any change to the root helper, which runs as root, so review it. It then:
+It runs as the deploy user and shows the changelog and any change to the root helper, checks out the release, reinstalls what changed and reloads the API without dropping connections. If anything fails, it goes back to the previous version.
 
-1. checks out the release and runs `composer install --no-dev`;
-2. in a fresh process with the new code, reinstalls the helper if it changed, updates the sudo rule, the AppArmor rule and the service, reloads the API without dropping connections, and runs the health check.
+After deploying another way (`git pull`, rsync), run `wgla install`. It notices that the API runs old code and reloads it.
 
-If you deploy code another way, such as a plain `git pull` or rsync, run `php artisan wg:install` afterwards. It notices that the API still runs the old code and reloads it. (The API reports the code it booted with, and the wizard compares that with what's on disk.) If you changed `API_KEY`, the running API rejects the new key, so the wizard restarts it instead.
+## CLI
 
-If any of that fails, it goes back to the previous version by itself. Updates are never unattended: an update installs code that runs as root. The release it ends up on is what `/status` reports as the version.
+`wgla <command>` runs `php artisan wg:<command>` as the user it belongs to: link and peer commands as the web user (like the API), `install` and `update` as the deploy user. `wgla` alone lists the commands, and `wgla help <command>` shows a command's options. In a checkout, `bin/wgla` also works without installing, e.g. on macOS for development. It then uses that project, the `php` on your `PATH`, the web user from `.env` (otherwise you), and the project's owner for `install` and `update`. Without an installed root helper, link and peer commands use the project's `bin/wgla-helper` through your own `sudo`, which asks for your password once.
+
+```text
+wgla status                              version, system, root helper
+wgla links                               link names
+wgla link wg0                            a link and its peers
+wgla link:create wg0 10.0.0.1/24 --address6=auto --forward=true --nat=true
+wgla link:update wg0 --port=51821 --up=false     (--address6=none: IPv4 only)
+wgla link:delete wg0
+wgla link:peers wg0                      peers: names, state, live stats
+wgla peer:create wg0 --name=laptop --qr  the new client config, also as a QR code
+wgla peer wg0 <pubkey> [--qr]            the client config again
+wgla peer:update wg0 <pubkey> --enabled=false    (--name --ip --networks --dns --allowed-ips)
+wgla peer:delete wg0 <pubkey>
+wgla backup [file|-]                     encrypted backup of every link
+wgla restore <file|->
+```
+
+## API
+
+Every route except `GET /health` needs the `api-key` header. `{pubkey}` is the peer's public key in URL-safe base64 without padding (`+/` → `-_`, no `=`).
+
+| Route | |
+|-------|---|
+| `GET /health` | `200` or `503`, nothing else. Public |
+| `GET /status` | Version, system stats, root helper state |
+| `GET /ip` | The server's public IPv4 and IPv6 |
+| `GET /links` | Link names |
+| `POST /link` | `name`, `ip` (CIDR), and optionally `address6`, `port`, `ifout`, `dns`, `keepalive`, `allowed_ips`, `forward`, `nat`, `up` |
+| `GET /link/{name}` | The link and its peers |
+| `PATCH /link/{name}` | Any of the above, with `address` instead of `ip` |
+| `DELETE /link/{name}` | |
+| `GET /link/{link}/peers` | Peers with `name`, `enabled`, `networks` and live stats: `endpoint`, `latest_handshake_at`, `connected` (a handshake within 3 minutes), `transfer_rx`, `transfer_tx`. The stats are `null` while the peer isn't on the interface |
+| `POST /link/{link}/peers` | Optionally `ip`, `name`, `networks`. Returns the keys and the client config |
+| `PATCH /link/{link}/peer/{pubkey}` | `ip`, `name`, `enabled`, `networks`, and the client config's `dns` and `allowed_ips`. `null` removes a name or networks |
+| `DELETE /link/{link}/peer/{pubkey}` | |
+| `GET /link/{link}/peer/{pubkey}/config` | The client config |
+| `GET /link/{link}/peer/{pubkey}/qr` | The client config as a QR code (`image/svg+xml`), for the WireGuard apps |
+
+Errors are `{"error": "…"}`: `403` (API key), `404`, `409` (port, subnet or name taken), `422` (invalid input), `500` (a system command failed; the message says why).
+
+### Links and peers
+
+- **Addresses.** A link has an IPv4 subnet and optionally an IPv6 prefix: `address6` is an address such as `fd12:3456:789a::1/64`, `auto` for a random private /64, or `null` to remove it. A peer gets the next free IPv4 address unless you give one, and the same host number in the prefix (`10.0.0.5` → `fd12:3456:789a::5`). Moving a peer or the link moves both.
+- **Peers** can have a `name`, a label of up to 64 characters. Names don't have to be unique, and peers are still addressed by public key. A disabled peer (`enabled: false`) is off the interface but keeps its keys, address and client config. In the link config it's a commented-out `[Peer]` section.
+- **Networks behind a peer** (`networks`, site-to-site), such as a branch office LAN, are routed to that peer. They can't overlap the link's addresses, other peers or other links, and a default route is refused. The peer's client config needs `allowed_ips` for whatever it should reach, and the link needs `forward` for traffic between networks. Changing a peer's networks restarts a running link, because wg-quick sets up the routes. Peers reconnect by themselves when they next send traffic or a keepalive.
+- **No clashes.** Links can't share a listen port, overlap subnets or prefixes, or take the name of an existing interface. Without `port`, a free random one is picked.
+- **Forwarding and NAT** are per link and cover both families. On Linux each link has an nftables table, `inet wg_<link>`, and NAT only masquerades the link's own subnet and prefix. On macOS each link has a pf anchor, `wg/<link>`. Where Docker or ufw drop forwarded traffic, the helper adds tagged accepts to iptables and ip6tables. firewalld isn't handled.
+- **Client configs** are stored, and re-rendered when the link's port, addresses or client defaults change. A peer's own `dns` and `allowed_ips` are kept. Clients of a dual-stack link also route `::/0` by default.
+- The server's private key is never returned.
 
 ## Backup and restore
 
 ```bash
-sudo -u www-data php artisan wg:backup                     # to storage/app/backups/wgla-<time>.backup (0600)
-sudo -u www-data php artisan wg:backup - > server.backup   # or to stdout
-sudo -u www-data php artisan wg:restore server.backup      # (- for stdin)
+wgla backup [file|-]
+wgla restore <file|->
 ```
 
-A backup holds every link, its keys and the stored client configs. It is encrypted with a passphrase you choose (Argon2id + libsodium), so it can only be restored with that passphrase, on this server or another one. Pass the passphrase with `--passphrase-file=` or `WGLA_BACKUP_PASSPHRASE`, or type it when asked. Backups exist only on the command line: the API never hands out private keys this way.
+A backup holds every link with its keys and client configs, encrypted with your passphrase (Argon2id + libsodium). Pass the passphrase with `--passphrase-file=` or `WGLA_BACKUP_PASSPHRASE`, or type it when asked. A restore checks everything before it changes anything. An existing link is skipped or replaced (asked, or `--existing=skip|replace`), and a clashing one can only be skipped. Links are rebuilt for the new server (its OS, outbound interface and hostname) and start again if they were running. Backups are CLI only.
 
-What a restore does:
-- **Before changing anything,** it checks every link.
-  - A link that already exists here is skipped or replaced, as you choose. Without a terminal, pass `--existing=skip|replace`; otherwise nothing is restored.
-  - A link that would clash with one that stays (same port, overlapping subnet) can only be skipped.
-- **Each link is rebuilt for this server.**
-  - Links that were running start again.
-  - If the outbound interface (e.g. `eth0`) doesn't exist here, the default route's interface is used, and the restore says so.
-  - Client configs point at this server's `WIREGUARD_HOSTNAME`, keeping per-peer overrides. If the hostname changed, peers need their new config.
+## Security
 
-## Firewall notes
-
-- **Rules per link.** `forward` and `nat` are per-link rules, for both IPv4 and IPv6. Linux uses an nftables table `inet wg_<link>`, and NAT only masquerades the link's own subnet and IPv6 prefix. macOS uses a pf anchor `wg/<link>`.
-- **Docker and ufw.** These drop forwarded traffic in the `FORWARD` chain of iptables (and ip6tables), which an nftables accept can't override. When that chain drops anything, the helper also adds two `ACCEPT` rules there, tagged `wgla:<link>`.
-- **firewalld.** It isn't handled. Add the WireGuard interface to a zone that allows forwarding.
+- Everything that needs root goes through `bin/wgla-helper`, installed root-owned. It's all the sudo rule allows: `www-data ALL=(root) NOPASSWD: /usr/local/sbin/wgla-helper`. The rule has no wildcards, so `sudo-rs` (Ubuntu 25.10+) takes it too.
+- The helper takes a fixed set of commands and validates every argument. It only writes configs the app would generate, and the only hooks it allows are its own firewall commands.
+- The app refuses to use a helper that differs from the bundled one, and `wg:install` reinstalls it.
+- `wgla` is installed root-owned, with the app's path and users written into it. It only switches to the web user or the deploy user (with `sudo`) and runs `artisan`.
+- Updates are never unattended, because they install code that runs as root.
 
 ## Configuration
 
-All settings are in `.env` — see `.env.example`. Key options:
+In `.env` (see `.env.example`):
 
-| Variable | Description |
-|----------|-------------|
-| `API_KEY` | Shared secret for API authentication (required) |
-| `WIREGUARD_HOSTNAME` | Endpoint hostname for client configs (auto-detected if empty) |
-| `WIREGUARD_DNS` | Default DNS for client configs (default: `8.8.8.8`) |
-| `WIREGUARD_KEEPALIVE` | Default PersistentKeepalive seconds (default: `25`) |
-| `WIREGUARD_ALLOWED_IPS` | Default AllowedIPs for clients (default: `0.0.0.0/0`; dual-stack links add `::/0` when it routes all IPv4 and names no IPv6) |
-| `WIREGUARD_HELPER` | Installed path of the root helper (default: `/usr/local/sbin/wgla-helper`) |
-
-## API
-
-Every route except `/health` requires the `api-key` header.
-
-| Method | Route | Auth | Description |
-|--------|-------|------|-------------|
-| GET | `/health` | No | `200 {"status":"ok"}` or `503 {"status":"unavailable"}`, for load balancers and monitoring |
-| GET | `/status` | Yes | Version, system stats, root helper state |
-| GET | `/ip` | Yes | Server public IP |
-| GET | `/links` | Yes | List all interfaces |
-| POST | `/link` | Yes | Create interface |
-| GET | `/link/{name}` | Yes | Get interface details |
-| PATCH | `/link/{name}` | Yes | Update interface |
-| DELETE | `/link/{name}` | Yes | Delete interface |
-| GET | `/link/{link}/peers` | Yes | List peers |
-| POST | `/link/{link}/peers` | Yes | Create peer |
-| PATCH | `/link/{link}/peer/{pubkey}` | Yes | Update peer |
-| DELETE | `/link/{link}/peer/{pubkey}` | Yes | Delete peer |
-| GET | `/link/{link}/peer/{pubkey}/config` | Yes | Get peer client config |
-
-`{pubkey}` is the peer's public key in URL-safe base64 without padding (`+/` → `-_`, `=` removed).
-
-Peers of a running link include live stats from WireGuard. All of these are `null` while the link is down:
-
-| Field | Meaning |
-|-------|---------|
-| `endpoint` | Where the peer last connected from (`ip:port`) |
-| `latest_handshake_at` | Time of the last handshake (ISO 8601, UTC), `null` if it never connected |
-| `connected` | Whether that handshake was within the last 3 minutes |
-| `transfer_rx`, `transfer_tx` | Bytes received from and sent to the peer since the link started |
-
-### IPv6
-
-A link always has an IPv4 subnet (`ip` when creating it, `address` when updating it). It can also get an IPv6 prefix, `address6`:
-
-- `"address6": "fd12:3456:789a::1/64"` gives the link that address. It must be a unique local (`fc00::/7`) or global unicast (`2000::/3`) address, and the prefix must hold every IPv4 host number (any `/64` does).
-- `"address6": "auto"` picks a random private /64 (RFC 4193). The link's address in it ends in its IPv4 host number, e.g. `::1` for `10.0.0.1/24`.
-- `"address6": null` in `PATCH /link/{name}` makes the link IPv4-only again. Leaving the field out keeps it.
-
-Peers don't get a separate IPv6 address. They get their IPv4 host number in the prefix: `10.0.0.5` in `10.0.0.0/24` becomes `fd12:3456:789a::5`, so a peer's `allowed_ips` is `10.0.0.5/32, fd12:3456:789a::5/128`, and its client config's `Address` has both. Moving a peer (`ip`) moves both, and changing the link's addresses moves every peer along. Peers never get the link's own IPv6 address. `forward` and `nat` cover IPv6 traffic too (NAT66 for the prefix), and clients of a dual-stack link route `::/0` through the tunnel by default.
-
-If `WIREGUARD_HOSTNAME` is an IPv6 address, client configs write it as `[address]:port`.
-
-### Peers
-
-Updating a peer (`PATCH /link/{link}/peer/{pubkey}`) accepts:
-
-| Field | Effect |
-|-------|--------|
-| `ip` | Moves the peer to another address in the link subnet: server-side AllowedIPs and the client config's `Address` (its IPv6 address moves along) |
-| `dns` | DNS in the peer's client config |
-| `allowed_ips` | AllowedIPs (routes) in the peer's client config. The server side is unchanged |
-
-When a link's `port`, `address`, `address6`, `dns`, `keepalive` or `allowed_ips` change, the stored client configs of its peers are regenerated. Per-peer `dns`/`allowed_ips` overrides are kept.
-
-Link responses include the OS `interface` the link runs as (`utunN` on macOS), and never the server's private key.
-
-A link can't reuse another link's listen port or overlap its subnet or IPv6 prefix, and can't be named after an existing network interface. Without `port`, a free random port is picked.
-
-Errors are JSON `{"error": "..."}`: `403` for a missing or wrong API key (also when `API_KEY` is unset), `404` for an unknown link or peer, `409` for a conflict (existing link, port, subnet or interface name), `422` for invalid input, and `500` when a system command fails (the message includes its error output).
-
-## CLI
-
-```bash
-php artisan wg:help              # How to set up and update
-php artisan wg:install           # Set up / check this server (as the deploy user)
-php artisan wg:update            # Update to the latest release (as the deploy user)
-php artisan wg:status            # System status
-php artisan wg:links             # List interfaces
-php artisan wg:link {name}       # Show interface details
-php artisan wg:link:create       # Create interface (--address6=fd12:3456:789a::1/64 or auto for IPv6 too)
-php artisan wg:link:update       # Update interface (--address6=none removes IPv6)
-php artisan wg:link:delete       # Delete interface
-php artisan wg:link:peers        # List peers
-php artisan wg:peer:create       # Create peer
-php artisan wg:peer:update       # Update peer (--ip, --dns, --allowed-ips)
-php artisan wg:peer:delete       # Delete peer
-php artisan wg:peer              # Show peer client config
-php artisan wg:backup [file]     # Encrypted backup of every link
-php artisan wg:restore {file}    # Restore from a backup
-```
-
-Except for `wg:help`, `wg:install` and `wg:update`, these run as the web server user (`sudo -u www-data php artisan …`), like the API. They refuse to run as anyone else once `wg:install` has set the user.
+| Variable | |
+|----------|---|
+| `API_KEY` | The API secret. Without it, every route but `/health` returns `403` |
+| `WIREGUARD_HOSTNAME` | The endpoint in client configs. Default: the machine's FQDN, otherwise its public IPv4 |
+| `WIREGUARD_DNS`, `WIREGUARD_KEEPALIVE`, `WIREGUARD_ALLOWED_IPS` | Client config defaults (`8.8.8.8`, `25`, `0.0.0.0/0`), which links and peers can override |
+| `WIREGUARD_HELPER` | Where the root helper is installed (default `/usr/local/sbin/wgla-helper`) |

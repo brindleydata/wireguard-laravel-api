@@ -486,3 +486,134 @@ it('brackets an IPv6 endpoint in client configs', function () {
 
     expect($rig->wg->addPeer('wg0')->client_config)->toContain("Endpoint = [2001:db8::10]:51820\n");
 });
+
+// ─── Peer names, disabled peers, networks behind peers ──────────────
+
+it('labels peers, also across live changes and restarts', function (string $os) {
+    $rig = new Rig($os);
+    $rig->wg->createLink('wg0', '10.0.0.1/24', 51820);
+
+    $alice = $rig->wg->addPeer('wg0', name: ' Алиса, phone ');
+    $bob = $rig->wg->addPeer('wg0');
+
+    expect($alice->name)->toBe('Алиса, phone')
+        ->and($rig->host->conf('wg0'))->toContain("[Peer]\n# name = Алиса, phone\nPublicKey = {$alice->public_key}")
+        ->and(array_map(fn (PeerInfo $p) => $p->name, $rig->wg->getLink('wg0')->peers))->toBe(['Алиса, phone', null]);
+
+    $rig->wg->updatePeer('wg0', $bob->public_key, ['name' => 'Bob']);
+    $rig->wg->updateLink('wg0', ['port' => 51821]); // restarts the link
+    $rig->wg->updatePeer('wg0', $alice->public_key, ['name' => null]);
+
+    expect(array_map(fn (PeerInfo $p) => $p->name, $rig->wg->getLink('wg0')->peers))->toBe([null, 'Bob'])
+        ->and(fn () => $rig->wg->updatePeer('wg0', $bob->public_key, ['name' => "Bob\nPostUp = id"]))->toThrow(InvalidArgumentException::class);
+})->with('os');
+
+it('disables a peer without losing it, and enables it again', function (string $os, bool $up) {
+    $rig = new Rig($os);
+    $rig->wg->createLink('wg0', '10.0.0.1/24', 51820, up: $up);
+    $peer = $rig->wg->addPeer('wg0', name: 'laptop');
+    $config = $peer->client_config;
+
+    $disabled = $rig->wg->updatePeer('wg0', $peer->public_key, ['enabled' => false]);
+
+    $shown = $rig->wg->getLink('wg0')->peers[0];
+    expect($disabled->enabled)->toBeFalse()
+        ->and($shown->enabled)->toBeFalse()
+        ->and($shown->name)->toBe('laptop')
+        ->and($shown->allowed_ips)->toBe('10.0.0.2/32')
+        ->and($shown->connected())->toBeNull()
+        ->and($rig->host->conf('wg0'))->toContain("# [Peer] disabled\n# name = laptop\n# PublicKey = {$peer->public_key}\n# PresharedKey = {$peer->preshared_key}\n# AllowedIPs = 10.0.0.2/32")
+        ->and($rig->host->confPeers('wg0'))->toBe([], 'wg-quick loads no disabled peer')
+        ->and($rig->wg->getPeerConfig('wg0', $peer->public_key))->toBe($config)
+        ->and($rig->wg->addPeer('wg0')->allowed_ips)->toBe('10.0.0.3/32', 'Its address stays taken');
+    if ($up) {
+        expect($rig->host->runtimePeers('wg0'))->not->toHaveKey($peer->public_key);
+    }
+
+    $rig->wg->updatePeer('wg0', $peer->public_key, ['enabled' => true]);
+
+    expect($rig->wg->getLink('wg0')->peers[0]->enabled)->toBeTrue()
+        ->and($rig->host->confPeers('wg0'))->toHaveKey($peer->public_key)
+        ->and($rig->host->conf('wg0'))->not->toContain('disabled');
+    if ($up) {
+        expect($rig->host->runtimePeers('wg0')[$peer->public_key])->toBe('10.0.0.2/32');
+    }
+})->with('os')->with(['running' => true, 'stopped' => false]);
+
+it('never puts a disabled peer on the running interface', function () {
+    $rig = new Rig('linux');
+    $rig->wg->createLink('wg0', '10.0.0.1/24', 51820);
+    $peer = $rig->wg->addPeer('wg0');
+    $rig->wg->updatePeer('wg0', $peer->public_key, ['enabled' => false]);
+    $calls = count($rig->shell->calls);
+
+    $rig->wg->updatePeer('wg0', $peer->public_key, ['ip' => '10.0.0.9', 'name' => 'moved']);
+    $rig->wg->addPeer('wg0'); // rewrites the config from the live interface
+    $rig->wg->removePeer('wg0', $peer->public_key);
+
+    $live = array_column(array_slice($rig->shell->calls, $calls), 'command');
+    expect($live)->not->toContain('sudo -n :helper peer-ips :iface :pubkey :ips')
+        ->and($live)->not->toContain('sudo -n :helper peer-remove :iface :pubkey')
+        ->and($rig->host->runtimePeers('wg0'))->not->toHaveKey($peer->public_key)
+        ->and($rig->host->conf('wg0'))->not->toContain($peer->public_key);
+});
+
+it('routes networks behind a peer to it (site-to-site)', function (string $os) {
+    $rig = new Rig($os);
+    $rig->wg->createLink('wg0', '10.0.0.1/24', 51820, forward: true, address6: 'fd12::1/64');
+    $iface = $rig->host->interfaceOf('wg0');
+
+    $router = $rig->wg->addPeer('wg0', name: 'branch', networks: '192.168.1.7/24, 2001:db8:1::/48');
+
+    expect($router->networks)->toBe('192.168.1.0/24, 2001:db8:1::/48')
+        ->and($router->allowed_ips)->toBe('10.0.0.2/32, fd12::2/128, 192.168.1.0/24, 2001:db8:1::/48')
+        ->and($rig->host->runtimePeers('wg0')[$router->public_key])->toBe($router->allowed_ips)
+        ->and($rig->wg->getLink('wg0')->peers[0]->networks)->toBe('192.168.1.0/24, 2001:db8:1::/48');
+    if ($os === 'mac') {
+        expect($rig->host->interfaceOf('wg0'))->not->toBe($iface, 'wg-quick restarted the link to route the networks');
+    }
+
+    // Moving the peer keeps them; changing them restarts the link; removing them too
+    $rig->wg->updatePeer('wg0', $router->public_key, ['ip' => '10.0.0.9']);
+    expect($rig->host->confPeers('wg0')[$router->public_key])->toBe('10.0.0.9/32, fd12::9/128, 192.168.1.0/24, 2001:db8:1::/48');
+
+    $starts = count($rig->shell->callsTo('sudo -n :helper up :name'));
+    $rig->wg->updatePeer('wg0', $router->public_key, ['networks' => '192.168.2.0/24']);
+    expect($rig->host->runtimePeers('wg0')[$router->public_key])->toBe('10.0.0.9/32, fd12::9/128, 192.168.2.0/24')
+        ->and($rig->shell->callsTo('sudo -n :helper up :name'))->toHaveCount($starts + 1);
+
+    $rig->wg->updatePeer('wg0', $router->public_key, ['networks' => null]);
+    expect($rig->host->confPeers('wg0')[$router->public_key])->toBe('10.0.0.9/32, fd12::9/128')
+        ->and($rig->wg->getLink('wg0')->peers[0]->networks)->toBeNull();
+})->with('os');
+
+it('refuses networks that would take another route', function (string $networks, string $exception, string $message) {
+    $rig = new Rig('linux');
+    $rig->wg->createLink('wg0', '10.0.0.1/24', 51820);
+    $rig->wg->addPeer('wg0', name: 'branch', networks: '192.168.1.0/24');
+    $rig->wg->createLink('wg1', '10.1.0.1/24', 51821);
+    $rig->wg->addPeer('wg1', networks: '172.16.0.0/16');
+
+    expect(fn () => $rig->wg->addPeer('wg0', networks: $networks))->toThrow($exception, $message);
+})->with([
+    'a default route' => ['0.0.0.0/0', InvalidArgumentException::class, 'default route'],
+    'loopback' => ['127.0.0.0/8', InvalidArgumentException::class, 'reserved'],
+    "the link's own subnet" => ['10.0.0.0/16', InvalidArgumentException::class, "the link's own addresses"],
+    "another peer's network" => ['192.168.1.128/25', ConflictException::class, 'overlaps 192.168.1.0/24 of peer branch'],
+    "another link's subnet" => ['10.1.0.0/24', ConflictException::class, 'of link wg1'],
+    "a network behind another link's peer" => ['172.16.5.0/24', ConflictException::class, 'of link wg1'],
+    'garbage' => ['192.168.9.0/24;id', InvalidArgumentException::class, 'Invalid allowed IP'],
+]);
+
+it('refuses a link subnet that a peer of another link routes', function () {
+    $rig = new Rig('linux');
+    $rig->wg->createLink('wg0', '10.0.0.1/24', 51820);
+    $rig->wg->addPeer('wg0', networks: '192.168.1.0/24');
+
+    expect(fn () => $rig->wg->createLink('wg1', '192.168.1.1/24', 51821))->toThrow(ConflictException::class, 'routed to a peer of link wg0');
+
+    // Nor can a link grow over its own peers' networks
+    $rig->wg->createLink('wg2', '172.20.0.1/24', 51822);
+    $rig->wg->addPeer('wg2', networks: '172.21.0.0/16');
+    expect(fn () => $rig->wg->updateLink('wg2', ['address' => '172.20.0.1/14']))->toThrow(InvalidArgumentException::class, '172.20.0.1/14 would overlap 172.21.0.0/16');
+});

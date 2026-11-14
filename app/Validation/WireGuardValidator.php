@@ -98,6 +98,48 @@ class WireGuardValidator
         return "{$ip}/{$prefix}";
     }
 
+    /**
+     * A peer's label: 1-64 characters, any script, no control characters. Returns it trimmed.
+     */
+    public function peerName(string $name): string
+    {
+        $name = trim($name);
+        if ($name === '' || ! mb_check_encoding($name, 'UTF-8') || mb_strlen($name) > 64 || preg_match('/\p{Cc}/u', $name)) {
+            throw new InvalidArgumentException('A peer name must be 1-64 characters, without line breaks or control characters.');
+        }
+
+        return $name;
+    }
+
+    /**
+     * Networks behind a peer (site-to-site), as a comma-separated list of CIDRs of either family.
+     * Returns them as network addresses (192.168.1.5/24 → 192.168.1.0/24, which is what wg reports),
+     * without duplicates. A default route would send all of the server's traffic to the peer.
+     *
+     * @return list<string>
+     */
+    public function networks(string $networks): array
+    {
+        $this->validateAllowedIps($networks);
+
+        $reserved = ['127.0.0.0/8', '169.254.0.0/16', '224.0.0.0/4', '::1/128', 'fe80::/10', 'ff00::/8'];
+        $result = [];
+        foreach ($this->entries($networks) as $entry) {
+            $network = IpAllocator::networkCidr($entry);
+            if (str_ends_with($network, '/0')) {
+                throw new InvalidArgumentException("{$entry} is a default route: it would send all of the server's traffic to the peer.");
+            }
+            foreach ($reserved as $range) {
+                if (IpAllocator::overlaps($network, $range)) {
+                    throw new InvalidArgumentException("{$entry} overlaps reserved addresses ({$range}).");
+                }
+            }
+            $result[] = $network;
+        }
+
+        return array_values(array_unique($result));
+    }
+
     public function validatePort(int $port): void
     {
         if ($port < 1 || $port > 65535) {

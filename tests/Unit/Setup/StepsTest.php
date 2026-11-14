@@ -10,8 +10,10 @@ use App\Setup\Steps\Helper;
 use App\Setup\Steps\Permissions;
 use App\Setup\Steps\PfAnchors;
 use App\Setup\Steps\Server;
+use App\Setup\Steps\Shortcut;
 use App\Setup\Steps\Sudoers;
 use App\Setup\Steps\WebUser;
+use Symfony\Component\Process\Process;
 use Tests\Fakes\CommandFailed;
 use Tests\Fakes\FakeShell;
 use Tests\Support\HelperSandbox;
@@ -36,6 +38,7 @@ function setupContext(string $os = 'linux', array $answers = []): Context
     mkdir("{$tmp}/app/bin", 0755, true);
     mkdir("{$tmp}/root/etc", 0755, true);
     copy(HelperSandbox::path(), "{$tmp}/app/bin/wgla-helper");
+    copy(dirname(HelperSandbox::path()).'/wgla', "{$tmp}/app/bin/wgla");
     file_put_contents("{$tmp}/app/.env.example", "APP_KEY=\nAPI_KEY=\nWIREGUARD_HOSTNAME=\n");
 
     return new Context(
@@ -280,6 +283,96 @@ it('only applies when the API runs as its own user', function () {
     expect((new Permissions(new FakeShell))->applies(setupContext()))->toBeTrue()
         ->and((new Permissions(new FakeShell))->applies(setupContext(answers: ['web_user' => 'deploy'])))->toBeFalse();
 });
+
+// ─── wgla ───────────────────────────────────────────────────────────
+
+it('installs the wgla shortcut root-owned, and again when it changes', function () {
+    $ctx = setupContext();
+    $step = new Shortcut(new FakeShell);
+
+    expect($step->check($ctx))->toBe(['/usr/local/bin/wgla is missing or out of date'])
+        ->and($step->plan($ctx)[0]->command)->toContain("sudo install -o root -g root -m 755 \"\$tmp\" '{$ctx->system('/usr/local/bin/wgla')}'");
+
+    mkdir(dirname($ctx->system(Shortcut::FILE)), 0755, true);
+    file_put_contents($ctx->system(Shortcut::FILE), $step->script($ctx));
+    expect($step->check($ctx))->toBe([]);
+
+    $ctx->answers['web_user'] = 'nginx';
+    expect($step->check($ctx))->not->toBe([], 'Another web user: a new script')
+        ->and($step->script($ctx))->toContain("WEB='nginx'\n", "APP='{$ctx->app()}'\n")->not->toMatch('/@[A-Z]+@/');
+});
+
+it('runs each wgla command as the user it belongs to', function (array $args, array $env, string $expected) {
+    $ctx = setupContext();
+    mkdir("{$this->tmp}/bin");
+    foreach (['sudo', 'php'] as $stub) {
+        // Each prints its argv; php lists commands as `artisan list wg --raw` does
+        $list = $stub === 'php' ? "[ \"\$2\" = list ] && { printf 'wg:links         List WireGuard links\\nwg:link:create   Create a WireGuard link\\n'; exit; }\n" : '';
+        file_put_contents("{$this->tmp}/bin/{$stub}", "#!/bin/sh\n{$list}printf '%s' {$stub}; for a in \"\$@\"; do printf ' [%s]' \"\$a\"; done\n");
+        chmod("{$this->tmp}/bin/{$stub}", 0755);
+    }
+    // php is the stub; the web user is whoever runs the test when the case asks for it
+    $me = trim((string) shell_exec('id -un'));
+    $ctx = new Context(os: 'linux', appPath: $ctx->appPath, deployUser: 'deploy', deployGroup: 'deploy', php: "{$this->tmp}/bin/php",
+        helperPath: $ctx->helperPath, bundledHelper: $ctx->bundledHelper, root: $ctx->root,
+        answers: ['web_user' => ($env['AS_WEB'] ?? false) ? $me : 'www-data', 'web_group' => 'www-data']);
+    file_put_contents("{$this->tmp}/wgla", (new Shortcut(new FakeShell))->script($ctx));
+    chmod("{$this->tmp}/wgla", 0755);
+
+    $process = new Process(["{$this->tmp}/wgla", ...$args], env: ['PATH' => "{$this->tmp}/bin:/usr/bin:/bin", ...array_diff_key($env, ['AS_WEB' => 1])]);
+    $process->run();
+
+    expect(trim($process->getOutput()))->toBe(strtr($expected, ['PHP' => "{$this->tmp}/bin/php", 'ARTISAN' => "{$ctx->app()}/artisan"]));
+})->with([
+    'no command: the commands, as wgla takes them' => [[], [], "Usage: wgla <command> [arguments] [options]\n\n  links         List WireGuard links\n  link:create   Create a WireGuard link\n\nwgla help <command> shows its arguments and options."],
+    'a link command' => [['links'], [], 'sudo [-H] [-u] [www-data] [--] [PHP] [ARTISAN] [wg:links]'],
+    'arguments as given' => [['wg:peer:create', 'wg0', "--name=Ана's phone"], [], "sudo [-H] [-u] [www-data] [--] [PHP] [ARTISAN] [wg:peer:create] [wg0] [--name=Ана's phone]"],
+    'install and update' => [['update', '--to=v1.2.0'], [], 'sudo [-H] [-u] [deploy] [--] [PHP] [ARTISAN] [wg:update] [--to=v1.2.0]'],
+    'help, as whoever asks' => [['help'], [], 'php [ARTISAN] [wg:help]'],
+    "a command's help" => [['help', 'peer:create'], [], 'php [ARTISAN] [help] [wg:peer:create]'],
+    'a backup passphrase' => [['backup'], ['WGLA_BACKUP_PASSPHRASE' => 'secret phrase'], 'sudo [-H] [-u] [www-data] [--preserve-env=WGLA_BACKUP_PASSPHRASE] [--] [PHP] [ARTISAN] [wg:backup]'],
+    'already the web user: no sudo' => [['links'], ['AS_WEB' => true], 'php [ARTISAN] [wg:links]'],
+]);
+
+it('runs bin/wgla as is from a checkout: this project, the shell\'s php, users from .env and the owner', function (string $dotenv, array $args, array $env, string $expected, bool $symlink) {
+    setupContext();
+    $app = "{$this->tmp}/checkout";
+    mkdir("{$app}/bin", 0755, true);
+    copy(dirname(HelperSandbox::path()).'/wgla', "{$app}/bin/wgla");
+    chmod("{$app}/bin/wgla", 0755);
+    // INSTALLED: a helper path that exists, as after wg:install (the default may or may not here)
+    file_put_contents("{$app}/.env", strtr($dotenv, ['INSTALLED' => "{$app}/bin/wgla"]));
+    mkdir("{$this->tmp}/bin");
+    file_put_contents("{$this->tmp}/bin/php", "#!/bin/sh\nprintf php; [ -z \"\$WIREGUARD_HELPER\" ] || printf ' {helper=%s}' \"\$WIREGUARD_HELPER\"\n"
+        ."[ \"\$2\" = list ] && { printf '\\nwg:links         List WireGuard links\\n'; exit; }\nfor a in \"\$@\"; do printf ' [%s]' \"\$a\"; done; echo\n");
+    // sudo -n fails when a password is needed (SUDO_NEEDS_PASSWORD)
+    file_put_contents("{$this->tmp}/bin/sudo", "#!/bin/sh\nprintf sudo; for a in \"\$@\"; do printf ' [%s]' \"\$a\"; done; echo\n"
+        ."[ \"\$1\" = -n ] && [ -n \"\$SUDO_NEEDS_PASSWORD\" ] && exit 1; exit 0\n");
+    chmod("{$this->tmp}/bin/php", 0755);
+    chmod("{$this->tmp}/bin/sudo", 0755);
+    // Run through a relative symlink elsewhere, as when it's linked into the PATH
+    $command = "{$app}/bin/wgla";
+    if ($symlink) {
+        mkdir("{$this->tmp}/links");
+        symlink('../checkout/bin/wgla', $command = "{$this->tmp}/links/wgla");
+    }
+
+    $process = new Process([$command, ...$args], env: ['PATH' => "{$this->tmp}/bin:/usr/bin:/bin", ...$env]);
+    $process->run();
+
+    expect(trim($process->getOutput()))->toBe(strtr($expected, [
+        'PHP' => "{$this->tmp}/bin/php", 'ARTISAN' => realpath($app).'/artisan', 'BESIDE' => realpath($app).'/bin/wgla-helper',
+    ]), $process->getErrorOutput());
+})->with([
+    'the web user from .env' => ["WGLA_WEB_USER=\"www-data\"\nWIREGUARD_HELPER=INSTALLED\n", ['links'], [], 'sudo [-H] [-u] [www-data] [--] [PHP] [ARTISAN] [wg:links]', false],
+    'no web user in .env: the API runs as you' => ["WIREGUARD_HELPER=INSTALLED\n", ['links'], [], 'php [ARTISAN] [wg:links]', false],
+    'update as the owner of the project (you)' => ["WGLA_WEB_USER=www-data\n", ['update'], [], 'php [ARTISAN] [wg:update]', false],
+    'through a symlink' => ["WGLA_WEB_USER=www-data\n", ['links'], [], 'sudo [-H] [-u] [www-data] [--] [PHP] [ARTISAN] [wg:links]', true],
+    'no helper installed: the one beside it, through your sudo' => ["WIREGUARD_HELPER=/nowhere/wgla-helper\n", ['links'], [], "sudo [-n] [true]\nphp {helper=BESIDE} [ARTISAN] [wg:links]", false],
+    '... asking for your password once' => ["WIREGUARD_HELPER=/nowhere/wgla-helper\n", ['links'], ['SUDO_NEEDS_PASSWORD' => '1'], "sudo [-n] [true]\nsudo [-v]\nphp {helper=BESIDE} [ARTISAN] [wg:links]", false],
+    '... but never for install, which would make it the installed one' => ["WIREGUARD_HELPER=/nowhere/wgla-helper\n", ['install'], [], 'php [ARTISAN] [wg:install]', false],
+    '... nor to list the commands' => ["WIREGUARD_HELPER=/nowhere/wgla-helper\n", [], [], "Usage: wgla <command> [arguments] [options]\n\nphp\n  links         List WireGuard links\n\nwgla help <command> shows its arguments and options.", false],
+]);
 
 // ─── AppArmor ───────────────────────────────────────────────────────
 

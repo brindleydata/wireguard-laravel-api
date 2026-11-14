@@ -83,6 +83,7 @@ it('runs link and peer commands only as the web user', function () {
 
     $this->artisan('wg:links')
         ->expectsOutputToContain('Run this as someone-else, the user the API runs as')
+        ->expectsOutputToContain('wgla links ...')
         ->expectsOutputToContain('sudo -u someone-else php artisan wg:links')
         ->assertFailed();
 });

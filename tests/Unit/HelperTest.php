@@ -38,8 +38,10 @@ function appConf(string $os, bool $forward = true, bool $nat = true, ?string $ad
     return (new ConfigBuilder([], $driver))->buildConfFile(
         '10.0.0.1/24', $keys->genkey(), 51820, $os === 'Darwin' ? 'en0' : 'eth0',
         [
-            ['public_key' => $keys->pubkey($keys->genkey()), 'preshared_key' => $keys->genpsk(), 'allowed_ips' => '10.0.0.2/32'],
-            ['public_key' => $keys->pubkey($keys->genkey()), 'allowed_ips' => '10.0.0.3/32, fd00::3/128'],
+            ['public_key' => $keys->pubkey($keys->genkey()), 'preshared_key' => $keys->genpsk(), 'allowed_ips' => '10.0.0.2/32', 'name' => "Ана's phone (#2)"],
+            ['public_key' => $keys->pubkey($keys->genkey()), 'allowed_ips' => '10.0.0.3/32, fd00::3/128, 192.168.1.0/24'],
+            // Disabled: commented out, so wg-quick doesn't load it
+            ['public_key' => $keys->pubkey($keys->genkey()), 'preshared_key' => $keys->genpsk(), 'allowed_ips' => '10.0.0.4/32', 'name' => 'old laptop', 'enabled' => false],
         ],
         '1.1.1.1, 8.8.8.8', 25, '0.0.0.0/0, ::/0', $forward, $nat, address6: $address6,
     )."\n";
@@ -87,6 +89,7 @@ it('stores exactly the link configs the app writes', function (string $os) {
         ->and($box->run(['conf-write', 'wg1'], $plain)['exit'])->toBe(0)
         ->and($box->run(['conf-write', 'wg2'], $dual)['exit'])->toBe(0)
         ->and($dual)->toContain("# address6 = fd12:3456:789a::1/64\n")->toContain("Address = 10.0.0.1/24, fd12:3456:789a::1/64\n")
+        ->and($hooked)->toContain("[Peer]\n# name = Ана's phone (#2)\nPublicKey = ")->toContain("# [Peer] disabled\n# name = old laptop\n# PublicKey = ")
         ->and(file_get_contents("{$box->confDir}/wg0.conf"))->toBe($hooked)
         ->and(sprintf('%o', fileperms("{$box->confDir}/wg0.conf") & 0777))->toBe('600')
         ->and($box->run(['conf-read', 'wg0'])['stdout'])->toBe($hooked)
@@ -121,6 +124,13 @@ it('rejects anything else in a link config and keeps the saved one', function (s
     'a malformed IPv6 address' => ['/^Address = .*$/m', 'Address = 10.0.0.1/24, fd12:::1/64', 'not allowed in a link config: Address'],
     'unknown metadata' => ['/^/', "# owner = me\n", 'metadata not allowed'],
     'a comment after [Interface]' => ['/^\[Peer\]$/m', "# note\n[Peer]", 'comments are only allowed before [Interface]'],
+    'a peer name in [Interface]' => ['/^ListenPort/m', "# name = me\nListenPort", 'comments are only allowed before [Interface]'],
+    'a peer name before [Interface]' => ['/^/', "# name = me\n", 'metadata not allowed'],
+    'a control character in a peer name' => ['/^# name = old laptop$/m', "# name = old\x1b[2Jlaptop", 'invalid peer name'],
+    'an empty peer name' => ['/^# name = old laptop$/m', '# name = ', 'invalid peer name'],
+    'a hook in a disabled peer' => ['/^# \[Peer\] disabled$/m', "# [Peer] disabled\n# PostUp = id", 'not allowed in a link config: PostUp = id'],
+    'a bad key in a disabled peer' => ['/^(# PublicKey = ).*$/m', '$1not-a-key', 'not allowed in a link config: PublicKey = not-a-key'],
+    'free text in a disabled peer' => ['/^# \[Peer\] disabled$/m', "# [Peer] disabled\n# remember to delete", 'malformed line in a disabled peer'],
     'a second [Interface]' => ['/\z/', "[Interface]\n", '[Interface] must come first, once'],
     'no [Interface]' => ['/\A[\s\S]*\z/', "[Peer]\nPublicKey = ".HELPER_TEST_KEY."\n", '[Peer] before [Interface]'],
     'more than 1 MB' => ['/\z/', str_repeat("#\n", 600000), 'larger than'],
