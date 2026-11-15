@@ -1,0 +1,88 @@
+#!/bin/sh
+#
+# wgla: the WireGuard API's `php artisan wg:*` commands, each run as the user it belongs to.
+#
+#   wgla                        the commands
+#   wgla <command> [args]       e.g. wgla link:create wg0 10.0.0.1/24, wgla peer:create wg0
+#   wgla help [command]         how to set up and update, or one command's options
+#
+# A template: `php artisan wg:install` fills in the @…@ placeholders with this server's app
+# path, PHP binary and users (shell-quoted), and installs the result root-owned as
+# /usr/local/bin/wgla. Edits to the installed copy are overwritten.
+#
+# It also runs as is, from a checkout (e.g. for development): see below.
+
+APP=@APP@
+PHP=@PHP@
+WEB=@WEB@
+DEPLOY=@DEPLOY@
+HELPER=''
+
+# Not installed (the placeholders are unfilled): the project this script is in, the shell's
+# php, the web user from its .env (else whoever runs this), and the project's owner as the
+# deploy user. The pattern isn't a placeholder, so it survives filling them in.
+case $APP in
+    @*@)
+        self=$0
+        while [ -L "$self" ]; do
+            target=$(readlink "$self")
+            case $target in
+                /*) self=$target ;;
+                *) self=$(dirname "$self")/$target ;;
+            esac
+        done
+        APP=$(cd "$(dirname "$self")/.." && pwd -P)
+        PHP=$(command -v php) || { echo 'wgla: no php on the PATH' >&2; exit 1; }
+        WEB=$(sed -n 's/^WGLA_WEB_USER=//p' "$APP/.env" 2> /dev/null | tail -n 1 | tr -d "\"'")
+        [ -n "$WEB" ] || WEB=$(id -un)
+        DEPLOY=$(stat -c %U "$APP" 2> /dev/null || stat -f %Su "$APP")  # GNU, else BSD (macOS)
+        # No root helper installed: the one beside this script (see artisan below)
+        installed=$(sed -n 's/^WIREGUARD_HELPER=//p' "$APP/.env" 2> /dev/null | tail -n 1 | tr -d "\"'")
+        [ -e "${installed:-/usr/local/sbin/wgla-helper}" ] || HELPER=$APP/bin/wgla-helper
+        ;;
+esac
+
+# artisan as $user: directly when we are that user, else through sudo
+artisan() {
+    if [ "$(id -un)" != "$user" ]; then
+        if [ -n "${WGLA_BACKUP_PASSPHRASE:-}" ]; then
+            # A passphrase for wg:backup/wg:restore from the environment survives the switch
+            sudo -H -u "$user" --preserve-env=WGLA_BACKUP_PASSPHRASE -- "$PHP" "$APP/artisan" "$@"
+        else
+            sudo -H -u "$user" -- "$PHP" "$APP/artisan" "$@"
+        fi
+    elif [ -n "$HELPER" ] && [ "$uses_helper" = 1 ]; then
+        # From a checkout without an installed helper (development): the app runs the one beside
+        # this script, as root through your own sudo. It calls sudo -n, which can't ask for a
+        # password, so sudo asks here if it needs one.
+        sudo -n true 2> /dev/null || sudo -v || exit 1
+        WIREGUARD_HELPER=$HELPER "$PHP" "$APP/artisan" "$@"
+    else
+        "$PHP" "$APP/artisan" "$@"
+    fi
+}
+
+# Listing and help run as whoever asks (root: as the deploy user)
+user=$(id -un)
+[ "$user" != root ] || user=$DEPLOY
+uses_helper=0
+
+command=${1:-}
+[ $# -eq 0 ] || shift
+command=${command#wg:}
+
+case "$command" in
+    '' | list | -h | --help)
+        echo 'Usage: wgla <command> [arguments] [options]'
+        echo
+        artisan list wg --raw | sed 's/^wg:/  /'
+        echo
+        echo 'wgla help <command> shows its arguments and options.'
+        exit
+        ;;
+    help) if [ $# -gt 0 ]; then set -- help "wg:${1#wg:}"; else set -- wg:help; fi ;;
+    install | update) set -- "wg:$command" "$@"; user=$DEPLOY ;;
+    *) set -- "wg:$command" "$@"; user=$WEB; uses_helper=1 ;;
+esac
+
+artisan "$@"

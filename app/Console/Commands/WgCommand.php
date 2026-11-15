@@ -2,132 +2,151 @@
 
 namespace App\Console\Commands;
 
+use App\Services\Server;
+use App\Services\WireGuard;
+use Closure;
 use Illuminate\Console\Command;
+use InvalidArgumentException;
+use Symfony\Component\Console\Input\InputInterface;
+use Symfony\Component\Console\Input\InputOption;
+use Symfony\Component\Console\Output\OutputInterface;
 
+/**
+ * Base class of the wg:* commands, and `wg:help` itself.
+ */
 class WgCommand extends Command
 {
-    /**
-     * The name and signature of the console command.
-     * @var string
-     */
     protected $signature = 'wg:help';
 
-    /**
-     * The console command description.
-     * @var string
-     */
-    protected $description = 'Show prerequisities';
+    protected $description = 'How to set up and update this server';
 
     /**
-     * Execute the console command.
-     * @return mixed
+     * Link and peer commands run as the web user, like the API: same sudo rule, same lock files.
+     * As anyone else they'd fail with an unhelpful "sudo: a password is required".
      */
-    public function handle()
+    protected function execute(InputInterface $input, OutputInterface $output): int
     {
-        $this->info('Prerequisities before running:');
-        $this->line('');
-        $this->line('sudo sysctl -w net.ipv4.ip_forward=1');
-        $this->line('sudo sed -i "s:#${NET_FORWARD}:${NET_FORWARD}:" /etc/sysctl.conf');
-        $this->line('');
-        $this->line('sudo mkdir -p /etc/wireguard/clients');
-        $this->line('sudo chmod -R 770 /etc/wireguard && sudo chown -R root:www-data /etc/wireguard');
-        $this->line('sudo chmod u+s `which wg` `which wg-quick` `which ip` `which systemctl`');
-        $this->line('');
-        $this->warn('Ensure your security twice!');
-        $this->warn('Do not allow another users on this VPN host and do not allow another significant daemons on it.');
-        $this->line('');
+        $web = config('wireguard.web_user');
+        $user = app(Server::class)->processUser();
+
+        if ($this->runsAsWebUser() && $web && $user !== $web) {
+            $this->error("Run this as {$web}, the user the API runs as:");
+            $this->line('  wgla '.substr($this->getName(), 3).' ...');
+            $this->line("  (or: sudo -u {$web} php artisan {$this->getName()} ...)");
+
+            return self::FAILURE;
+        }
+
+        return parent::execute($input, $output);
     }
 
-    protected function system($cmd, $errMsg, bool $fatal = false)
+    protected function runsAsWebUser(): bool
     {
-        exec($cmd, $output, $ret);
-        if ($ret) {
-            if ($fatal) {
-                $this->error($errMsg);
-                die(1);
-            }
-
-            $this->warn($errMsg);
-            return false;
-        }
-
-        if (count($output) == 1) {
-            return $output[0];
-        }
-
-        return $output;
+        return $this->getName() !== 'wg:help';
     }
 
-    protected function verifyInterface(string $link)
+    /**
+     * The link and peer commands take --json and then print what the API returns for the same
+     * thing, for scripts. Not the ones that walk an admin through something.
+     */
+    protected function configure(): void
     {
-        exec('wg show interfaces', $output, $ret);
-        if ($ret || empty($output)) {
-            return false;
-        }
+        parent::configure();
 
-        $interfaces = explode(' ', $output[0]);
-        return in_array($link, $interfaces);
+        if (! in_array($this->getName(), ['wg:help', 'wg:install', 'wg:update', 'wg:backup', 'wg:restore'], true)) {
+            $this->addOption('json', null, InputOption::VALUE_NONE, 'Print the result as JSON, as the API returns it');
+        }
     }
 
-    protected function readLink(string $link)
+    protected function json(): bool
     {
-        if (!$this->verifyInterface($link)) {
-            $this->error("Interface does not exists: {$link}");
-            die(1);
-        }
-
-        $public_key = $this->system("wg show {$link} public-key", "Can not retreive public key for {$link}.");
-        $private_key = $this->system("wg show {$link} private-key", "Can not retreive private key for {$link}.");
-        $listen_port = $this->system("wg show {$link} listen-port", "Can not retreive port number for {$link}.");
-        $vpn_address = $this->system("ip address show {$link} | grep inet | awk '{print $2}'", "Can not retreive internal IP for {$link}.");
-        if (empty($vpn_address)) {
-            $vpn_address = "(none)";
-        }
-
-        $peers = [];
-        $peers_psks = $this->system("wg show {$link} preshared-keys", "Can not retreive peers for {$link}.");
-        if (is_string($peers_psks)) {
-            $peers_psks = [ $peers_psks ];
-        }
-        foreach ($peers_psks as $peer_psk) {
-            list ($peer, $psk) = preg_split('~\s+~', $peer_psk);
-            $peers[$peer] = [
-                'psk' => $psk,
-            ];
-        }
-
-        $peers_ips = $this->system("wg show {$link} allowed-ips", "Can not retreive peers for {$link}.");
-        if (is_string($peers_ips)) {
-            $peers_ips = [ $peers_ips ];
-        }
-        foreach ($peers_ips as $peer_ip) {
-            list ($peer, $ip) = preg_split('~\s+~', $peer_ip);
-            $peers[$peer]['ip'] = $ip;
-        }
-
-        return (object) [
-            'iface' => $link,
-            'public_key' => $public_key,
-            'private_key' => $private_key,
-            'listen_port' => $listen_port,
-            'vpn_address' => $vpn_address,
-            'peers' => $peers,
-        ];
+        return $this->input->hasOption('json') && (bool) $this->option('json');
     }
 
-    protected function genPsk()
+    /**
+     * The command's result: $data as JSON with --json (what the API answers), else whatever
+     * $text prints.
+     */
+    protected function respond(array $data, Closure $text): int
     {
-        return $this->system("wg genpsk", "Can not generate PSK key.");
+        if ($this->json()) {
+            $this->line(json_encode($data, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE));
+        } else {
+            $text();
+        }
+
+        return self::SUCCESS;
     }
 
-    protected function genPrivKey()
+    /** What went wrong: for people, or as {"error": …} with --json. */
+    protected function failed(string $message): int
     {
-        return $this->system("wg genkey", "Can not generate Private Key.");
+        $this->json()
+            ? $this->line(json_encode(['error' => $message], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE))
+            : $this->error($message);
+
+        return self::FAILURE;
     }
 
-    protected function genPubKey($priv)
+    /**
+     * Whether there is someone to ask: not with --no-interaction, and not when stdin is a pipe
+     * or a file (cron, CI, `wgla restore - < file`), where a prompt could only fail.
+     */
+    protected function interactive(): bool
     {
-        $priv = escapeshellarg($priv);
-        return $this->system("echo {$priv} | wg pubkey", "Can not generate Public Key.");
+        return $this->input->isInteractive() && (stream_isatty(STDIN) || app()->runningUnitTests());
+    }
+
+    /**
+     * A true/false option; null when it wasn't given. A typo is refused, not read as false:
+     * `--up=treu` must not bring a link down.
+     */
+    protected function flag(string $name): ?bool
+    {
+        $value = $this->option($name);
+        if ($value === null) {
+            return null;
+        }
+
+        $flag = $value === '' ? null : filter_var($value, FILTER_VALIDATE_BOOLEAN, FILTER_NULL_ON_FAILURE);
+
+        return $flag ?? throw new InvalidArgumentException("--{$name} must be true or false, not \"{$value}\".");
+    }
+
+    /**
+     * A whole-number option; null when it wasn't given.
+     */
+    protected function number(string $name): ?int
+    {
+        $value = $this->option($name);
+        if ($value === null) {
+            return null;
+        }
+
+        return ctype_digit($value) ? (int) $value : throw new InvalidArgumentException("--{$name} must be a whole number, not \"{$value}\".");
+    }
+
+    public function handle(WireGuard $wg): int
+    {
+        $this->line(<<<'HELP'
+            Set up this server (run as the user that owns the code, not root):
+
+              php artisan wg:install          step by step; re-run it any time to check the setup
+              php artisan wg:install --print  the same commands as a shell script, to review or run yourself
+              php artisan wg:install --yes    unattended, with answers as options (see --help)
+
+            Update to the latest release:
+
+              php artisan wg:update           shows the changes (and any root helper diff) first
+
+            Once installed, `wgla` runs any of these commands as the right user:
+
+              wgla                            the commands
+              wgla links                      = sudo -u <web user> php artisan wg:links
+              wgla peer:create wg0 --qr
+              wgla update                     as the deploy user
+            HELP);
+
+        return Command::SUCCESS;
     }
 }

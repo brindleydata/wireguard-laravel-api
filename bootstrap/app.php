@@ -1,55 +1,61 @@
 <?php
 
-/*
-|--------------------------------------------------------------------------
-| Create The Application
-|--------------------------------------------------------------------------
-|
-| The first thing we will do is create a new Laravel application instance
-| which serves as the "glue" for all the components of Laravel, and is
-| the IoC container for the system binding all of the various parts.
-|
-*/
+use App\Exceptions\ConflictException;
+use App\Exceptions\NotFoundException;
+use App\Exceptions\SystemException;
+use App\Http\Middleware\ForceJsonResponse;
+use Illuminate\Foundation\Application;
+use Illuminate\Foundation\Configuration\Exceptions;
+use Illuminate\Foundation\Configuration\Middleware;
+use Illuminate\Support\Env;
+use Illuminate\Validation\ValidationException;
+use Symfony\Component\HttpKernel\Exception\HttpExceptionInterface;
+use Symfony\Component\HttpKernel\Exception\NotFoundHttpException;
 
-$app = new Illuminate\Foundation\Application(
-    $_ENV['APP_BASE_PATH'] ?? dirname(__DIR__)
-);
+// .env values stay out of the process environment (no putenv). FrankenPHP keeps that environment
+// across worker restarts, so `systemctl reload wgla` would otherwise keep serving the old values.
+Env::disablePutenv();
 
-/*
-|--------------------------------------------------------------------------
-| Bind Important Interfaces
-|--------------------------------------------------------------------------
-|
-| Next, we need to bind some important interfaces into the container so
-| we will be able to resolve them when needed. The kernels serve the
-| incoming requests to this application from both the web and CLI.
-|
-*/
+return Application::configure(basePath: dirname(__DIR__))
+    ->withRouting(
+        api: __DIR__.'/../routes/api.php',
+        commands: __DIR__.'/../routes/console.php',
+        apiPrefix: '',
+    )
+    ->withMiddleware(function (Middleware $middleware): void {
+        $middleware->api(prepend: [
+            ForceJsonResponse::class,
+        ]);
+    })
+    ->withExceptions(function (Exceptions $exceptions): void {
+        $exceptions->render(function (NotFoundHttpException $e) {
+            return response()->json(['error' => $e->getMessage() ?: 'Resource not found.'], 404);
+        });
 
-$app->singleton(
-    Illuminate\Contracts\Http\Kernel::class,
-    App\Http\Kernel::class
-);
+        $exceptions->render(function (NotFoundException $e) {
+            return response()->json(['error' => $e->getMessage()], 404);
+        });
 
-$app->singleton(
-    Illuminate\Contracts\Console\Kernel::class,
-    App\Console\Kernel::class
-);
+        $exceptions->render(function (InvalidArgumentException $e) {
+            return response()->json(['error' => $e->getMessage()], 422);
+        });
 
-$app->singleton(
-    Illuminate\Contracts\Debug\ExceptionHandler::class,
-    App\Exceptions\Handler::class
-);
+        $exceptions->render(function (ConflictException $e) {
+            return response()->json(['error' => $e->getMessage()], 409);
+        });
 
-/*
-|--------------------------------------------------------------------------
-| Return The Application
-|--------------------------------------------------------------------------
-|
-| This script returns the application instance. The instance is given to
-| the calling script so we can separate the building of the instances
-| from the actual running of the application and sending responses.
-|
-*/
+        // Still reported to the log (with the command line for CommandFailedException)
+        $exceptions->render(function (SystemException $e) {
+            return response()->json(['error' => $e->getMessage()], 500);
+        });
 
-return $app;
+        // The same shape for what the framework refuses itself. A request that fails its field
+        // rules also lists every message per field.
+        $exceptions->render(function (ValidationException $e) {
+            return response()->json(['error' => $e->validator->errors()->first(), 'errors' => $e->errors()], $e->status);
+        });
+
+        $exceptions->render(function (HttpExceptionInterface $e) {
+            return response()->json(['error' => $e->getMessage() ?: 'Request refused.'], $e->getStatusCode(), $e->getHeaders());
+        });
+    })->create();

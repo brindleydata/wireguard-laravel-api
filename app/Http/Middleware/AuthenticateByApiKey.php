@@ -2,15 +2,19 @@
 
 namespace App\Http\Middleware;
 
-use Illuminate\Auth\Middleware\Authenticate as Middleware;
 use Closure;
+use Illuminate\Http\Request;
+use Symfony\Component\HttpFoundation\Response;
 
-class AuthenticateByApiKey extends Middleware
+class AuthenticateByApiKey
 {
-    public function handle($request, Closure $next, ...$guards)
+    public function handle(Request $request, Closure $next): Response
     {
-        if ($request->header('api-key') !== env('API_KEY')) {
-            return abort(403, 'Access denied.');
+        $key = (string) config('wireguard.api_key');
+
+        // Fail closed: with no API_KEY configured, an empty header would otherwise match
+        if ($key === '' || ! hash_equals($key, (string) $request->header('api-key'))) {
+            abort(403, 'Access denied.');
         }
 
         return $next($request);
