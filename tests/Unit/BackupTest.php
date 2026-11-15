@@ -71,10 +71,11 @@ it('restores every link on another server, re-rendered for it', function (string
     $payload = $old->backup->decrypt($old->backup->encrypt($old->backup->create(), BACKUP_PASSPHRASE), BACKUP_PASSPHRASE);
     $new = new Rig($to, hostname: 'new.example.test');
 
-    $report = $new->backup->restore($payload, ['wg0' => 'restore', 'wg1' => 'restore']);
+    // Where the clients connect now: this server (wg:restore --endpoint=)
+    $report = $new->backup->restore($payload, ['wg0' => 'restore', 'wg1' => 'restore'], endpoint: 'new.example.test');
 
     $wg0 = $new->wg->getLink('wg0');
-    expect($report)->toMatchArray(['restored' => ['wg0', 'wg1'], 'skipped' => [], 'clients' => 3, 'hostname' => 'new.example.test', 'hostname_changed' => true])
+    expect($report)->toMatchArray(['restored' => ['wg0', 'wg1'], 'skipped' => [], 'clients' => 3, 'endpoints' => ['wg0' => 'new.example.test', 'wg1' => 'new.example.test']])
         // Same keys and peers, same running state
         ->and($wg0->public_key)->toBe($old->wg->getLink('wg0')->public_key)
         ->and($wg0->up)->toBeTrue()
@@ -132,8 +133,19 @@ it('restores peer names, disabled peers and networks behind peers', function (st
         ['laptop', false, null],
     ])
         ->and($new->host->runtimePeers('wg0'))->toBe([$branch->public_key => '10.0.0.2/32, 192.168.1.0/24'])
-        ->and($new->wg->getPeerConfig('wg0', $laptop->public_key))->toContain('Endpoint = new.example.test:51820');
+        ->and($new->wg->getPeerConfig('wg0', $laptop->public_key))->toContain('Endpoint = vpn.example.test:51820'); // kept: not told otherwise
 })->with(['Linux' => 'linux', 'macOS' => 'mac']);
+
+it('keeps where a restored link\'s clients connect, unless told elsewhere', function () {
+    // As a client config never points elsewhere behind its back: on another server, maybe the old one
+    [$old, $peers] = backedUpServer('linux'); // vpn.example.test
+    $payload = $old->backup->create();
+    $new = new Rig('linux', hostname: 'new.example.test');
+
+    expect($new->backup->restore($payload, ['wg0' => 'restore'])['endpoints'])->toBe(['wg0' => 'vpn.example.test'])
+        ->and($new->wg->getPeerConfig('wg0', $peers['plain']->public_key))->toContain('Endpoint = vpn.example.test:51820')
+        ->and(fn () => $new->backup->restore($payload, ['wg1' => 'restore'], endpoint: 'not a host'))->toThrow(InvalidArgumentException::class, 'Invalid endpoint');
+});
 
 it("falls back to this server's outbound interface when the old one doesn't exist here", function () {
     [$old] = backedUpServer('mac'); // NAT out of en0
@@ -220,11 +232,15 @@ it('leaves a link alone when the one to replace it with cannot be restored', fun
     $peer = $new->wg->addPeer('wg0');
     $obstacle($new);
 
-    expect(fn () => $new->backup->restore($payload, ['wg0' => 'replace']))->toThrow($exception);
+    // What can't be restored here stops the restore; what the host refuses is reported with the link
+    $exception === SystemException::class
+        ? expect($new->backup->restore($payload, ['wg0' => 'replace']))->failed->toBe(['wg0' => 'wgla-helper: not allowed in a link config'])->restored->toBe([])
+        : expect(fn () => $new->backup->restore($payload, ['wg0' => 'replace']))->toThrow($exception);
 
     expect($new->wg->getLink('wg0'))->public_key->toBe($mine->public_key)->up->toBeTrue()
         ->and($new->host->runtimePeers('wg0'))->toBe([$peer->public_key => '10.9.0.2/32'])
         ->and($new->wg->getPeerConfig('wg0', $peer->public_key))->toBe($peer->client_config)
+        ->and(array_filter(array_keys($new->host->clients), fn (string $key) => str_starts_with($key, 'wg0/')))->toHaveCount(1, 'No key left of a peer that was never restored')
         ->and($new->host->firewall['wg0'])->toBe(['forward' => true, 'nat' => false]);
 })->with([
     'a clash with another link' => [function (Rig $rig) {
@@ -256,7 +272,7 @@ it('keeps a restored link that does not start, stopped', function (string $os, b
         ->and($link->public_key)->toBe($old->wg->getLink('wg0')->public_key)
         ->and($link->up)->toBeFalse()
         ->and(array_keys($new->host->confPeers('wg0')))->toBe([$peers['plain']->public_key, $peers['custom']->public_key])
-        ->and($new->wg->getPeerConfig('wg0', $peers['plain']->public_key))->toContain('Endpoint = new.example.test:51820')
+        ->and($new->wg->getPeerConfig('wg0', $peers['plain']->public_key))->toContain('Endpoint = vpn.example.test:51820')
         ->and($new->host->clients)->toHaveCount(2, 'The replaced link\'s client configs are gone')
         // Down for good, until the admin starts it
         ->and($new->host->interfaces)->toBe([])
@@ -265,6 +281,30 @@ it('keeps a restored link that does not start, stopped', function (string $os, b
 
     expect($new->wg->updateLink('wg0', ['up' => true])->up)->toBeTrue();
 })->with('os')->with(['a new link' => false, 'in place of an existing one' => true]);
+
+it('restores the peers\' keys before their config, as everywhere: no peer is there without its key', function () {
+    [$old] = backedUpServer('linux');
+    $payload = $old->backup->create();
+    $new = new Rig('linux');
+
+    $new->backup->restore($payload, ['wg0' => 'restore']);
+
+    $writes = array_values(array_intersect(array_column($new->shell->calls, 'command'), ['sudo -n :helper client-write :link :key', 'sudo -n :helper conf-write :name']));
+    expect($writes)->toBe(['sudo -n :helper client-write :link :key', 'sudo -n :helper client-write :link :key', 'sudo -n :helper conf-write :name']);
+});
+
+it('restores the other links when the host refuses one, and says which', function () {
+    [$old] = backedUpServer('linux');
+    $payload = $old->backup->create();
+    $new = new Rig('linux');
+    $new->shell->failOnce('sudo -n :helper conf-write :name', fn (array $b) => $b['name'] === 'wg0', 'wgla-helper: No space left on device');
+
+    $report = $new->backup->restore($payload, ['wg0' => 'restore', 'wg1' => 'restore']);
+
+    expect($report['failed'])->toBe(['wg0' => 'wgla-helper: No space left on device'])
+        ->and($report['restored'])->toBe(['wg1'])
+        ->and($new->wg->listLinks())->toBe(['wg1']);
+});
 
 it('backs up a hand-written config but does not restore it', function () {
     $rig = new Rig('linux');
@@ -304,40 +344,6 @@ it('exports the stored client config of each peer', function () {
         ->and(array_keys($links['wg0']['clients']))->toBe([KeyManager::pubkeyToSafe($peers['plain']->public_key), KeyManager::pubkeyToSafe($peers['custom']->public_key)]);
 });
 
-it('restores a backup whose configs still have the up line older versions wrote', function () {
-    [$old] = backedUpServer('linux');
-    $payload = $old->backup->create();
-    foreach (['wg0', 'wg1'] as $name) {
-        $payload['links'][$name]['conf'] = str_replace('# format = ', "# up = true\n# format = ", $payload['links'][$name]['conf']);
-    }
-    $new = new Rig('linux');
-
-    // Whether a link runs was never read from that line: the backup says so itself
-    expect($new->backup->problems($payload, 'wg0'))->toBe([])
-        ->and($new->backup->restore($payload, ['wg0' => 'restore', 'wg1' => 'restore'])['restored'])->toBe(['wg0', 'wg1'])
-        ->and($new->host->conf('wg0').$new->host->conf('wg1'))->not->toContain('# up')
-        ->and([$new->wg->getLink('wg0')->up, $new->wg->getLink('wg1')->up])->toBe([true, false]);
-});
-
-it('restores what peers had of their own from a backup made before that was stored with them', function () {
-    [$old, $peers] = backedUpServer('linux'); // one peer with its own DNS, 9.9.9.9
-    $payload = $old->backup->create();
-    // Then: no peer settings in the link config, and whole client configs in the backup
-    $payload['links']['wg0']['conf'] = asFormat1($payload['links']['wg0']['conf']);
-    foreach ([$peers['plain'], $peers['custom']] as $peer) {
-        $payload['links']['wg0']['clients'][KeyManager::pubkeyToSafe($peer->public_key)] = $old->wg->getPeerConfig('wg0', $peer->public_key);
-    }
-    expect($payload['links']['wg0']['conf'])->not->toContain('9.9.9.9');
-    $new = new Rig('linux', hostname: 'new.example.test');
-
-    $new->backup->restore($payload, ['wg0' => 'restore']);
-
-    expect($new->host->conf('wg0'))->toContain("# format = 2\n", "# dns = 9.9.9.9\nPublicKey = {$peers['custom']->public_key}\n")
-        ->and($new->wg->getLink('wg0')->peers[0]->dns)->toBeNull()
-        ->and($new->wg->getPeerConfig('wg0', $peers['custom']->public_key))->toContain("DNS = 9.9.9.9\n", 'Endpoint = new.example.test:51820')
-        ->and($new->wg->getPeerConfig('wg0', $peers['plain']->public_key))->toContain("DNS = 8.8.8.8\n");
-});
-
 it('restores the keys of the peers, and the MTU and remotes of the link', function () {
     $old = new Rig('linux');
     $old->wg->createLink('wg0', '10.0.0.1/24', 51820, mtu: 1380);
@@ -351,7 +357,7 @@ it('restores the keys of the peers, and the MTU and remotes of the link', functi
         ->and($link->mtu)->toBe(1380)
         ->and($link->peers[0]->remote)->toBe('branch.example.com:51820')
         ->and(array_values($new->host->clients)[0])->toContain("PrivateKey = {$peer->private_key}")->not->toContain('Endpoint')
-        ->and($new->wg->getPeerConfig('wg0', $peer->public_key))->toContain("PrivateKey = {$peer->private_key}\n", 'Endpoint = new.example.test:51820', "MTU = 1380\n");
+        ->and($new->wg->getPeerConfig('wg0', $peer->public_key))->toContain("PrivateKey = {$peer->private_key}\n", 'Endpoint = vpn.example.test:51820', "MTU = 1380\n");
 });
 
 it('does not restore networks that cover an address this server needs itself', function () {

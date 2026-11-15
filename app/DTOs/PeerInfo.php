@@ -68,7 +68,7 @@ class PeerInfo
             'public_key' => $this->public_key,
             'name' => $this->name,
             'enabled' => $this->enabled,
-            'preshared_key' => $this->preshared_key,
+            // No preshared_key: it is a secret of the peer's, handed out in its client config only
             'allowed_ips' => $this->allowed_ips,
             'networks' => $this->networks,
             'remote' => $this->remote,

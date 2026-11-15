@@ -28,8 +28,17 @@ class FakeHost
     /** @var array<string, array{link: ?string, private_key: string, port: int, address: string, peers: array<string, array{psk: ?string, allowed_ips: string}>}> */
     public array $interfaces = [];
 
-    /** @var array<string, array{forward: bool, nat: bool, nat6?: string}> live firewall state per link (nat6: the masqueraded IPv6 prefix) */
+    /** @var array<string, array{forward: bool, nat: bool, nat6?: string, inbound?: true}> live firewall state per link (nat6: the masqueraded IPv6 prefix; inbound: connections into the tunnel, not only replies) */
     public array $firewall = [];
+
+    /** @var array{allow_default_route: bool, allow_own_networks: bool} the server's route policy (the helper's `policy`) */
+    public array $policy = ['allow_default_route' => false, 'allow_own_networks' => false];
+
+    /** @var list<string> names that don't resolve (every other one does) */
+    public array $unresolvable = [];
+
+    /** This machine's name (`hostname`): an FQDN, so a new link's endpoint is detected as it */
+    public string $hostname = 'vpn.example.test';
 
     /** @var list<string> */
     public array $enabledUnits = [];
@@ -123,7 +132,9 @@ class FakeHost
     {
         $helper = fn (string $command, callable $handler) => $this->shell->on("sudo -n :helper {$command}", $handler);
 
+        $this->shell->on('hostname', fn () => $this->hostname);
         $helper('version', fn () => '1');
+        $helper('policy', fn () => implode("\n", array_map(fn (string $key, bool $on) => "{$key}=".($on ? 'true' : 'false'), array_keys($this->policy), $this->policy)));
 
         // Runtime state
         $helper('interfaces', fn () => implode(' ', array_keys($this->interfaces)));
@@ -136,6 +147,12 @@ class FakeHost
                     'allowed_ips' => $peer['AllowedIPs'],
                 ];
             }
+
+            return '';
+        });
+        $helper('link-key :iface', function (array $b, ?string $input) {
+            $this->requireInterface($b['iface']);
+            $this->interfaces[$b['iface']]['private_key'] = trim((string) $input);
 
             return '';
         });
@@ -256,6 +273,10 @@ class FakeHost
         $state = ['forward' => ($meta['forward'] ?? 'false') === 'true', 'nat' => ($meta['nat'] ?? 'false') === 'true'];
         if ($state['nat'] && isset($meta['address6'])) {
             $state['nat6'] = $meta['address6'];
+        }
+        // Forwarding into the tunnel takes connections that start outside, not only replies
+        if ($state['forward'] && ($meta['inbound'] ?? 'false') === 'true') {
+            $state['inbound'] = true;
         }
 
         return $state['forward'] || $state['nat'] ? $state : null;
@@ -381,6 +402,10 @@ class FakeHost
                 return implode("\n", $lines);
             })
             ->on('ip route show default', fn () => 'default via 192.0.2.1 dev eth0 proto static')
+            // As getent answers: a line per address, exit status 2 for a name that doesn't resolve
+            ->on('getent ahosts :host', fn (array $b) => in_array($b['host'], $this->unresolvable, true)
+                ? throw new CommandFailed('Command failed with exit code 2', exitCode: 2)
+                : "192.0.2.77      STREAM {$b['host']}\n192.0.2.77      DGRAM\n192.0.2.77      RAW")
             ->on('ip -o address show', function () {
                 $lines = ['1: lo    inet 127.0.0.1/8 scope host lo', '2: eth0    inet 192.0.2.10/24 brd 192.0.2.255 scope global eth0', '2: eth0    inet6 2001:db8:f::10/64 scope global'];
                 foreach ($this->interfaces as $iface => $interface) {
@@ -411,6 +436,10 @@ class FakeHost
             })
             ->on('ifconfig -l', fn () => implode(' ', ['lo0', 'en0', ...array_keys($this->interfaces)]))
             ->on('route -n get default 2>/dev/null', fn () => "   route to: default\ndestination: default\n    gateway: 192.0.2.1\n  interface: en0")
+            // As dscacheutil answers: nothing (and exit status 0) for a name that doesn't resolve
+            ->on('dscacheutil -q host -a name :host', fn (array $b) => in_array($b['host'], $this->unresolvable, true)
+                ? ''
+                : "name: {$b['host']}\nip_address: 192.0.2.77")
             ->on('ifconfig', function () {
                 $output = "lo0: flags=8049<UP,LOOPBACK,RUNNING,MULTICAST> mtu 16384\n\tinet 127.0.0.1 netmask 0xff000000\n\tinet6 fe80::1%lo0 prefixlen 64 scopeid 0x1\n"
                     ."en0: flags=8863<UP,BROADCAST,RUNNING> mtu 1500\n\tinet 192.0.2.10 netmask 0xffffff00 broadcast 192.0.2.255\n\tinet6 2001:db8:f::10 prefixlen 64\n";

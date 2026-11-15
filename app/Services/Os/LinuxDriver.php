@@ -98,6 +98,12 @@ class LinuxDriver extends BaseDriver
         return 'eth0';
     }
 
+    public function resolves(string $host): bool
+    {
+        // As the resolver wg uses (getaddrinfo, nsswitch): exit status 2 when the name doesn't resolve
+        return $this->shell->tryRun('getent ahosts :host', ['host' => $host], timeout: 10) !== null;
+    }
+
     public function ownAddresses(): array
     {
         // "2: eth0    inet 192.0.2.10/24 brd …", "2: eth0    inet6 2001:db8::10/64 scope global …"

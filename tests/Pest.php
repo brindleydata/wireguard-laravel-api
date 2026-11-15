@@ -2,7 +2,6 @@
 
 use App\Services\KeyManager;
 use Symfony\Component\Process\Process;
-use Tests\Fakes\FakeHost;
 use Tests\TestCase;
 
 /*
@@ -53,22 +52,6 @@ function handWrittenConf(): string
         'Endpoint = branch.example.com:51820',
         'PersistentKeepalive = 15',
     ]);
-}
-
-/**
- * A link config as written before format 2: no format line, and nothing of a peer's own client
- * settings in its section. They only showed in its client config, which was stored whole then:
- * store $clients (public key => client config, as getPeerConfig() builds it) the same way.
- */
-function asFormat1(string $conf, ?FakeHost $host = null, string $link = '', array $clients = []): string
-{
-    foreach ($clients as $pubkey => $config) {
-        $host->clients[$link.'/'.KeyManager::pubkeyToSafe($pubkey)] = $config;
-    }
-
-    [$header, $sections] = explode('[Interface]', $conf, 2);
-
-    return preg_replace('/^# format = .*\n/m', '', $header).'[Interface]'.preg_replace('/^# (dns|keepalive|allowed_ips) = .*\n/m', '', $sections);
 }
 
 /*

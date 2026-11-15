@@ -16,6 +16,10 @@ use Tests\Support\HelperSandbox;
 
 const HELPER_TEST_KEY = 'xTIBA5rboUvnH4htodjb6e697QjLERt1NAB4mZqp8Dg=';
 
+/** The table firewall-up installs for appConf('Linux') (replies only), as `nft list` prints it */
+const NFT_LISTED = "table inet wg_wg0 {\n\tchain forward {\n\t\ttype filter hook forward priority filter; policy accept;\n\t\tiifname \"wg0\" accept\n\t\toifname \"wg0\" ct state established,related accept\n\t\toifname \"wg0\" drop\n\t}\n\n"
+    ."\tchain postrouting {\n\t\ttype nat hook postrouting priority srcnat; policy accept;\n\t\tip saddr 10.0.0.0/24 oifname \"eth0\" masquerade\n\t}\n}";
+
 beforeEach(function () {
     if (HelperSandbox::isRoot()) {
         $this->markTestSkipped('As root the helper ignores its test overrides and would touch the real system');
@@ -29,7 +33,7 @@ dataset('helper os', ['Linux' => 'Linux', 'macOS' => 'Darwin']);
 /**
  * A link config exactly as the app writes it (hooks naming the helper under test).
  */
-function appConf(string $os, bool $forward = true, bool $nat = true, ?string $address6 = null, ?int $mtu = 1380): string
+function appConf(string $os, bool $forward = true, bool $nat = true, ?string $address6 = null, ?int $mtu = 1380, bool $inbound = false, array $routes = [], bool $allow_default_route = false, bool $allow_own_networks = false): string
 {
     $driver = $os === 'Darwin'
         ? new MacDriver(new FakeShell, HelperSandbox::path())
@@ -45,8 +49,11 @@ function appConf(string $os, bool $forward = true, bool $nat = true, ?string $ad
             ['public_key' => $keys->pubkey($keys->genkey()), 'allowed_ips' => '10.0.0.3/32, fd00::3/128, 192.168.1.0/24', 'remote' => 'branch.example.com:51820'],
             // Disabled: commented out, so wg-quick doesn't load it
             ['public_key' => $keys->pubkey($keys->genkey()), 'preshared_key' => $keys->genpsk(), 'allowed_ips' => '10.0.0.4/32', 'name' => 'old laptop', 'enabled' => false, 'dns' => '9.9.9.9'],
+            // $routes: what one more peer routes (a disabled one: it goes on the interface as it is when enabled)
+            ...($routes === [] ? [] : [['public_key' => $keys->pubkey($keys->genkey()), 'allowed_ips' => implode(', ', ['10.0.0.5/32', ...$routes]), 'enabled' => false]]),
         ],
         '1.1.1.1, 8.8.8.8', 25, '0.0.0.0/0, ::/0', $forward, $nat, address6: $address6, mtu: $mtu,
+        inbound: $inbound, allow_default_route: $allow_default_route, allow_own_networks: $allow_own_networks,
     )."\n";
 }
 
@@ -78,6 +85,71 @@ it('reports its version', function () {
     expect((new HelperSandbox)->run(['version'])['stdout'])->toBe(helperVersion()."\n");
 });
 
+// ─── What peers may route ───────────────────────────────────────────
+
+it('reports the server\'s route policy, nothing allowed without one', function () {
+    $box = new HelperSandbox;
+    expect($box->run(['policy'])['stdout'])->toBe("allow_default_route=false\nallow_own_networks=false\n");
+
+    $box->policy(default_route: true);
+    expect($box->run(['policy'])['stdout'])->toBe("allow_default_route=true\nallow_own_networks=false\n");
+});
+
+it('takes a peer\'s route that takes over the server\'s own traffic only where the server and the link allow it', function (string $os, string $route, string $kind, bool $server, bool $link, bool $taken) {
+    $box = new HelperSandbox($os);
+    $box->policy(default_route: $server && $kind === 'default', own_networks: $server && $kind === 'own');
+
+    // On a disabled peer: it goes on the interface as it is once it's enabled
+    $run = $box->run(['conf-write', 'wg0'], appConf($os, routes: [$route],
+        allow_default_route: $link && $kind === 'default', allow_own_networks: $link && $kind === 'own'));
+
+    expect($run['exit'])->toBe($taken ? 0 : 1, $run['stderr']);
+    if (! $taken) {
+        expect($run['stderr'])->toContain("a peer may not route {$route} here")->toContain("allow_{$kind}_")
+            ->and(file_exists("{$box->confDir}/wg0.conf"))->toBeFalse();
+    }
+})->with('helper os')->with([
+    // The host has 192.0.2.10/24 and 2001:db8:f::10/64, its gateway is 192.0.2.1
+    'IPv4 default route' => ['0.0.0.0/0', 'default'],
+    'IPv6 default route' => ['::/0', 'default'],
+    'its LAN' => ['192.0.2.0/24', 'own'],
+    'half of everything, the gateway in it' => ['0.0.0.0/1', 'own'],
+    'its gateway alone' => ['192.0.2.1/32', 'own'],
+    'its IPv6 prefix' => ['2001:db8:f::/48', 'own'],
+])->with([
+    'both allow it' => [true, true, true],
+    'the server only' => [true, false, false],
+    'the link only' => [false, true, false],
+    'neither' => [false, false, false],
+]);
+
+it('takes networks beside the server\'s own as they are', function (string $os) {
+    $box = new HelperSandbox($os);
+
+    $run = $box->run(['conf-write', 'wg0'], appConf($os, routes: ['192.0.3.0/24', '2001:db8:e::/48', '0.0.0.0/2']));
+
+    expect($run['exit'])->toBe(0, $run['stderr']);
+})->with('helper os');
+
+it('checks a peer added or changed on a running link against that link\'s settings', function (string $os) {
+    $box = new HelperSandbox($os);
+    $iface = $os === 'Darwin' ? 'utun5' : 'wg0';
+    file_put_contents("{$box->runDir}/wg0.name", "utun5\n");
+    $peer = fn (string $ips) => "[Peer]\nPublicKey = ".HELPER_TEST_KEY."\nAllowedIPs = {$ips}\n";
+    $box->policy(default_route: true);
+    $box->writeConf('wg0', appConf($os));
+
+    expect($box->run(['peer-add', $iface], $peer('10.0.0.9/32, 0.0.0.0/0'))['exit'])->toBe(1, 'The link does not allow it')
+        ->and($box->run(['peer-ips', $iface, HELPER_TEST_KEY, '10.0.0.9/32, 0.0.0.0/0'])['exit'])->toBe(1)
+        ->and($box->run(['peer-add', $iface], $peer('10.0.0.9/32, 192.0.2.0/25'))['exit'])->toBe(1, 'Nor its own networks')
+        ->and($box->calls())->toBe([]);
+
+    $box->writeConf('wg0', appConf($os, allow_default_route: true));
+    expect($box->run(['peer-add', $iface], $peer('10.0.0.9/32, 0.0.0.0/0'))['exit'])->toBe(0)
+        ->and($box->run(['peer-ips', $iface, HELPER_TEST_KEY, '10.0.0.9/32, 0.0.0.0/0'])['exit'])->toBe(0)
+        ->and($box->calls())->toHaveCount(2);
+})->with('helper os');
+
 // ─── Link configs ───────────────────────────────────────────────────
 
 it('stores exactly the link configs the app writes', function (string $os) {
@@ -92,7 +164,7 @@ it('stores exactly the link configs the app writes', function (string $os) {
         ->and($box->run(['conf-write', 'wg1'], $plain)['exit'])->toBe(0)
         ->and($box->run(['conf-write', 'wg2'], $dual)['exit'])->toBe(0)
         ->and($dual)->toContain("# address6 = fd12:3456:789a::1/64\n")->toContain("Address = 10.0.0.1/24, fd12:3456:789a::1/64\n")
-        ->and($hooked)->toContain("# nat = true\n# format = 2\n", "ListenPort = 51820\nMTU = 1380\n")->not->toContain('# up')
+        ->and($hooked)->toContain("# nat = true\n# inbound = false\n# format = 2\n", "ListenPort = 51820\nMTU = 1380\n")->not->toContain('# up')
         ->toContain("AllowedIPs = 10.0.0.3/32, fd00::3/128, 192.168.1.0/24\nEndpoint = branch.example.com:51820\nPersistentKeepalive = 25\n")
         ->toContain("[Peer]\n# name = Ана's phone (#2)\n# dns = 10.0.0.1, corp.example.com\n# keepalive = 0\n# allowed_ips = 10.0.0.0/24, fd00::/64\nPublicKey = ")
         ->toContain("# [Peer] disabled\n# name = old laptop\n# dns = 9.9.9.9\n# PublicKey = ")
@@ -101,17 +173,6 @@ it('stores exactly the link configs the app writes', function (string $os) {
         ->and($box->run(['conf-read', 'wg0'])['stdout'])->toBe($hooked)
         ->and($box->run(['conf-list'])['stdout'])->toBe("wg0\nwg1\nwg2\n")
         ->and($box->calls())->toBe([]);
-})->with('helper os');
-
-it('still takes the up line the app wrote before 1.0, for a config that is put back', function (string $os) {
-    $box = new HelperSandbox($os);
-    // revert() writes a link's previous config back as it was read
-    $older = str_replace('# format = ', "# up = true\n# format = ", appConf($os));
-
-    $run = $box->run(['conf-write', 'wg0'], $older);
-
-    expect($run['exit'])->toBe(0, $run['stderr'])
-        ->and(file_get_contents("{$box->confDir}/wg0.conf"))->toBe($older)->toContain("# up = true\n");
 })->with('helper os');
 
 it('rejects anything else in a link config and keeps the saved one', function (string $pattern, string $replacement, string $error) {
@@ -219,6 +280,43 @@ it('adds a validated peer to a running interface', function (string $where) {
     'one at an IPv6 address' => "Endpoint = [2001:db8::7]:51820\nPersistentKeepalive = 25\n",
 ]);
 
+it('runs wg in the C locale, trying a name that does not resolve only a few times', function () {
+    // By default wg retries for minutes: the app's call would time out and leave wg running.
+    // The locale is the helper's own too: what its checks match can't depend on the caller's.
+    $box = new HelperSandbox;
+    file_put_contents("{$box->dir}/stubs/wg", "#!/bin/sh\necho \"retries=\$WG_ENDPOINT_RESOLUTION_RETRIES locale=\$LC_ALL\"\n");
+    chmod("{$box->dir}/stubs/wg", 0755);
+
+    $run = $box->run(['peer-add', 'wg0'], "[Peer]\nPublicKey = ".HELPER_TEST_KEY."\nAllowedIPs = 10.0.0.2/32\nEndpoint = branch.example.com:51820\n");
+
+    expect($run['exit'])->toBe(0, $run['stderr'])->and($run['stdout'])->toBe("retries=2 locale=C\n");
+});
+
+it('gives a running link a new private key, on stdin only', function () {
+    $box = new HelperSandbox;
+
+    expect($box->run(['link-key', 'wg0'], HELPER_TEST_KEY."\n")['exit'])->toBe(0)
+        ->and($box->calls())->toBe([['wg', 'set', 'wg0', 'private-key', '/dev/stdin']])
+        ->and($box->stdin())->toBe([HELPER_TEST_KEY."\n"])
+        ->and($box->run(['link-key', 'wg0'], "not a key\n")['exit'])->toBe(1)
+        ->and($box->calls())->toHaveCount(1);
+});
+
+it('takes where a link\'s clients connect, and nothing else in that line', function (string $endpoint, bool $taken) {
+    $box = new HelperSandbox;
+
+    $run = $box->run(['conf-write', 'wg0'], str_replace('# forward = ', "# endpoint = {$endpoint}\n# forward = ", appConf('Linux')));
+
+    expect($run['exit'])->toBe($taken ? 0 : 1, $run['stderr']);
+})->with([
+    'a name' => ['vpn.example.com', true],
+    'a name and port' => ['vpn.example.com:443', true],
+    'an IPv6 address' => ['[2001:db8::7]', true],
+    'with a port' => ['[2001:db8::7]:443', true],
+    'shell syntax' => ['vpn.example.com;id', false],
+    'a bare IPv6 address' => ['2001:db8::7', false],
+]);
+
 it('sets allowed IPs of both families in the form wg takes', function () {
     $box = new HelperSandbox;
 
@@ -310,34 +408,40 @@ it('resolves the utun interface wg-quick created on macOS', function () {
 
 // ─── Firewall ───────────────────────────────────────────────────────
 
-it('installs the link nftables table from its saved config', function () {
+it('installs the link nftables table from its saved config', function (bool $inbound, string $into) {
     $box = new HelperSandbox('Linux');
-    $box->writeConf('wg0', appConf('Linux'));
+    $box->writeConf('wg0', appConf('Linux', inbound: $inbound));
     $box->respond('iptables -S FORWARD', '-P FORWARD ACCEPT');
 
     $run = $box->run(['firewall-up', 'wg0', 'wg0']);
 
     expect($run['exit'])->toBe(0, $run['stderr'])
-        ->and($box->stdin())->toBe([<<<'NFT'
+        ->and($box->stdin())->toBe([<<<NFT
             table inet wg_wg0
             delete table inet wg_wg0
             table inet wg_wg0 {
-                chain forward { type filter hook forward priority 0; iifname "wg0" accept; oifname "wg0" accept; }
+                chain forward { type filter hook forward priority 0; iifname "wg0" accept; {$into} }
                 chain postrouting { type nat hook postrouting priority 100; ip saddr 10.0.0.0/24 oifname "eth0" masquerade; }
             }
 
             NFT])
         ->and(array_filter($box->calls(), fn ($call) => in_array('-I', $call, true)))->toBe([], 'Nothing in iptables drops forwarded traffic');
-});
+})->with([
+    // Into the tunnel: what answers its peers, and only with `inbound` what starts outside
+    // (the rest dropped: the chain's policy would accept it)
+    'replies only' => [false, 'oifname "wg0" ct state established,related accept; oifname "wg0" drop;'],
+    'inbound' => [true, 'oifname "wg0" accept;'],
+]);
 
-it('opens the iptables FORWARD chain when Docker or ufw drop forwarded traffic', function () {
+it('opens the iptables FORWARD chain when Docker or ufw drop forwarded traffic', function (bool $inbound, array $into) {
     $box = new HelperSandbox('Linux');
-    $box->writeConf('wg0', appConf('Linux'));
+    $box->writeConf('wg0', appConf('Linux', inbound: $inbound));
     $box->respond('iptables -S FORWARD', implode("\n", [
         // As real iptables prints them: the comment is quoted
         '-P FORWARD DROP',
         '-A FORWARD -i wg0 -m comment --comment "wgla:wg0" -j ACCEPT',
         '-A FORWARD -o wg0 -m comment --comment wgla:wg0 -j ACCEPT',
+        '-A FORWARD -o wg0 -m conntrack --ctstate RELATED,ESTABLISHED -m comment --comment "wgla:wg0" -j ACCEPT',
         '-A FORWARD -i wg01 -m comment --comment "wgla:wg01" -j ACCEPT',
         '-A FORWARD -j DOCKER-USER',
     ]));
@@ -347,10 +451,14 @@ it('opens the iptables FORWARD chain when Docker or ufw drop forwarded traffic',
     expect(array_values(array_filter($box->calls(), fn ($call) => $call[0] === 'iptables' && $call[1] !== '-S')))->toBe([
         ['iptables', '-D', 'FORWARD', '-i', 'wg0', '-m', 'comment', '--comment', 'wgla:wg0', '-j', 'ACCEPT'],
         ['iptables', '-D', 'FORWARD', '-o', 'wg0', '-m', 'comment', '--comment', 'wgla:wg0', '-j', 'ACCEPT'],
-        ['iptables', '-I', 'FORWARD', '1', '-o', 'wg0', '-m', 'comment', '--comment', 'wgla:wg0', '-j', 'ACCEPT'],
+        ['iptables', '-D', 'FORWARD', '-o', 'wg0', '-m', 'conntrack', '--ctstate', 'RELATED,ESTABLISHED', '-m', 'comment', '--comment', 'wgla:wg0', '-j', 'ACCEPT'],
+        ['iptables', '-I', 'FORWARD', '1', '-o', 'wg0', ...$into, '-m', 'comment', '--comment', 'wgla:wg0', '-j', 'ACCEPT'],
         ['iptables', '-I', 'FORWARD', '1', '-i', 'wg0', '-m', 'comment', '--comment', 'wgla:wg0', '-j', 'ACCEPT'],
     ]);
-});
+})->with([
+    'replies only' => [false, ['-m', 'conntrack', '--ctstate', 'RELATED,ESTABLISHED']],
+    'inbound' => [true, []],
+]);
 
 it('masquerades the IPv6 prefix too on a dual-stack link', function () {
     $box = new HelperSandbox('Linux');
@@ -374,7 +482,7 @@ it('opens the ip6tables FORWARD chain too when it drops forwarded traffic', func
 
     expect(array_values(array_filter($box->calls(), fn ($call) => $call[1] !== '-S' && str_contains($call[0], 'tables'))))->toBe([
         ['ip6tables', '-D', 'FORWARD', '-i', 'wg0', '-m', 'comment', '--comment', 'wgla:wg0', '-j', 'ACCEPT'],
-        ['ip6tables', '-I', 'FORWARD', '1', '-o', 'wg0', '-m', 'comment', '--comment', 'wgla:wg0', '-j', 'ACCEPT'],
+        ['ip6tables', '-I', 'FORWARD', '1', '-o', 'wg0', '-m', 'conntrack', '--ctstate', 'RELATED,ESTABLISHED', '-m', 'comment', '--comment', 'wgla:wg0', '-j', 'ACCEPT'],
         ['ip6tables', '-I', 'FORWARD', '1', '-i', 'wg0', '-m', 'comment', '--comment', 'wgla:wg0', '-j', 'ACCEPT'],
     ]);
 });
@@ -391,9 +499,9 @@ it('leaves iptables and ip6tables alone when they are not installed', function (
         ->and(array_column($box->calls(), 0))->toBe(['nft']);
 });
 
-it('loads nat before pass rules into the link pf anchor', function () {
+it('loads nat before pass rules into the link pf anchor', function (bool $inbound, string $pass) {
     $box = new HelperSandbox('Darwin');
-    $box->writeConf('wg0', appConf('Darwin'));
+    $box->writeConf('wg0', appConf('Darwin', inbound: $inbound));
     file_put_contents("{$box->runDir}/wg0.name", "utun5\n"); // wg-quick records it before PostUp
 
     $run = $box->run(['firewall-up', 'wg0', 'utun5']);
@@ -401,9 +509,14 @@ it('loads nat before pass rules into the link pf anchor', function () {
     expect($run['exit'])->toBe(0, $run['stderr'])
         ->and($box->calls())->toBe([['pfctl', '-a', 'wg/wg0', '-f', '-'], ['pfctl', '-e']])
         ->and($box->stdin()[0])
-        ->toBe("nat on en0 from 10.0.0.0/24 to any -> (en0)\npass in on utun5 all\npass out on utun5 all\n")
+        ->toBe("nat on en0 from 10.0.0.0/24 to any -> (en0)\n{$pass}")
         ->toBeAcceptedByPf();
-});
+})->with([
+    // pf keeps state: what peers start (in on the utun) is answered. What comes in elsewhere for the
+    // link's addresses is tagged without state, and dropped on its way out to the utun
+    'replies only' => [false, "pass in on utun5 all\npass in on ! utun5 inet from any to 10.0.0.0/24 no state tag wgla_in_wg0\nblock drop out on utun5 all tagged wgla_in_wg0\n"],
+    'inbound' => [true, "pass in on utun5 all\npass out on utun5 all\n"],
+]);
 
 it('adds an IPv6 nat rule to the pf anchor of a dual-stack link', function () {
     $box = new HelperSandbox('Darwin');
@@ -415,7 +528,8 @@ it('adds an IPv6 nat rule to the pf anchor of a dual-stack link', function () {
     expect($run['exit'])->toBe(0, $run['stderr'])
         ->and($box->stdin()[0])
         ->toBe("nat on en0 from 10.0.0.0/24 to any -> (en0)\nnat on en0 inet6 from fd12:3456:789a::1/64 to any -> (en0)\n"
-            ."pass in on utun5 all\npass out on utun5 all\n")
+            ."pass in on utun5 all\npass in on ! utun5 inet from any to 10.0.0.0/24 no state tag wgla_in_wg0\n"
+            ."pass in on ! utun5 inet6 from any to fd12:3456:789a::1/64 no state tag wgla_in_wg0\nblock drop out on utun5 all tagged wgla_in_wg0\n")
         ->toBeAcceptedByPf();
 });
 
@@ -497,10 +611,10 @@ it('says whether a link still has the rules its config asks for', function (stri
     $box->respond('iptables -S FORWARD', '-P FORWARD ACCEPT');
     if ($os === 'Darwin') {
         $box->respond('pfctl -a wg/wg0 -s nat', $present ? 'nat on en0 inet from 10.0.0.0/24 to any -> (en0) round-robin' : '');
-        $box->respond('pfctl -a wg/wg0 -s rules', $present ? "pass in on utun5 all flags S/SA keep state\npass out on utun5 all flags S/SA keep state" : '');
+        // As pfctl prints them
+        $box->respond('pfctl -a wg/wg0 -s rules', $present ? "pass in on utun5 all flags S/SA keep state\npass in on ! utun5 inet from any to 10.0.0.0/24 no state tag wgla_in_wg0\nblock drop out on utun5 all tagged wgla_in_wg0" : '');
     } elseif ($present) {
-        $box->respond('nft list table inet wg_wg0', "table inet wg_wg0 {\n\tchain forward {\n\t\ttype filter hook forward priority filter; policy accept;\n\t\tiifname \"wg0\" accept\n\t\toifname \"wg0\" accept\n\t}\n\n"
-            ."\tchain postrouting {\n\t\ttype nat hook postrouting priority srcnat; policy accept;\n\t\tip saddr 10.0.0.0/24 oifname \"eth0\" masquerade\n\t}\n}");
+        $box->respond('nft list table inet wg_wg0', NFT_LISTED);
     } else {
         // As after `nft -f` of a ruleset that starts with "flush ruleset"
         $box->respond('nft list table inet wg_wg0', '', 1);
@@ -515,15 +629,61 @@ it('says whether a link still has the rules its config asks for', function (stri
 it('misses its accepts in an iptables chain that drops forwarded traffic', function (string $listing, string $answer) {
     $box = new HelperSandbox('Linux');
     $box->writeConf('wg0', appConf('Linux', nat: false));
-    $box->respond('nft list table inet wg_wg0', "table inet wg_wg0 {\n\tchain forward {\n\t\tiifname \"wg0\" accept\n\t\toifname \"wg0\" accept\n\t}\n}");
+    $box->respond('nft list table inet wg_wg0', "table inet wg_wg0 {\n\tchain forward {\n\t\tiifname \"wg0\" accept\n\t\toifname \"wg0\" ct state established,related accept\n\t\toifname \"wg0\" drop\n\t}\n}");
     $box->respond('iptables -S FORWARD', $listing);
 
     expect($box->run(['firewall-check', 'wg0', 'wg0'])['stdout'])->toBe("{$answer}\n");
 })->with([
-    'both there' => ["-P FORWARD DROP\n-A FORWARD -i wg0 -m comment --comment \"wgla:wg0\" -j ACCEPT\n-A FORWARD -o wg0 -m comment --comment \"wgla:wg0\" -j ACCEPT\n-A FORWARD -j DOCKER-USER", 'ok'],
+    'both there' => ["-P FORWARD DROP\n-A FORWARD -i wg0 -m comment --comment \"wgla:wg0\" -j ACCEPT\n-A FORWARD -o wg0 -m conntrack --ctstate RELATED,ESTABLISHED -m comment --comment \"wgla:wg0\" -j ACCEPT\n-A FORWARD -j DOCKER-USER", 'ok'],
     'gone after a Docker or ufw restart' => ["-P FORWARD DROP\n-A FORWARD -j DOCKER-USER", 'missing'],
     'nothing drops' => ['-P FORWARD ACCEPT', 'ok'],
+    // From before the link was replies-only: it takes connections in that it shouldn't
+    'one that takes connections in' => ["-P FORWARD DROP\n-A FORWARD -i wg0 -m comment --comment \"wgla:wg0\" -j ACCEPT\n-A FORWARD -o wg0 -m comment --comment \"wgla:wg0\" -j ACCEPT", 'missing'],
+    // wgla:wg0 is a prefix of these: they are another link's
+    'only those of wg01' => ["-P FORWARD DROP\n-A FORWARD -i wg01 -m comment --comment \"wgla:wg01\" -j ACCEPT\n-A FORWARD -o wg01 -m conntrack --ctstate RELATED,ESTABLISHED -m comment --comment \"wgla:wg01\" -j ACCEPT", 'missing'],
+    'only those of wg0-site' => ["-P FORWARD DROP\n-A FORWARD -i wg0-site -m comment --comment wgla:wg0-site -j ACCEPT\n-A FORWARD -o wg0-site -m conntrack --ctstate RELATED,ESTABLISHED -m comment --comment wgla:wg0-site -j ACCEPT", 'missing'],
 ]);
+
+it('misses rules that are there, but not the ones the config asks for now', function (string $config, string $listed) {
+    // The old check only looked for the word "masquerade" and one accept
+    $box = new HelperSandbox('Linux');
+    $box->writeConf('wg0', $config);
+    $box->respond('iptables -S FORWARD', '-P FORWARD ACCEPT');
+    $box->respond('nft list table inet wg_wg0', $listed);
+
+    expect($box->run(['firewall-check', 'wg0', 'wg0'])['stdout'])->toBe("missing\n");
+})->with([
+    'NAT out of the interface it went out of before' => [appConf('Linux'), str_replace('oifname "eth0"', 'oifname "eth1"', NFT_LISTED)],
+    'NAT of another subnet' => [appConf('Linux'), str_replace('10.0.0.0/24', '10.9.0.0/24', NFT_LISTED)],
+    'no NAT for the IPv6 prefix' => [appConf('Linux', address6: 'fd12:3456:789a::1/64'), NFT_LISTED],
+    'connections in, where only replies are asked for' => [appConf('Linux'), str_replace([' ct state established,related', "\t\toifname \"wg0\" drop\n"], '', NFT_LISTED)],
+    'only replies, where connections in are asked for' => [appConf('Linux', inbound: true), NFT_LISTED],
+]);
+
+it('finds macOS\'s replies-only rules as pfctl prints them, and misses them when they are not', function (string $rules, string $answer) {
+    $box = new HelperSandbox('Darwin');
+    $box->writeConf('wg0', appConf('Darwin', address6: 'fd12:3456:789a::1/64'));
+    file_put_contents("{$box->runDir}/wg0.name", "utun5\n");
+    $box->respond('pfctl -a wg/wg0 -s nat', "nat on en0 inet from 10.0.0.0/24 to any -> (en0) round-robin\nnat on en0 inet6 from fd12:3456:789a::/64 to any -> (en0) round-robin");
+    $box->respond('pfctl -a wg/wg0 -s rules', $rules);
+
+    expect($box->run(['firewall-check', 'wg0', 'utun5'])['stdout'])->toBe("{$answer}\n");
+})->with([
+    // The prefix with its host bits masked, as pfctl prints it
+    'all there' => ["pass in on utun5 all flags S/SA keep state\npass in on ! utun5 inet from any to 10.0.0.0/24 no state tag wgla_in_wg0\npass in on ! utun5 inet6 from any to fd12:3456:789a::/64 no state tag wgla_in_wg0\nblock drop out on utun5 all tagged wgla_in_wg0", 'ok'],
+    'nothing dropped' => ["pass in on utun5 all flags S/SA keep state\npass in on ! utun5 inet from any to 10.0.0.0/24 no state tag wgla_in_wg0\npass in on ! utun5 inet6 from any to fd12:3456:789a::/64 no state tag wgla_in_wg0", 'missing'],
+    'connections in' => ["pass in on utun5 all flags S/SA keep state\npass out on utun5 all flags S/SA keep state", 'missing'],
+]);
+
+it('finds NAT for the IPv6 prefix as nft prints it', function () {
+    $box = new HelperSandbox('Linux');
+    $box->writeConf('wg0', appConf('Linux', address6: 'fd12:3456:789a::1/64'));
+    $box->respond('iptables -S FORWARD', '-P FORWARD ACCEPT');
+    // The host bits masked
+    $box->respond('nft list table inet wg_wg0', str_replace("masquerade\n", "masquerade\n\t\tip6 saddr fd12:3456:789a::/64 oifname \"eth0\" masquerade\n", NFT_LISTED));
+
+    expect($box->run(['firewall-check', 'wg0', 'wg0'])['stdout'])->toBe("ok\n");
+});
 
 it('has nothing to miss for a link without forward or NAT', function (string $os) {
     $box = new HelperSandbox($os);
@@ -543,7 +703,7 @@ it('puts the rules back for every running link that lost them, and only for thos
     $box->respond('wg show interfaces', 'wg0 wg1 wg3 unmanaged9');
     $box->respond('iptables -S FORWARD', '-P FORWARD ACCEPT');
     $box->respond('nft list table inet wg_wg0', '', 1);
-    $box->respond('nft list table inet wg_wg1', "table inet wg_wg1 {\n\tiifname \"wg1\" accept\n\tmasquerade\n}");
+    $box->respond('nft list table inet wg_wg1', str_replace('"wg0"', '"wg1"', NFT_LISTED));
 
     $run = $box->run(['firewall-repair']);
 
@@ -552,6 +712,20 @@ it('puts the rules back for every running link that lost them, and only for thos
         ->and($run['stdout'])->toBe("<4>wgla-helper: link wg0 had lost its firewall rules; they are back\n")
         ->and(array_values(array_filter($box->calls(), fn (array $call) => $call === ['nft', '-f', '-'])))->toHaveCount(1)
         ->and($box->stdin()[0])->toContain('table inet wg_wg0 {', 'iifname "wg0" accept');
+});
+
+it('says so when putting the rules back fails, instead of that they are back', function () {
+    $box = new HelperSandbox('Linux');
+    $box->writeConf('wg0', appConf('Linux'));
+    $box->respond('wg show interfaces', 'wg0');
+    $box->respond('iptables -S FORWARD', '-P FORWARD ACCEPT');
+    $box->failing('nft'); // listing (gone) and loading (refused) alike
+
+    $run = $box->run(['firewall-repair']);
+
+    expect($run['exit'])->toBe(0, $run['stderr'])
+        ->and($run['stdout'])->toBe("<3>wgla-helper: link wg0 is missing its firewall rules, and they could not be put back\n")
+        ->and($box->calls())->not->toContain(['iptables', '-S', 'FORWARD'], 'Nothing after the failed nft');
 });
 
 it('repairs the link behind each utun on macOS', function () {

@@ -95,6 +95,9 @@ it('rejects peer names that could break a config line', function (string $name) 
     'an escape sequence' => "laptop\e[2J",
     'too long' => str_repeat('a', 65),
     'invalid UTF-8' => "lap\xfftop",
+    // A line end for some readers; the root helper's [[:cntrl:]] under a UTF-8 locale too
+    'a line separator' => "laptop\u{2028}phone",
+    'a paragraph separator' => "laptop\u{2029}phone",
 ]);
 
 it('takes networks behind a peer as network addresses', function () {
@@ -104,7 +107,11 @@ it('takes networks behind a peer as network addresses', function () {
 
 it('rejects networks that would hijack the server', function (string $networks) {
     expect(fn () => (new WireGuardValidator)->networks($networks))->toThrow(InvalidArgumentException::class);
-})->with(['0.0.0.0/0', '::/0', '127.0.0.0/8', '169.254.0.0/16', 'fe80::/64', '224.0.0.0/8', '192.168.1.0/33', '']);
+})->with(['127.0.0.0/8', '169.254.0.0/16', 'fe80::/64', '224.0.0.0/8', '192.168.1.0/33', '']);
+
+it('passes default routes on, as the link and the server decide on those', function () {
+    expect((new WireGuardValidator)->networks('0.0.0.0/0, ::/0, 10.1.2.3/0'))->toBe(['0.0.0.0/0', '::/0']);
+});
 
 it('hands lists on the way they are written into configs', function () {
     $validator = new WireGuardValidator;
@@ -141,11 +148,30 @@ it('takes where to connect to a peer as host:port', function (string $given, str
     ['203.0.113.7:51820', '203.0.113.7:51820'],
     [' branch.example.com:51820 ', 'branch.example.com:51820'],
     ['[2001:DB8:0::7]:1', '[2001:db8::7]:1'],
+    // Written with dots by inet_ntop(), which no endpoint takes: its IPv4 address
+    'an IPv4-mapped IPv6 address' => ['[::ffff:cb00:7107]:51820', '203.0.113.7:51820'],
 ]);
 
 it('rejects a remote that is no host and port', function (string $remote) {
     expect(fn () => (new WireGuardValidator)->remote($remote))->toThrow(InvalidArgumentException::class, 'Invalid remote');
-})->with(['branch.example.com', '203.0.113.7:0', '203.0.113.7:70000', '2001:db8::7:51820', '[203.0.113.7]:51820', 'branch.example.com:51820;id', "a.example.com:1\nPostUp = id", '-bad.example:1']);
+})->with(['branch.example.com', '203.0.113.7:0', '203.0.113.7:70000', '2001:db8::7:51820', '[203.0.113.7]:51820', 'branch.example.com:51820;id', "a.example.com:1\nPostUp = id", '-bad.example:1', '[::cb00:7107]:51820']);
+
+it('takes where a link\'s clients connect as a host, or host:port', function (string $given, string $written) {
+    expect((new WireGuardValidator)->endpoint($given))->toBe($written);
+})->with([
+    ['vpn.example.com', 'vpn.example.com'],
+    [' vpn.example.com:443 ', 'vpn.example.com:443'],
+    ['203.0.113.7', '203.0.113.7'],
+    ['203.0.113.7:51999', '203.0.113.7:51999'],
+    'IPv6, bare' => ['2001:DB8::7', '[2001:db8::7]'],
+    'IPv6, in brackets' => ['[2001:db8::7]', '[2001:db8::7]'],
+    'IPv6 with a port' => ['[2001:db8::7]:51999', '[2001:db8::7]:51999'],
+    'IPv4-mapped' => ['::ffff:203.0.113.7', '203.0.113.7'],
+]);
+
+it('rejects an endpoint that is no host', function (string $endpoint) {
+    expect(fn () => (new WireGuardValidator)->endpoint($endpoint))->toThrow(InvalidArgumentException::class, 'Invalid');
+})->with(['', 'vpn.example.com:', 'vpn.example.com:0', "vpn.example.com\nPostUp = id", '[vpn.example.com]', '2001:db8::7:51999:1', '-bad.example', 'http://vpn.example.com']);
 
 it('bounds a link\'s MTU', function () {
     $validator = new WireGuardValidator;

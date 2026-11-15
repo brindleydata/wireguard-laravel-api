@@ -40,13 +40,13 @@ class WgPeerUpdate extends WgCommand
                 $params['keepalive'] = $this->option('keepalive') === '' ? null : $this->number('keepalive');
             }
 
-            if ($params === []) {
-                return $this->respond(['message' => 'No options given: nothing to update.'], fn () => $this->warn('No options provided. Nothing to update.'));
-            }
-
+            // None: the peer as it is, as PATCH {} answers
             $peer = $wg->updatePeer($link, $pubkey, $params);
         } catch (\Throwable $e) {
             return $this->failed($e->getMessage());
+        }
+        if ($params === []) {
+            return $this->respond($peer->toArray(), fn () => $this->warn('No options given: nothing to update.'));
         }
 
         return $this->respond($peer->toArray(), function () use ($peer) {

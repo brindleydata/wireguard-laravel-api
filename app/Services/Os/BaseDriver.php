@@ -194,6 +194,32 @@ abstract class BaseDriver implements OsDriver
         $this->shell->tryRun('sudo -n :helper firewall-down :link', ['helper' => $this->helperPath, 'link' => $link]);
     }
 
+    public function setPrivateKey(string $iface, string $privkey): void
+    {
+        $this->helper('link-key :iface', ['iface' => $iface], $privkey."\n");
+    }
+
+    public function hostname(): string
+    {
+        return $this->shell->tryRun('hostname') ?: (string) gethostname();
+    }
+
+    // ─── What peers may route ───────────────────────────────────────
+
+    public function routePolicy(): array
+    {
+        // "allow_default_route=false\nallow_own_networks=true"
+        $policy = ['allow_default_route' => false, 'allow_own_networks' => false];
+        foreach (explode("\n", $this->helper('policy')) as $line) {
+            [$key, $value] = array_pad(explode('=', trim($line), 2), 2, '');
+            if (array_key_exists($key, $policy)) {
+                $policy[$key] = $value === 'true';
+            }
+        }
+
+        return $policy;
+    }
+
     // ─── Helper ─────────────────────────────────────────────────────
 
     public function helperStatus(): array

@@ -180,4 +180,23 @@ interface OsDriver
      * Remove a link's forward/NAT rules. Never throws.
      */
     public function clearFirewall(string $link): void;
+
+    /** Give a running link's interface a new private key (on stdin), live. */
+    public function setPrivateKey(string $iface, string $privkey): void;
+
+    // ─── What peers may route ───────────────────────────────────────
+
+    /**
+     * What this server lets links allow their peers to route (wg:install sets it, root-owned;
+     * the helper enforces it too): a default route, networks that hold its own addresses.
+     *
+     * @return array{allow_default_route: bool, allow_own_networks: bool}
+     */
+    public function routePolicy(): array;
+
+    /** Whether a host name resolves now (unprivileged). */
+    public function resolves(string $host): bool;
+
+    /** This machine's name (`hostname`). */
+    public function hostname(): string;
 }

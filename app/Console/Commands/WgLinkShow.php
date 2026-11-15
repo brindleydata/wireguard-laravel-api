@@ -31,6 +31,7 @@ class WgLinkShow extends WgCommand
             $this->line('Interface: '.($link->interface ?? '(down)'));
             $this->line("Public Key: {$link->public_key}");
             $this->line("Listen Port: {$link->listen_port}");
+            $this->line('Endpoint: '.($link->endpoint ?? '(detected)'));
             $this->line("VPN Address: {$link->address}");
             if ($link->address6 !== null) {
                 $this->line("VPN Address (IPv6): {$link->address6}");
@@ -39,6 +40,8 @@ class WgLinkShow extends WgCommand
             $this->line("Outbound: {$link->ifout}");
             $this->line('Forward: '.($link->forward ? 'enabled' : 'disabled'));
             $this->line('NAT: '.($link->nat ? 'enabled' : 'disabled'));
+            $this->line('Inbound: '.($link->inbound ? 'connections from outside reach peers' : 'replies only'));
+            $this->line('Peers may route: '.$this->routesAllowed($link));
             if ($link->firewall === 'missing') {
                 $this->error("Its firewall rules are missing. Put them back with: wgla link:repair {$link->name}");
             }
@@ -54,7 +57,6 @@ class WgLinkShow extends WgCommand
                 foreach ($this->details($peer) as $line) {
                     $this->line($line);
                 }
-                $this->line('PSK: '.($peer->preshared_key ?? '(none)'));
                 $this->line('');
             }
         });

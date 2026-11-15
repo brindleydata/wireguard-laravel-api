@@ -2,6 +2,7 @@
 
 namespace App\Services;
 
+use App\Exceptions\SystemException;
 use InvalidArgumentException;
 
 /**
@@ -32,7 +33,8 @@ class Backup
             'version' => 1,
             'created_at' => gmdate('Y-m-d\TH:i:s\Z'),
             'app_version' => $this->appVersion,
-            'hostname' => $this->config['hostname'] ?? null,
+            // Which machine it came from, for the admin's information
+            'hostname' => gethostname() ?: null,
             'links' => $this->wg->exportLinks(),
         ];
     }
@@ -146,14 +148,19 @@ class Backup
     /**
      * Restore the chosen links: 'restore' (new here), 'replace' (in place of the existing one)
      * or 'skip'. A link that is restored but then doesn't start stays, stopped, and is listed
-     * under `not_started` with the error.
+     * under `not_started` with the error. One the host fails to take (a SystemException) is
+     * listed under `failed` with the error, and the others are restored all the same: they don't
+     * depend on it, and the report says what was done.
+     *
+     * Each restored link keeps its endpoint (where its clients connect) unless $endpoint points
+     * them all elsewhere: `endpoints` says where each one's clients connect now (null: detected).
      *
      * @param  array<string, string>  $choices
-     * @return array{restored: list<string>, skipped: list<string>, ifout: array<string, array{0: ?string, 1: string}>, not_started: array<string, string>, clients: int, hostname: ?string, hostname_changed: bool}
+     * @return array{restored: list<string>, skipped: list<string>, failed: array<string, string>, ifout: array<string, array{0: ?string, 1: string}>, not_started: array<string, string>, clients: int, endpoints: array<string, ?string>}
      */
-    public function restore(array $payload, array $choices): array
+    public function restore(array $payload, array $choices, ?string $endpoint = null): array
     {
-        $report = ['restored' => [], 'skipped' => [], 'ifout' => [], 'not_started' => [], 'clients' => 0];
+        $report = ['restored' => [], 'skipped' => [], 'failed' => [], 'ifout' => [], 'not_started' => [], 'clients' => 0, 'endpoints' => []];
 
         foreach ($payload['links'] as $name => $link) {
             $choice = $choices[$name] ?? 'skip';
@@ -163,8 +170,17 @@ class Backup
                 continue;
             }
 
-            $result = $this->wg->restoreLink($name, $link['conf'], $link['clients'], (bool) ($link['up'] ?? false), replace: $choice === 'replace');
+            try {
+                $result = $this->wg->restoreLink($name, $link['conf'], $link['clients'], (bool) ($link['up'] ?? false), replace: $choice === 'replace', endpoint: $endpoint);
+            } catch (SystemException $e) {
+                // The host's failure (sudo, the helper, a full disk). What can't be restored here
+                // at all (a clash, a hand-written config) problems() says beforehand: that stops it.
+                $report['failed'][$name] = $e->getMessage();
+
+                continue;
+            }
             $report['restored'][] = $name;
+            $report['endpoints'][$name] = $result['endpoint'];
             $report['clients'] += $result['clients'];
             if ($result['ifout'] !== null) {
                 $report['ifout'][$name] = $result['ifout'];
@@ -174,9 +190,7 @@ class Backup
             }
         }
 
-        $hostname = $this->config['hostname'] ?? null;
-
-        return [...$report, 'hostname' => $hostname, 'hostname_changed' => ($payload['hostname'] ?? null) !== $hostname];
+        return $report;
     }
 
     protected function key(string $passphrase, string $salt, int $ops, int $mem): string

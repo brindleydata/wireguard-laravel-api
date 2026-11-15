@@ -15,6 +15,9 @@ Homestead.yaml
 npm-debug.log
 yarn-error.log
 /frankenphp
+# The one a download replaced (put back by the way back from a failed update), and one underway
+/frankenphp.previous
+/frankenphp.new
 # octane:install appends these when they're missing. Listing them keeps a deploy checkout clean,
 # which wg:update needs (it refuses local changes). tests/Unit/OctaneTest.php checks the list.
 **/caddy

@@ -4,8 +4,11 @@
 # Octane's own Caddyfile serves https://<host>:<port> only and has no place for certificate files,
 # so the site address and TLS come from the systemd unit's environment instead:
 #   WGLA_SITE_ADDRESS   https://api.example.com (Let's Encrypt), :443 (own certificate),
-#                       http://127.0.0.1:8080 (behind a proxy)
+#                       http://:8080 (behind a proxy: any Host header)
 #   WGLA_TLS_DIRECTIVE  "tls /path/cert.pem /path/key.pem" or empty
+#   WGLA_BIND_DIRECTIVE "bind 127.0.0.1" behind a proxy, else empty (every interface). An IP in the
+#                       site address would only match the Host header: Caddy would still listen
+#                       on every interface.
 #
 {
 	{$CADDY_GLOBAL_OPTIONS}
@@ -23,6 +26,7 @@
 
 {$WGLA_SITE_ADDRESS} {
 	{$WGLA_TLS_DIRECTIVE}
+	{$WGLA_BIND_DIRECTIVE}
 
 	log {
 		level {$CADDY_SERVER_LOG_LEVEL}

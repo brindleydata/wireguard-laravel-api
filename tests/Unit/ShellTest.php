@@ -28,6 +28,12 @@ it('reports the exit code and stderr of a failed command', function () {
     }
 });
 
+it('reports a command that takes too long as a failed one', function () {
+    // A SystemException (500 with its message), not an exception the error handler takes for a bug
+    expect(fn () => (new Shell)->run('sleep 5', timeout: 0.3))
+        ->toThrow(CommandFailedException::class, 'Command timed out after 0.3 seconds');
+});
+
 it('runs commands from / whatever the caller\'s directory', function () {
     $here = getcwd();
     $dir = sys_get_temp_dir().'/wgla_cwd_'.bin2hex(random_bytes(4));

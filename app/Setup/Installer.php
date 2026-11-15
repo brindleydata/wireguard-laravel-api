@@ -12,6 +12,7 @@ use App\Setup\Steps\Helper;
 use App\Setup\Steps\Packages;
 use App\Setup\Steps\Permissions;
 use App\Setup\Steps\PfAnchors;
+use App\Setup\Steps\Policy;
 use App\Setup\Steps\Server;
 use App\Setup\Steps\Shortcut;
 use App\Setup\Steps\Sudoers;
@@ -33,7 +34,8 @@ class Installer
         'key' => 'WGLA_SERVER_KEY',
         'bind' => 'WGLA_SERVER_BIND',
         'admin_port' => 'WGLA_SERVER_ADMIN_PORT',
-        'hostname' => 'WIREGUARD_HOSTNAME',
+        'allow_default_route' => 'WGLA_ALLOW_DEFAULT_ROUTE',
+        'allow_own_networks' => 'WGLA_ALLOW_OWN_NETWORKS',
     ];
 
     /**
@@ -55,6 +57,7 @@ class Installer
             new PfAnchors($this->shell),
             new Helper($this->shell),
             new Sudoers($this->shell),
+            new Policy($this->shell),
             new AppArmor($this->shell),
             new FirewallRepair($this->shell),
             new Shortcut($this->shell),
@@ -84,7 +87,8 @@ class Installer
 
         $env = new EnvFile($ctx->app('.env'));
         foreach (self::SAVED as $answer => $key) {
-            if (($value = $env->get($key)) !== null && $value !== '') {
+            $value = $env->get($key);
+            if ($value !== null && $value !== '') {
                 $ctx->answers[$answer] = $value;
             }
         }
@@ -103,7 +107,7 @@ class Installer
         return $ctx;
     }
 
-    /** Save the answers into .env once it exists (the environment step sets WIREGUARD_HOSTNAME). */
+    /** Save the answers into .env once it exists (the environment step creates it). */
     public function save(Context $ctx): void
     {
         $env = new EnvFile($ctx->app('.env'));
@@ -113,7 +117,7 @@ class Installer
 
         foreach (self::SAVED as $answer => $key) {
             $value = $ctx->answer($answer);
-            if ($answer !== 'hostname' && $value !== null) {
+            if ($value !== null) {
                 $env->set($key, is_bool($value) ? ($value ? 'true' : 'false') : (string) $value);
             }
         }

@@ -19,6 +19,7 @@ Route::middleware(AuthenticateByApiKey::class)->group(function () {
     Route::patch('/link/{name}', [WireGuard::class, 'linkUpdate']);
     Route::delete('/link/{name}', [WireGuard::class, 'linkDelete']);
     Route::post('/link/{name}/repair', [WireGuard::class, 'linkRepair']);
+    Route::post('/link/{name}/rekey', [WireGuard::class, 'linkRekey']);
 
     // Peer routes
     Route::get('/link/{link}/peers', [WireGuard::class, 'peers']);

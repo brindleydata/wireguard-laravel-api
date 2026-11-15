@@ -100,6 +100,78 @@ it('rejects requests without the right API key', function () {
     $this->getJson('/links', ['api-key' => 'wrong'])->assertForbidden();
 });
 
+it('refuses an address for a while once it sent too many wrong keys', function () {
+    $from = fn (string $ip) => $this->withServerVariables(['REMOTE_ADDR' => $ip]);
+    for ($i = 0; $i < AuthenticateByApiKey::ATTEMPTS; $i++) {
+        $from('198.51.100.7')->getJson('/links', ['api-key' => "guess {$i}"])->assertForbidden();
+    }
+
+    // The key can't be guessed at speed: not even the right one gets through from there now
+    $from('198.51.100.7')->getJson('/links', ['api-key' => 'guess'])->assertStatus(429)->assertHeader('Retry-After')
+        ->assertJsonPath('error', fn (string $error) => str_contains($error, 'Too many requests with a wrong API key'));
+    $from('198.51.100.7')->getJson('/links', $this->auth)->assertStatus(429);
+
+    // Other addresses, and the public health check, as before
+    $from('198.51.100.8')->getJson('/links', $this->auth)->assertOk();
+    $from('198.51.100.7')->getJson('/health')->assertOk();
+});
+
+it('counts the clients of a proxy on this host each on their own', function () {
+    // As behind nginx or Caddy with --tls=http: every request comes from 127.0.0.1
+    for ($i = 0; $i < AuthenticateByApiKey::ATTEMPTS; $i++) {
+        $this->getJson('/links', ['api-key' => 'guess', 'X-Forwarded-For' => '203.0.113.66'])->assertForbidden();
+    }
+
+    $this->getJson('/links', ['api-key' => 'guess', 'X-Forwarded-For' => '203.0.113.66'])->assertStatus(429);
+    $this->getJson('/links', [...$this->auth, 'X-Forwarded-For' => '203.0.113.67'])->assertOk();
+});
+
+it('keeps preshared keys out of listings: they are in the client config', function () {
+    $this->postJson('/link', ['name' => 'wg0', 'ip' => '10.0.0.1/24', 'port' => 51820], $this->auth)->assertCreated();
+    $peer = $this->postJson('/link/wg0/peers', [], $this->auth)->assertCreated()->json();
+    $safe = KeyManager::pubkeyToSafe($peer['public_key']);
+
+    foreach (['/link/wg0', '/link/wg0/peers', "/link/wg0/peer/{$safe}"] as $route) {
+        expect($this->getJson($route, $this->auth)->assertOk()->getContent())->not->toContain('preshared_key')->not->toContain('PresharedKey');
+    }
+    expect($this->getJson("/link/wg0/peer/{$safe}/config", $this->auth)->json('config'))->toMatch('/^PresharedKey = \S+$/m')
+        ->and($peer['client_config'])->toMatch('/^PresharedKey = \S+$/m');
+});
+
+it('takes a link\'s inbound and route settings', function () {
+    $this->host->policy['allow_default_route'] = true;
+
+    $this->postJson('/link', ['name' => 'wg0', 'ip' => '10.0.0.1/24', 'port' => 51820, 'forward' => true, 'inbound' => true, 'allow_default_route' => true], $this->auth)
+        ->assertCreated()->assertJsonPath('inbound', true)->assertJsonPath('allow_default_route', true)->assertJsonPath('allow_own_networks', false);
+    $this->patchJson('/link/wg0', ['inbound' => false], $this->auth)->assertOk()->assertJsonPath('inbound', false);
+
+    // What the server's policy doesn't allow, a link can't either
+    $this->patchJson('/link/wg0', ['allow_own_networks' => true], $this->auth)->assertStatus(409)
+        ->assertJsonPath('error', fn (string $error) => str_contains($error, 'wg:install --allow-own-networks=true'));
+});
+
+it('takes keys of their own, gives a link new keys, and keeps where its clients connect', function () {
+    $keys = new KeyManager;
+    $link_key = $keys->genkey();
+    $device = $keys->pubkey($keys->genkey());
+
+    $link = $this->postJson('/link', ['name' => 'wg0', 'ip' => '10.0.0.1/24', 'port' => 51820, 'private_key' => $link_key, 'endpoint' => 'vpn.example.org:443'], $this->auth)
+        ->assertCreated()->assertJsonPath('public_key', $keys->pubkey($link_key))->assertJsonPath('endpoint', 'vpn.example.org:443')->assertJsonMissingPath('private_key')->json();
+    $peer = $this->postJson('/link/wg0/peers', ['public_key' => $device, 'dns' => '1.1.1.1', 'enabled' => false], $this->auth)
+        ->assertCreated()->assertJsonPath('enabled', false)->assertJsonPath('client.dns', '1.1.1.1')->assertJsonMissingPath('private_key')->json();
+    $safe = KeyManager::pubkeyToSafe($device);
+
+    // A config without the PrivateKey line (the device has it), and no QR code of that
+    expect($this->getJson("/link/wg0/peer/{$safe}/config", $this->auth)->assertOk()->json('config'))->toContain('Endpoint = vpn.example.org:443')->not->toContain('PrivateKey');
+    $this->getJson("/link/wg0/peer/{$safe}/qr", $this->auth)->assertUnprocessable()->assertJsonPath('error', fn (string $error) => str_contains($error, "isn't stored here"));
+
+    $rekeyed = $this->postJson('/link/wg0/rekey', [], $this->auth)->assertOk()->json();
+    expect($rekeyed['public_key'])->not->toBe($link['public_key'])
+        ->and($this->getJson("/link/wg0/peer/{$safe}/config", $this->auth)->json('config'))->toContain("PublicKey = {$rekeyed['public_key']}");
+    $this->patchJson('/link/wg0', ['endpoint' => null], $this->auth)->assertOk()->assertJsonPath('endpoint', 'vpn.example.test');
+    expect($peer['public_key'])->toBe($device);
+});
+
 it('locks the API instead of opening it when no API key is set', function () {
     config(['wireguard.api_key' => '']);
 
@@ -311,10 +383,19 @@ it('has no public route but /health', function () {
 
 it('asks the root helper about health once in a while, not for every request', function () {
     $asked = fn () => count($this->host->shell->callsTo('sudo -n :helper version'));
+    // As Octane serves each request: with a new controller, and new services made for it
+    $request = function () {
+        foreach (app('router')->getRoutes() as $route) {
+            $route->flushController();
+        }
+        app()->forgetInstance(Server::class);
 
-    $this->getJson('/health')->assertOk();
-    $this->getJson('/health')->assertOk();
-    $this->getJson('/health')->assertOk();
+        return $this->getJson('/health');
+    };
+
+    $request()->assertOk();
+    $request()->assertOk();
+    $request()->assertOk();
     expect($asked())->toBe(1);
 
     // /status is behind the API key and always asks
@@ -457,7 +538,7 @@ it('refuses a field it does not know instead of ignoring it', function (string $
 })->with([
     'creating a link' => ['POST', '/link', ['name' => 'wg1', 'ip' => '10.1.0.1/24', 'adress6' => 'auto'], 'Unknown field: adress6. Known: name, ip, address6,'],
     'changing a link' => ['PATCH', '/link/wg0', ['forwrad' => true, 'allowedips' => '10.0.0.0/8'], 'Unknown fields: forwrad, allowedips. Known: address,'],
-    'adding a peer' => ['POST', '/link/wg0/peers', ['name' => 'x', 'network' => '192.168.1.0/24'], 'Unknown field: network. Known: ip, name, networks, remote.'],
+    'adding a peer' => ['POST', '/link/wg0/peers', ['name' => 'x', 'network' => '192.168.1.0/24'], 'Unknown field: network. Known: ip, name, networks, remote, public_key,'],
     'changing a peer' => ['PATCH', '/link/wg0/peer/{peer}', ['enable' => false], 'Unknown field: enable. Known: ip,'],
 ]);
 

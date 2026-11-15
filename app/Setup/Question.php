@@ -39,8 +39,13 @@ final class Question
         return $this->default instanceof Closure ? ($this->default)($ctx) : $this->default;
     }
 
+    /** What's wrong with an answer, or null. A select only takes one of its options. */
     public function error(mixed $value, Context $ctx): ?string
     {
+        if ($this->type === 'select' && ! array_key_exists((string) $value, $this->options)) {
+            return "'{$value}' is not one of: ".implode(', ', array_keys($this->options)).'.';
+        }
+
         return $this->validate === null ? null : ($this->validate)($value, $ctx);
     }
 
