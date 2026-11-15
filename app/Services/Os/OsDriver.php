@@ -126,6 +126,10 @@ interface OsDriver
      */
     public function writeConfig(string $name, string $content): void;
 
+    /**
+     * Delete a link's .conf (nothing to do when there is none). Throws CommandFailedException
+     * when it couldn't be deleted: the link would still be there.
+     */
     public function deleteConfig(string $name): void;
 
     /**
@@ -141,12 +145,6 @@ interface OsDriver
      */
     public function listConfigNames(): array;
 
-    /**
-     * Metadata from the comment header of a link's .conf: address, ifout, forward, nat, up and
-     * optionally dns, keepalive, allowed_ips. Null if the config doesn't exist.
-     */
-    public function parseConfig(string $name): ?array;
-
     // ─── Client configs ─────────────────────────────────────────────
 
     public function writeClientConfig(string $link, string $key, string $content): void;
@@ -156,6 +154,10 @@ interface OsDriver
      */
     public function readClientConfig(string $link, string $key): ?string;
 
+    /**
+     * Delete what is stored for a peer (its private key), or for every peer of a link. Nothing to
+     * do when there is nothing; both throw CommandFailedException when it couldn't be deleted.
+     */
     public function deleteClientConfig(string $link, string $key): void;
 
     public function deleteClientConfigDir(string $link): void;

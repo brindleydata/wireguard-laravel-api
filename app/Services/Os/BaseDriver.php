@@ -4,7 +4,6 @@ namespace App\Services\Os;
 
 use App\Exceptions\CommandFailedException;
 use App\Exceptions\HelperException;
-use App\Services\ConfigBuilder;
 use App\Services\Shell;
 
 /**
@@ -133,7 +132,7 @@ abstract class BaseDriver implements OsDriver
 
     public function deleteConfig(string $name): void
     {
-        $this->tryHelper('conf-delete :name', ['name' => $name]);
+        $this->helper('conf-delete :name', ['name' => $name]);
     }
 
     public function readConfig(string $name): ?string
@@ -153,13 +152,6 @@ abstract class BaseDriver implements OsDriver
         return $output === '' ? [] : explode("\n", $output);
     }
 
-    public function parseConfig(string $name): ?array
-    {
-        $content = $this->readConfig($name);
-
-        return $content === null ? null : ConfigBuilder::parseMetadata($content);
-    }
-
     // ─── Client configs ─────────────────────────────────────────────
 
     public function writeClientConfig(string $link, string $key, string $content): void
@@ -174,12 +166,12 @@ abstract class BaseDriver implements OsDriver
 
     public function deleteClientConfig(string $link, string $key): void
     {
-        $this->tryHelper('client-delete :link :key', ['link' => $link, 'key' => $key]);
+        $this->helper('client-delete :link :key', ['link' => $link, 'key' => $key]);
     }
 
     public function deleteClientConfigDir(string $link): void
     {
-        $this->tryHelper('client-delete-all :link', ['link' => $link]);
+        $this->helper('client-delete-all :link', ['link' => $link]);
     }
 
     // ─── Firewall ───────────────────────────────────────────────────
@@ -196,7 +188,10 @@ abstract class BaseDriver implements OsDriver
 
     public function clearFirewall(string $link): void
     {
-        $this->tryHelper('firewall-down :link', ['link' => $link]);
+        // The one call that may fail quietly: it tidies up after a stop, whose PostDown hook has
+        // normally removed the rules already. (A stale helper still throws: it must not be used.)
+        $this->assertHelperCurrent();
+        $this->shell->tryRun('sudo -n :helper firewall-down :link', ['helper' => $this->helperPath, 'link' => $link]);
     }
 
     // ─── Helper ─────────────────────────────────────────────────────
@@ -239,14 +234,6 @@ abstract class BaseDriver implements OsDriver
 
             throw $e;
         }
-    }
-
-    protected function tryHelper(string $command, array $bindings = [], ?string $input = null): ?string
-    {
-        // Throws rather than returning null: a stale helper must not look like "not found"
-        $this->assertHelperCurrent();
-
-        return $this->shell->tryRun("sudo -n :helper {$command}", ['helper' => $this->helperPath, ...$bindings], $input);
     }
 
     /**

@@ -6,6 +6,7 @@ use App\Services\Server;
 use App\Services\Shell;
 use App\Services\WireGuard;
 use Illuminate\Support\Facades\Artisan;
+use Tests\Fakes\CommandFailed;
 use Tests\Fakes\FakeHost;
 use Tests\Fakes\FakeShell;
 
@@ -239,6 +240,23 @@ it('fails with --json as {"error": …} and a non-zero exit code', function (str
     ['wg:peer:create', ['link' => 'wg0', '--ip' => '10.5.0.2'], "Peer IP 10.5.0.2 is not within the interface's network range (10.0.0.1/24)."],
 ]);
 
+it('does not say deleted for what is still there', function () {
+    // An interface something else started: not this app's to stop
+    $this->host->addUnmanagedInterface('wg9');
+    $this->artisan('wg:link:delete', ['link' => 'wg9'])
+        ->expectsOutputToContain('wg9 is a running WireGuard interface without a config here')
+        ->doesntExpectOutputToContain('Deleted')
+        ->assertFailed();
+
+    // A config the host didn't delete
+    app(Shell::class)->on('sudo -n :helper conf-delete :name', fn () => throw new CommandFailed('rm: cannot remove: Read-only file system'));
+    $code = Artisan::call('wg:link:delete', ['link' => 'wg0', '--json' => true]);
+
+    expect($code)->toBe(1)
+        ->and(json_decode(Artisan::output(), true)['error'])->toContain('Read-only file system')
+        ->and(app(WireGuard::class)->listLinks())->toBe(['wg0', 'wg9']);
+});
+
 it('takes a public key in either form in every peer command', function () {
     $wg = app(WireGuard::class);
     $key = $wg->addPeer('wg0', name: 'laptop')->public_key;
@@ -271,6 +289,15 @@ it('shows a peer with its details above its client config', function () {
     $this->artisan('wg:peer', ['link' => 'wg0', 'pubkey' => $key])->expectsOutputToContain('It has no client config')->assertSuccessful();
     $this->artisan('wg:peer', ['link' => 'wg0', 'pubkey' => $key, '--qr' => true])->expectsOutputToContain('no client config')->assertFailed();
 });
+
+it('names the release in wg:status as it is tagged', function (string $version) {
+    $this->host->shell->otherwise(fn () => '0');
+    config(['app.version' => $version, 'app.name' => 'WGLA']);
+    app()->forgetInstance(Server::class);
+
+    // "vv1.2.3" is what a real update showed: the tag has its v already
+    $this->artisan('wg:status')->expectsOutput("WGLA {$version}")->assertSuccessful();
+})->with(['v1.2.3', 'd891d88', 'dev']);
 
 it('fails wg:status when the root helper is not usable, as /health answers 503', function () {
     $this->host->shell->otherwise(fn () => '0');

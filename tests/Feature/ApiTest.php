@@ -209,6 +209,30 @@ it('refuses to change a hand-written config with a 409', function () {
     $this->deleteJson('/link/office', [], $this->auth)->assertOk();
 });
 
+it('shows an interface that runs without a config, and refuses to change or delete it with a 409', function () {
+    $this->host->addUnmanagedInterface('wg9');
+
+    $this->getJson('/link/wg9', $this->auth)->assertOk()->assertJsonPath('up', true)->assertJsonPath('listen_port', 40000);
+    $this->postJson('/link/wg9/peers', [], $this->auth)
+        ->assertConflict()
+        ->assertJsonPath('error', fn (string $error) => str_starts_with($error, 'wg9 is a running WireGuard interface without a config here'));
+    $this->patchJson('/link/wg9', ['up' => false], $this->auth)->assertConflict();
+    $this->deleteJson('/link/wg9', [], $this->auth)->assertConflict();
+
+    expect(array_keys($this->host->interfaces))->toBe(['wg9'])
+        ->and($this->host->files())->toBe([]);
+});
+
+it('answers a delete the host did not carry out with a 500, not with "deleted"', function () {
+    $this->postJson('/link', ['name' => 'wg0', 'ip' => '10.0.0.1/24', 'port' => 51820], $this->auth)->assertCreated();
+    app(Shell::class)->on('sudo -n :helper conf-delete :name', fn () => throw new CommandFailed('rm: cannot remove: Read-only file system'));
+
+    $this->deleteJson('/link/wg0', [], $this->auth)
+        ->assertStatus(500)
+        ->assertJsonPath('error', fn (string $error) => str_contains($error, 'Read-only file system'));
+    $this->getJson('/link/wg0', $this->auth)->assertOk()->assertJsonPath('up', false);
+});
+
 it('serves a peer config as a QR code', function () {
     $this->postJson('/link', ['name' => 'wg0', 'ip' => '10.0.0.1/24', 'port' => 51820], $this->auth)->assertCreated();
     $safe = KeyManager::pubkeyToSafe($this->postJson('/link/wg0/peers', [], $this->auth)->json('public_key'));

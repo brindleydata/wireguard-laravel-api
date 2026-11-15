@@ -51,7 +51,7 @@ FORWARD6_POLICY=$(ip6tables -S FORWARD 2>/dev/null | sed -n 's/^-P FORWARD //p')
 cleanup() {
     for link in e2e0 e2e1 e2e2 e2e3; do "${ART[@]}" wg:link:delete "$link" > /dev/null 2>&1; done
     ip netns del e2e-client 2>/dev/null; ip netns del e2e-far 2>/dev/null
-    ip link del e2e-h 2>/dev/null; ip link del e2e-fh 2>/dev/null
+    ip link del e2e-h 2>/dev/null; ip link del e2e-fh 2>/dev/null; ip link del e2ex 2>/dev/null
     [ -n "$FORWARD_POLICY" ] && iptables -P FORWARD "$FORWARD_POLICY"
     [ -n "$FORWARD6_POLICY" ] && ip6tables -P FORWARD "$FORWARD6_POLICY"
     rm -f /tmp/wgla-e2e-*
@@ -205,6 +205,13 @@ check "is listed and shown" "cli wg:links | grep -qw e2e3 && cli wg:link e2e3 | 
 check "but not changed: that would drop its Table setting" "! \"\${ART[@]}\" wg:peer:create e2e3 && grep -qx 'Table = off' /etc/wireguard/e2e3.conf"
 cli wg:link:delete e2e3 > /dev/null
 check "and can be deleted" "[ ! -e /etc/wireguard/e2e3.conf ]"
+
+step "A WireGuard interface that something else started"
+ip link add e2ex type wireguard
+check "is listed and shown" "cli wg:links | grep -qw e2ex && cli wg:link e2ex | grep -q 'Interface: e2ex'"
+check "but a peer can't be added: nothing here would keep it" "! \"\${ART[@]}\" wg:peer:create e2ex && [ -z \"\$(wg show e2ex peers)\" ] && [ ! -e /etc/wireguard/clients/e2ex ]"
+check "and it isn't 'deleted' while it runs on" "! \"\${ART[@]}\" wg:link:delete e2ex && [ \"\$(api -X DELETE $URL/link/e2ex)\" = 409 ] && ip link show e2ex"
+ip link del e2ex
 
 step "HTTP API ($URL)"
 check "a link that isn't there -> 404" "[ \"\$(api $URL/link/e2enone)\" = 404 ]"

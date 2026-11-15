@@ -31,7 +31,8 @@ class WgStatus extends WgCommand
 
         // What GET /status, /ip and /interfaces answer, in one
         $this->respond([...$status->toArray(), 'ip' => $ip, ...$interfaces], function () use ($status, $ip, $interfaces, $helper) {
-            $this->info($status->app['name'].' v'.($status->app['version'] ?? '0.0'));
+            // The version is the release's name already (v1.2.3, or a commit while there is no tag)
+            $this->info("{$status->app['name']} {$status->app['version']}");
             $this->line("Hostname: {$status->hostname}");
             $this->line('IPv4: '.($ip['ipv4'] ?? '(none)'));
             $this->line('IPv6: '.($ip['ipv6'] ?? '(none)'));

@@ -101,15 +101,19 @@ class FakeHost
         $this->interfaces[$iface]['peers'][$pubkey]['stats'] = compact('endpoint', 'handshake', 'rx', 'tx');
     }
 
-    /** Add a running WireGuard interface that no .conf manages. */
-    public function addUnmanagedInterface(string $iface): void
+    /**
+     * Add a running WireGuard interface that no .conf manages (started by something else).
+     *
+     * @param  array<string, string>  $peers  pubkey => allowed IPs
+     */
+    public function addUnmanagedInterface(string $iface, array $peers = []): void
     {
         $this->interfaces[$iface] = [
             'link' => null,
             'private_key' => base64_encode(random_bytes(32)),
             'port' => 40000,
             'address' => '192.168.99.1/24',
-            'peers' => [],
+            'peers' => array_map(fn (string $allowed_ips) => ['psk' => null, 'allowed_ips' => $allowed_ips], $peers),
         ];
     }
 

@@ -27,7 +27,7 @@ jobs:
 
       - run: ./vendor/bin/pint --test
 
-      - run: shellcheck -s bash bin/wgla-helper tests/e2e/linux.sh && shellcheck -s sh bin/wgla
+      - run: shellcheck -s bash bin/wgla-helper tests/e2e/linux.sh tests/e2e/update.sh && shellcheck -s sh bin/wgla
 
   # Both supported LTS releases: 24.04 has classic sudo; 26.04 has sudo-rs and AppArmor profiles
   # that confine wg and wg-quick.
@@ -80,3 +80,96 @@ jobs:
           echo "=== wgla (API)"; sudo journalctl -u wgla -n 60 --no-pager
           echo "=== wg-quick units"; sudo journalctl -u 'wg-quick@*' -n 100 --no-pager
           echo "=== kernel and firewall"; uname -a; sudo nft --version; sudo iptables --version; sudo iptables -S FORWARD
+
+  # What every installed server goes through: the version before this one, set up and in use,
+  # is updated in place with wg:update. Its link and connected client have to come through, the
+  # new version has to manage them, and the updated server has to pass what a new one does.
+  update:
+    name: Update a running server (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    needs: tests
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-26.04]
+    steps:
+      # With the history and the tags: the version to update from is in there
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.5'
+          extensions: sodium, mbstring, dom
+          coverage: none
+
+      # The last release before this commit, or simply the commit before it while there is none.
+      # /srv/wgla is a clone of this checkout, which makes it the origin wg:update fetches from.
+      - name: Install the version before this one in /srv/wgla
+        run: |
+          from=$(git describe --tags --abbrev=0 --match 'v[0-9]*' --exclude '*-*' HEAD^ 2>/dev/null || git rev-parse HEAD^)
+          echo "Updating from $from: $(git log -1 --format='%h %s' "$from")"
+          sudo install -d -o "$USER" -g "$(id -gn)" /srv/wgla
+          git clone --quiet --no-checkout "$GITHUB_WORKSPACE" /srv/wgla
+          git -C /srv/wgla checkout --quiet --detach "$from"
+          cd /srv/wgla
+          composer install --no-dev --optimize-autoloader --no-interaction --no-progress
+          php artisan wg:install --yes --user=www-data --hostname=127.0.0.1 --forward=true --tls=http --bind=127.0.0.1 --port=8080
+
+      # The script is this commit's (the old version may not have it); the link is the old version's
+      - name: A link with a connected client, on that version
+        run: sudo WGLA_E2E=1 "$GITHUB_WORKSPACE/tests/e2e/update.sh" before /srv/wgla
+
+      # As on a server: no arguments, so it takes the newest release. That is this commit, under
+      # a tag that only exists on this runner.
+      - name: php artisan wg:update --yes
+        working-directory: /srv/wgla
+        run: |
+          git -C "$GITHUB_WORKSPACE" tag v9999.0.0
+          php artisan wg:update --yes
+
+      - name: The link and its client came through, and the new version manages them
+        run: sudo WGLA_E2E=1 "$GITHUB_WORKSPACE/tests/e2e/update.sh" after /srv/wgla "$(git rev-parse HEAD)"
+
+      # This commit is the installed version now, and with that the one that has to find the way
+      # back when a later release fails: code that can't be fixed any more once it is on a server.
+      # So two releases that fail and one that works, made here and never leaving the runner.
+      - name: A link with a connected client again, on this version
+        run: sudo WGLA_E2E=1 "$GITHUB_WORKSPACE/tests/e2e/update.sh" before /srv/wgla
+
+      - name: A release whose API is never healthy fails after the reload, and the update goes back
+        working-directory: /srv/wgla
+        run: |
+          WGLA_E2E=1 "$GITHUB_WORKSPACE/tests/e2e/update.sh" release v9999.1.0 unhealthy
+          if php artisan wg:update --yes; then echo "That update had to fail"; exit 1; fi
+          sudo WGLA_E2E=1 "$GITHUB_WORKSPACE/tests/e2e/update.sh" back /srv/wgla "$(git -C "$GITHUB_WORKSPACE" rev-parse HEAD)"
+
+      - name: A release that doesn't parse fails before any reload, and the update goes back
+        working-directory: /srv/wgla
+        run: |
+          WGLA_E2E=1 "$GITHUB_WORKSPACE/tests/e2e/update.sh" release v9999.2.0 unparsable
+          if php artisan wg:update --yes; then echo "That update had to fail"; exit 1; fi
+          sudo WGLA_E2E=1 "$GITHUB_WORKSPACE/tests/e2e/update.sh" back /srv/wgla "$(git -C "$GITHUB_WORKSPACE" rev-parse HEAD)"
+
+      - name: The release after those is an update like any other
+        working-directory: /srv/wgla
+        run: |
+          WGLA_E2E=1 "$GITHUB_WORKSPACE/tests/e2e/update.sh" release v9999.3.0 working
+          php artisan wg:update --yes
+          sudo WGLA_E2E=1 "$GITHUB_WORKSPACE/tests/e2e/update.sh" after /srv/wgla "$(git -C "$GITHUB_WORKSPACE" rev-parse HEAD)"
+
+      - name: Nothing is left for the installer to do
+        working-directory: /srv/wgla
+        run: php artisan wg:install --no-interaction
+
+      - name: End-to-end checks, as on a new server
+        run: sudo WGLA_E2E=1 /srv/wgla/tests/e2e/linux.sh /srv/wgla
+
+      - name: Logs on failure
+        if: failure()
+        run: |
+          echo "=== versions"; git -C /srv/wgla log --oneline -3; grep -E '^(APP_VERSION|WGLA_)' /srv/wgla/.env
+          echo "=== where the checkout has been"; git -C /srv/wgla reflog -8
+          echo "=== wgla (API)"; sudo journalctl -u wgla -n 80 --no-pager
+          echo "=== wg-quick units"; sudo journalctl -u 'wg-quick@*' -n 100 --no-pager

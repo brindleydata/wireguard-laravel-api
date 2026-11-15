@@ -197,6 +197,21 @@ it('finds what the restore itself would refuse, networks behind peers included',
         ->and($empty->backup->problems($payload, 'wg0'))->toBe([]);
 });
 
+it('does not restore over a WireGuard interface that runs without a config', function () {
+    [$old] = backedUpServer('linux');
+    $payload = $old->backup->create();
+    $new = new Rig('linux');
+    // Something else started it: replacing it would mean stopping what this app doesn't manage
+    $new->host->addUnmanagedInterface('wg0');
+    $before = $new->host->interfaces;
+
+    expect($new->backup->problems($payload, 'wg0', ignore: ['wg0']))
+        ->toBe(['wg0 is a running WireGuard interface without a config here: this app can show it, but not change, stop or delete it. Manage it where it was started.'])
+        ->and(fn () => $new->backup->restore($payload, ['wg0' => 'replace']))->toThrow(ConflictException::class, 'without a config here')
+        ->and($new->host->interfaces)->toBe($before)
+        ->and($new->host->files())->toBe([]);
+});
+
 it('leaves a link alone when the one to replace it with cannot be restored', function (Closure $obstacle, string $exception) {
     [$old] = backedUpServer('linux');
     $payload = $old->backup->create();
@@ -287,6 +302,21 @@ it('exports the stored client config of each peer', function () {
         ->and($links['wg0']['up'])->toBeTrue()
         ->and($links['wg1']['up'])->toBeFalse()
         ->and(array_keys($links['wg0']['clients']))->toBe([KeyManager::pubkeyToSafe($peers['plain']->public_key), KeyManager::pubkeyToSafe($peers['custom']->public_key)]);
+});
+
+it('restores a backup whose configs still have the up line older versions wrote', function () {
+    [$old] = backedUpServer('linux');
+    $payload = $old->backup->create();
+    foreach (['wg0', 'wg1'] as $name) {
+        $payload['links'][$name]['conf'] = str_replace('# format = ', "# up = true\n# format = ", $payload['links'][$name]['conf']);
+    }
+    $new = new Rig('linux');
+
+    // Whether a link runs was never read from that line: the backup says so itself
+    expect($new->backup->problems($payload, 'wg0'))->toBe([])
+        ->and($new->backup->restore($payload, ['wg0' => 'restore', 'wg1' => 'restore'])['restored'])->toBe(['wg0', 'wg1'])
+        ->and($new->host->conf('wg0').$new->host->conf('wg1'))->not->toContain('# up')
+        ->and([$new->wg->getLink('wg0')->up, $new->wg->getLink('wg1')->up])->toBe([true, false]);
 });
 
 it('restores what peers had of their own from a backup made before that was stored with them', function () {

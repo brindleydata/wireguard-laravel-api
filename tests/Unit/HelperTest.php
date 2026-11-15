@@ -92,7 +92,7 @@ it('stores exactly the link configs the app writes', function (string $os) {
         ->and($box->run(['conf-write', 'wg1'], $plain)['exit'])->toBe(0)
         ->and($box->run(['conf-write', 'wg2'], $dual)['exit'])->toBe(0)
         ->and($dual)->toContain("# address6 = fd12:3456:789a::1/64\n")->toContain("Address = 10.0.0.1/24, fd12:3456:789a::1/64\n")
-        ->and($hooked)->toContain("# up = true\n# format = 2\n", "ListenPort = 51820\nMTU = 1380\n")
+        ->and($hooked)->toContain("# nat = true\n# format = 2\n", "ListenPort = 51820\nMTU = 1380\n")->not->toContain('# up')
         ->toContain("AllowedIPs = 10.0.0.3/32, fd00::3/128, 192.168.1.0/24\nEndpoint = branch.example.com:51820\nPersistentKeepalive = 25\n")
         ->toContain("[Peer]\n# name = Ана's phone (#2)\n# dns = 10.0.0.1, corp.example.com\n# keepalive = 0\n# allowed_ips = 10.0.0.0/24, fd00::/64\nPublicKey = ")
         ->toContain("# [Peer] disabled\n# name = old laptop\n# dns = 9.9.9.9\n# PublicKey = ")
@@ -101,6 +101,17 @@ it('stores exactly the link configs the app writes', function (string $os) {
         ->and($box->run(['conf-read', 'wg0'])['stdout'])->toBe($hooked)
         ->and($box->run(['conf-list'])['stdout'])->toBe("wg0\nwg1\nwg2\n")
         ->and($box->calls())->toBe([]);
+})->with('helper os');
+
+it('still takes the up line the app wrote before 1.0, for a config that is put back', function (string $os) {
+    $box = new HelperSandbox($os);
+    // revert() writes a link's previous config back as it was read
+    $older = str_replace('# format = ', "# up = true\n# format = ", appConf($os));
+
+    $run = $box->run(['conf-write', 'wg0'], $older);
+
+    expect($run['exit'])->toBe(0, $run['stderr'])
+        ->and(file_get_contents("{$box->confDir}/wg0.conf"))->toBe($older)->toContain("# up = true\n");
 })->with('helper os');
 
 it('rejects anything else in a link config and keeps the saved one', function (string $pattern, string $replacement, string $error) {

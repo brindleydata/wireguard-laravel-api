@@ -51,7 +51,6 @@ it('reads a missing config as null', function () {
 
     expect($driver->readConfig('wg0'))->toBeNull()
         ->and($driver->configExists('wg0'))->toBeFalse()
-        ->and($driver->parseConfig('wg0'))->toBeNull()
         ->and($driver->readClientConfig('wg0', 'abc'))->toBeNull();
 });
 
@@ -66,6 +65,26 @@ it('never reads a failure as "nothing there"', function (Closure $read) {
     'the link list' => [fn (LinuxDriver $driver) => $driver->listConfigNames()],
     'the running interfaces' => [fn (LinuxDriver $driver) => $driver->runningInterfaces()],
 ]);
+
+it('never takes a delete that failed for done', function (Closure $delete) {
+    // "Deleted" for a link whose config is still there would be a lie
+    $shell = (new FakeShell)->otherwise(fn () => throw new CommandFailed('rm: cannot remove: Read-only file system'));
+
+    expect(fn () => $delete(helperDriver($shell)))->toThrow(CommandFailed::class, 'Read-only file system');
+})->with([
+    'a link config' => [fn (LinuxDriver $driver) => $driver->deleteConfig('wg0')],
+    'a stored key' => [fn (LinuxDriver $driver) => $driver->deleteClientConfig('wg0', 'abc')],
+    'the stored keys of a link' => [fn (LinuxDriver $driver) => $driver->deleteClientConfigDir('wg0')],
+]);
+
+it('tidies up firewall rules without failing', function () {
+    // After a stop, whose PostDown hook has normally removed them already
+    $shell = (new FakeShell)->otherwise(fn () => throw new CommandFailed('nft: no such table'));
+
+    helperDriver($shell)->clearFirewall('wg0');
+
+    expect(array_column($shell->calls, 'bound'))->toBe(["sudo -n '/usr/local/sbin/wgla-helper' firewall-down 'wg0'"]);
+});
 
 it('reads no configs and no running interfaces as empty lists', function () {
     $driver = helperDriver((new FakeShell)->otherwise(fn () => ''));

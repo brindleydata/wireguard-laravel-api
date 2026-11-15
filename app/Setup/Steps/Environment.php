@@ -70,7 +70,8 @@ class Environment extends Step
         $path = self::q($this->env($ctx)->path);
 
         return [
-            Action::php('Create .env and fill in keys and hostname', function (Context $ctx) {
+            // An update only has a new APP_VERSION to write: it shouldn't read as a new .env
+            Action::php($this->env($ctx)->exists() ? 'Bring .env up to date' : 'Create .env and fill in keys and hostname', function (Context $ctx) {
                 $env = $this->env($ctx);
                 if (! $env->exists()) {
                     copy($ctx->app('.env.example'), $env->path);

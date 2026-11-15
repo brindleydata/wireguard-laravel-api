@@ -1,6 +1,7 @@
 <?php
 
 use App\DTOs\PeerInfo;
+use App\Exceptions\CommandFailedException;
 use App\Exceptions\ConflictException;
 use App\Exceptions\NotFoundException;
 use App\Exceptions\SystemException;
@@ -445,6 +446,106 @@ it('lists unmanaged running interfaces once', function (string $os) {
 
     expect($rig->wg->listLinks())->toBe(['wg0', 'wg9']);
 })->with('os');
+
+it('shows a WireGuard interface that runs without a config, but changes nothing about it', function (string $os, Closure $change) {
+    $rig = new Rig($os);
+    // Started by something else: wg-quick with a config of its own, `ip link`, another tool
+    $rig->host->addUnmanagedInterface('wg9', [$key = (new KeyManager)->pubkey((new KeyManager)->genkey()) => '192.168.99.2/32']);
+    $before = [$rig->host->interfaces, $rig->host->files()];
+    $calls = count($rig->shell->calls);
+
+    expect(fn () => $change($rig->wg, $key))
+        ->toThrow(ConflictException::class, 'wg9 is a running WireGuard interface without a config here: this app can show it, but not change, stop or delete it.');
+
+    // Nothing was asked of the host but what it has: no peer on the interface, no stored key
+    // nothing would account for, no "deleted" for an interface that still runs
+    $asked = array_column(array_slice($rig->shell->calls, $calls), 'command');
+    expect([$rig->host->interfaces, $rig->host->files()])->toBe($before)
+        ->and(array_values(array_filter($asked, fn (string $command) => preg_match('/ (peer-|conf-write|conf-delete|client-|up |down |firewall-)/', $command))))->toBe([])
+        ->and($rig->wg->getLink('wg9')->peers[0]->public_key)->toBe($key)
+        ->and($rig->wg->getPeer('wg9', $key)->allowed_ips)->toBe('192.168.99.2/32')
+        ->and($rig->wg->getPeerConfig('wg9', $key))->toBeNull();
+})->with('os')->with([
+    'a new peer' => [fn ($wg) => $wg->addPeer('wg9')],
+    'a peer change' => [fn ($wg, string $key) => $wg->updatePeer('wg9', $key, ['name' => 'someone'])],
+    'new keys for a peer' => [fn ($wg, string $key) => $wg->rekeyPeer('wg9', $key)],
+    'removing a peer' => [fn ($wg, string $key) => $wg->removePeer('wg9', $key)],
+    'a link setting' => [fn ($wg) => $wg->updateLink('wg9', ['dns' => '1.1.1.1'])],
+    'stopping it' => [fn ($wg) => $wg->updateLink('wg9', ['up' => false])],
+    'deleting it' => [fn ($wg) => $wg->deleteLink('wg9')],
+]);
+
+it('does not say deleted when the host kept something', function (string $os, string $command, array $left) {
+    $rig = new Rig($os);
+    $rig->wg->createLink('wg0', '10.0.0.1/24', 51820);
+    $rig->wg->addPeer('wg0');
+    $rig->shell->on("sudo -n :helper {$command}", fn () => throw new CommandFailed('rm: cannot remove: Read-only file system'));
+
+    expect(fn () => $rig->wg->deleteLink('wg0'))->toThrow(CommandFailedException::class, 'Read-only file system');
+
+    // The config goes last: while anything is left the link is still there, to delete again
+    expect($rig->wg->listLinks())->toBe(['wg0'])
+        ->and($rig->wg->getLink('wg0')->up)->toBeFalse()
+        ->and([count($rig->host->confs), count($rig->host->clients)])->toBe($left);
+})->with('os')->with([
+    'the stored keys' => ['client-delete-all :link', [1, 1]],
+    'the config' => ['conf-delete :name', [1, 0]],
+]);
+
+it('says what is left when a removed peer\'s stored key could not be deleted', function (bool $up) {
+    $rig = new Rig('linux');
+    $rig->wg->createLink('wg0', '10.0.0.1/24', 51820, up: $up);
+    $gone = $rig->wg->addPeer('wg0');
+    $rekeyed = $rig->wg->addPeer('wg0');
+    $rig->shell->on('sudo -n :helper client-delete :link :key', fn () => throw new CommandFailed('rm: cannot remove: Read-only file system'));
+
+    expect(fn () => $rig->wg->removePeer('wg0', $gone->public_key))
+        ->toThrow(SystemException::class, "Peer {$gone->public_key} was removed from link wg0, but its stored private key could not be deleted: ")
+        ->and(array_keys($rig->host->confPeers('wg0')))->toBe([$rekeyed->public_key]);
+
+    try {
+        $rig->wg->rekeyPeer('wg0', $rekeyed->public_key);
+    } catch (SystemException $e) {
+    }
+    $now = array_keys($rig->host->confPeers('wg0'))[0];
+
+    expect($e->getMessage())->toStartWith("Peer {$rekeyed->public_key} has new keys and is now {$now}, but its old stored private key could not be deleted: ")
+        ->and($now)->not->toBe($rekeyed->public_key)
+        // The new key is stored: its config is there to be read
+        ->and($rig->wg->getPeerConfig('wg0', $now))->toContain('PrivateKey = ');
+})->with(['running' => [true], 'stopped' => [false]]);
+
+it('says so when a link that did not start could not be removed again', function () {
+    $rig = new Rig('linux');
+    $rig->host->failNextStart = true;
+    $rig->shell->on('sudo -n :helper conf-delete :name', fn () => throw new CommandFailed('rm: cannot remove: Read-only file system'));
+
+    expect(fn () => $rig->wg->createLink('wg0', '10.0.0.1/24', 51820))
+        ->toThrow(SystemException::class, 'Link wg0 was created but did not start, and its config could not be removed again (delete the link): ')
+        ->and($rig->wg->listLinks())->toBe(['wg0'])
+        ->and($rig->host->interfaceOf('wg0'))->toBeNull();
+});
+
+it('leaves out the up line older versions wrote, and manages their configs as before', function (string $os, bool $up) {
+    $rig = new Rig($os);
+    $rig->wg->createLink('wg0', '10.0.0.1/24', 51820, forward: true, up: $up);
+    $peer = $rig->wg->addPeer('wg0', name: 'laptop');
+
+    // Whether a link runs is the host's to say: the app wrote this line once and never read it
+    expect($rig->host->conf('wg0'))->not->toContain('# up');
+    $old = $rig->host->confs['wg0'] = str_replace('# format = ', '# up = '.($up ? 'true' : 'false')."\n# format = ", $rig->host->conf('wg0'));
+    expect($old)->toContain("# nat = false\n# up = ");
+
+    // A change it can't make keeps the config as it was, line and all
+    $rig->host->failNextStart = true;
+    expect(fn () => $rig->wg->updateLink('wg0', ['port' => 51999, 'up' => true]))->toThrow(SystemException::class, 'was undone')
+        ->and($rig->host->conf('wg0'))->toBe($old);
+
+    $rig->wg->updatePeer('wg0', $peer->public_key, ['name' => 'phone']);
+
+    expect($rig->host->conf('wg0'))->not->toContain('# up')->toContain('# name = phone', "# nat = false\n# format = 2\n")
+        ->and($rig->wg->getLink('wg0')->up)->toBe($up);
+})->with('os')->with(['running' => [true], 'stopped' => [false]]);
 
 it('hands configs and peers to the helper on stdin and keeps locks in the shared directory', function (string $os) {
     $rig = new Rig($os);
