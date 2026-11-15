@@ -284,7 +284,9 @@ it('runs wg in the C locale, trying a name that does not resolve only a few time
     // By default wg retries for minutes: the app's call would time out and leave wg running.
     // The locale is the helper's own too: what its checks match can't depend on the caller's.
     $box = new HelperSandbox;
-    file_put_contents("{$box->dir}/stubs/wg", "#!/bin/sh\necho \"retries=\$WG_ENDPOINT_RESOLUTION_RETRIES locale=\$LC_ALL\"\n");
+    // It reads its stdin as `wg addconf … /dev/stdin` does: one that exits first breaks the
+    // helper's pipe into it (cat: Broken pipe), whenever it wins that race
+    file_put_contents("{$box->dir}/stubs/wg", "#!/bin/sh\ncat > /dev/null\necho \"retries=\$WG_ENDPOINT_RESOLUTION_RETRIES locale=\$LC_ALL\"\n");
     chmod("{$box->dir}/stubs/wg", 0755);
 
     $run = $box->run(['peer-add', 'wg0'], "[Peer]\nPublicKey = ".HELPER_TEST_KEY."\nAllowedIPs = 10.0.0.2/32\nEndpoint = branch.example.com:51820\n");
