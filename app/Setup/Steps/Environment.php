@@ -5,7 +5,6 @@ namespace App\Setup\Steps;
 use App\Setup\Action;
 use App\Setup\Context;
 use App\Setup\EnvFile;
-use App\Setup\Question;
 use App\Setup\Step;
 
 class Environment extends Step
@@ -18,17 +17,6 @@ class Environment extends Step
     public function title(): string
     {
         return 'Configuration (.env)';
-    }
-
-    public function questions(Context $ctx): array
-    {
-        return [new Question(
-            key: 'hostname',
-            label: 'Public hostname or IP that VPN clients connect to',
-            default: fn (Context $ctx) => $this->env($ctx)->get('WIREGUARD_HOSTNAME') ?: $this->detectHostname(),
-            validate: fn ($value) => preg_match('/^[A-Za-z0-9.:-]+$/', (string) $value) ? null : 'Not a hostname or IP address.',
-            hint: 'Goes into every client config as the Endpoint.',
-        )];
     }
 
     public function check(Context $ctx): array
@@ -44,9 +32,6 @@ class Environment extends Step
         }
         if (! $env->get('API_KEY')) {
             $problems[] = 'API_KEY is not set (the API refuses every protected request without it)';
-        }
-        if ($env->get('WIREGUARD_HOSTNAME') !== (string) $ctx->answer('hostname')) {
-            $problems[] = 'WIREGUARD_HOSTNAME is not '.$ctx->answer('hostname');
         }
         if (($version = $this->version($ctx)) !== null && $env->get('APP_VERSION') !== $version) {
             $problems[] = "APP_VERSION is not {$version} (the checked-out release)";
@@ -71,7 +56,7 @@ class Environment extends Step
 
         return [
             // An update only has a new APP_VERSION to write: it shouldn't read as a new .env
-            Action::php($this->env($ctx)->exists() ? 'Bring .env up to date' : 'Create .env and fill in keys and hostname', function (Context $ctx) {
+            Action::php($this->env($ctx)->exists() ? 'Bring .env up to date' : 'Create .env and fill in its keys', function (Context $ctx) {
                 $env = $this->env($ctx);
                 if (! $env->exists()) {
                     copy($ctx->app('.env.example'), $env->path);
@@ -83,7 +68,6 @@ class Environment extends Step
                 if (! $env->get('API_KEY')) {
                     $env->set('API_KEY', bin2hex(random_bytes(32)));
                 }
-                $env->set('WIREGUARD_HOSTNAME', (string) $ctx->answer('hostname'));
                 $env->set('OCTANE_SERVER', 'frankenphp');
                 if (($version = $this->version($ctx)) !== null) {
                     $env->set('APP_VERSION', $version);
@@ -104,17 +88,5 @@ class Environment extends Step
     public function env(Context $ctx): EnvFile
     {
         return new EnvFile($ctx->app('.env'));
-    }
-
-    protected function detectHostname(): string
-    {
-        $hostname = (string) gethostname();
-        if (str_contains($hostname, '.')) {
-            return $hostname;
-        }
-
-        $ip = $this->shell->tryRun('curl -4 -s --max-time 5 :url', ['url' => config('wireguard.ip_service', 'http://ifconfig.me/ip')]);
-
-        return $ip && filter_var($ip, FILTER_VALIDATE_IP) ? $ip : $hostname;
     }
 }

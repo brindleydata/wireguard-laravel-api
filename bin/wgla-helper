@@ -14,8 +14,11 @@
 set -euo pipefail
 umask 077
 IFS=$' \t\n'
+# Bytes, whatever locale sudo hands over: character classes and ranges in the checks below then
+# mean the same everywhere (under glibc's C.UTF-8, [[:cntrl:]] also matches U+2028 in a name)
+export LC_ALL=C
 
-VERSION=7
+VERSION=9
 SELF=$0
 MAX_SIZE=1048576
 
@@ -33,9 +36,11 @@ if [ "$(id -u)" -eq 0 ]; then
         PATH=/opt/homebrew/bin:/opt/homebrew/sbin:$PATH
     fi
     WGLA_CONF_DIR='' WGLA_RUN_DIR='' TMPDIR=/tmp
+    POLICY_FILE=/etc/wgla/policy.conf
 else
     # Unprivileged runs can't do anything privileged; tests use them with stubs and temp dirs
     OS=${WGLA_OS:-$(uname -s)}
+    POLICY_FILE=${WGLA_POLICY:-/etc/wgla/policy.conf}
 fi
 
 case "$OS" in
@@ -52,6 +57,11 @@ case "$OS" in
 esac
 export PATH
 
+# wg resolves a peer's Endpoint name when it sets it, and retries a name that doesn't resolve
+# (yet) 15 times by default: for minutes, so the app's call would time out and leave wg running
+# without it. A few tries, then fail. (Not at boot: systemd runs wg-quick there, not this.)
+export WG_ENDPOINT_RESOLUTION_RETRIES=2
+
 # ─── Validation ──────────────────────────────────────────────────────────────
 
 re_name='^[a-zA-Z][a-zA-Z0-9_-]{0,14}$'
@@ -67,6 +77,8 @@ re_dns='^[A-Za-z0-9.:-]+(, ?[A-Za-z0-9.:-]+)*$'
 re_number='^[0-9]{1,5}$'
 # Where the server connects to a peer: host:port, an IPv6 address in brackets
 re_endpoint='^([A-Za-z0-9.-]+|\[[0-9A-Fa-f:]+\]):[0-9]{1,5}$'
+# Where a link's clients connect (its metadata): a host, or host:port
+re_link_endpoint='^([A-Za-z0-9.-]+|\[[0-9A-Fa-f:]+\])(:[0-9]{1,5})?$'
 
 valid_cidr4() {
     [[ $1 =~ $re_cidr4 ]] || return 1
@@ -122,11 +134,17 @@ validate_meta() {
     local line=$1 re='^# ([a-z][a-z0-9_]*) = (.+)$' key value
     [[ $line =~ $re ]] || die "malformed metadata comment: $line"
     key=${BASH_REMATCH[1]} value=${BASH_REMATCH[2]}
+    # A link's own route settings, for its peers' AllowedIPs further down (check_routes)
+    case "$key" in
+        allow_default_route) LINK_DEFAULT_ROUTE=$value ;;
+        allow_own_networks) LINK_OWN_NETWORKS=$value ;;
+    esac
     case "$key" in
         address) valid_cidr4 "$value" ;;
         address6) valid_cidr6 "$value" ;;
         ifout) [[ $value =~ $re_ifname ]] ;;
-        forward | nat | up) valid_bool "$value" ;;
+        endpoint) [[ $value =~ $re_link_endpoint ]] ;;
+        forward | nat | inbound | allow_default_route | allow_own_networks) valid_bool "$value" ;;
         format) [[ $value =~ ^[0-9]{1,3}$ ]] ;;
         dns) [[ $value =~ $re_dns ]] ;;
         keepalive) valid_keepalive "$value" ;;
@@ -143,6 +161,7 @@ valid_peer_name() { [ -n "$1" ] && [ "${#1}" -le 256 ] && [[ $1 != *[[:cntrl:]]*
 # of their own ("# dns = …", "# keepalive = …", "# allowed_ips = …"), checked like the link's.
 validate_conf() {
     local section='' line key value re='^([A-Za-z]+) = (.+)$' disabled='^# ([A-Za-z]+ = .+)$'
+    LINK_DEFAULT_ROUTE=false LINK_OWN_NETWORKS=false
     while IFS= read -r line || [ -n "$line" ]; do
         case "$line" in
             '') continue ;;
@@ -189,7 +208,8 @@ validate_conf() {
             interface:PostUp) [ "$value" = "$(hook up)" ] || die "PostUp must be exactly: $(hook up)" ;;
             interface:PostDown) [ "$value" = "$(hook down)" ] || die "PostDown must be exactly: $(hook down)" ;;
             peer:PublicKey | peer:PresharedKey | disabled:PublicKey | disabled:PresharedKey) [[ $value =~ $re_key ]] ;;
-            peer:AllowedIPs | disabled:AllowedIPs) [[ $value =~ $re_ips ]] ;;
+            # A disabled peer's too: it goes on the interface as it is when it's enabled
+            peer:AllowedIPs | disabled:AllowedIPs) [[ $value =~ $re_ips ]] && check_routes "$value" ;;
             peer:Endpoint | disabled:Endpoint) [[ $value =~ $re_endpoint ]] ;;
             peer:PersistentKeepalive | disabled:PersistentKeepalive) valid_keepalive "$value" ;;
             *) false ;;
@@ -199,7 +219,8 @@ validate_conf() {
     [ -n "$section" ] || die "missing [Interface]"
 }
 
-# A peer for `wg addconf`: [Peer] sections with keys, allowed IPs, and where to connect to it
+# A peer for `wg addconf`: [Peer] sections with keys, allowed IPs, and where to connect to it.
+# Its routes are checked against the settings of the link it goes to (link_settings()).
 validate_peer() {
     local line key value re='^([A-Za-z]+) = (.+)$'
     while IFS= read -r line || [ -n "$line" ]; do
@@ -208,12 +229,144 @@ validate_peer() {
         key=${BASH_REMATCH[1]} value=${BASH_REMATCH[2]}
         case "$key" in
             PublicKey | PresharedKey) [[ $value =~ $re_key ]] ;;
-            AllowedIPs) [[ $value =~ $re_ips ]] ;;
+            AllowedIPs) [[ $value =~ $re_ips ]] && check_routes "$value" ;;
             Endpoint) [[ $value =~ $re_endpoint ]] ;;
             PersistentKeepalive) valid_keepalive "$value" ;;
             *) false ;;
         esac || die "not allowed in a peer: $line"
     done < "$1"
+}
+
+# ─── Route policy ────────────────────────────────────────────────────────────
+#
+# What peers may route is the server's to say first: a default route (/0) sends the server's own
+# traffic to a peer, and a network that holds one of its own addresses or its gateway cuts it off
+# from its network. Both need the server's policy (POLICY_FILE, root's, written by wg:install;
+# missing: neither) and the link's own setting (`# allow_default_route = true`, written by the
+# app). So a compromised web user, who can write link configs, still can't lift the server's.
+
+LINK_DEFAULT_ROUTE=false LINK_OWN_NETWORKS=false
+
+policy_allows() { [ -f "$POLICY_FILE" ] && grep -qx -- "$1=true" "$POLICY_FILE"; }
+
+# Every entry of an AllowedIPs list, against the policy and the current link's settings
+check_routes() {
+    local entry own
+    for entry in $(echo "$1" | tr ',' ' '); do
+        case "$entry" in
+            */0)
+                if [ "$LINK_DEFAULT_ROUTE" != true ] || ! policy_allows allow_default_route; then
+                    die "a peer may not route $entry here, a default route: see allow_default_route (the link's, and wg:install's for the server)"
+                fi
+                ;;
+            *)
+                own_addresses
+                while IFS= read -r own; do
+                    if [ -n "$own" ] && cidr_holds "$entry" "$own"; then
+                        if [ "$LINK_OWN_NETWORKS" != true ] || ! policy_allows allow_own_networks; then
+                            die "a peer may not route $entry here, which holds $own, an address of this server's own: see allow_own_networks (the link's, and wg:install's for the server)"
+                        fi
+                        break
+                    fi
+                done <<< "$OWN"
+                ;;
+        esac
+    done
+}
+
+# The route settings of the link that runs as interface $1, from its config (no config: neither)
+link_settings() {
+    local link conf
+    link=$(link_of_iface "$1")
+    LINK_DEFAULT_ROUTE=false LINK_OWN_NETWORKS=false
+    if [[ $link =~ $re_name ]] && conf=$(conf_file "$link") && [ -f "$conf" ]; then
+        if [ "$(meta "$conf" allow_default_route)" = true ]; then LINK_DEFAULT_ROUTE=true; fi
+        if [ "$(meta "$conf" allow_own_networks)" = true ]; then LINK_OWN_NETWORKS=true; fi
+    fi
+}
+
+# The link of an OS interface: the same name on Linux, the one wg-quick recorded for a utunN on macOS
+link_of_iface() {
+    local file
+    if [ "$OS" != Darwin ]; then echo "$1"; return; fi
+    for file in "$RUN_DIR"/*.name; do
+        if [ -e "$file" ] && [ "$(head -n 1 "$file")" = "$1" ]; then basename "$file" .name; return; fi
+    done
+}
+
+# The server's own addresses (its interfaces') and gateway, one per line: read once, when needed
+OWN='' OWN_READ=false
+own_addresses() {
+    [ "$OWN_READ" = false ] || return 0
+    if [ "$OS" = Darwin ]; then
+        OWN=$(ifconfig -a < /dev/null | sed -n 's/^[[:space:]]*inet6\{0,1\} \([0-9A-Fa-f.:]*\).*/\1/p') || die "can't read this server's addresses"
+        OWN="$OWN"$'\n'$(route -n get default < /dev/null 2> /dev/null | sed -n 's/^[[:space:]]*gateway: \([0-9A-Fa-f.:]*\).*/\1/p' || true)
+    else
+        OWN=$(ip -o address show < /dev/null | sed -n 's/.* inet6\{0,1\} \([0-9A-Fa-f.:]*\)\/.*/\1/p') || die "can't read this server's addresses"
+        OWN="$OWN"$'\n'$(ip route show default < /dev/null 2> /dev/null | sed -n 's/.* via \([0-9A-Fa-f.:]*\).*/\1/p' || true)
+    fi
+    OWN_READ=true
+}
+
+# Whether CIDR $1 (or a bare address) holds address $2. Addresses of different families never do.
+cidr_holds() {
+    local net=${1%/*} bits='' a b
+    case "$1" in */*) bits=${1##*/} ;; esac
+    case "$net" in
+        *:*)
+            # IPv6 (with an IPv4 address at its end, too): only an IPv6 address
+            case "$2" in *:*) ;; *) return 1 ;; esac
+            [[ ${bits:-128} =~ ^[0-9]{1,3}$ ]] && [ "${bits:-128}" -le 128 ] || return 1
+            a=$(ip6_hex "$net") && b=$(ip6_hex "$2") || return 1
+            hex_prefix_equal "$a" "$b" "${bits:-128}"
+            ;;
+        *)
+            case "$2" in *:*) return 1 ;; esac
+            valid_cidr4 "$net/${bits:-32}" && valid_cidr4 "$2/32" || return 1
+            a=$(ip4_int "$net") b=$(ip4_int "$2")
+            [ $(((a ^ b) >> (32 - ${bits:-32}))) -eq 0 ]
+            ;;
+    esac
+}
+
+# shellcheck disable=SC2086 # split on the dots on purpose
+ip4_int() { local IFS=.; set -- $1; echo $((($1 << 24) | ($2 << 16) | ($3 << 8) | $4)); }
+
+# An IPv6 address as 32 hex digits, or a failure for anything else. An IPv4 address at its end
+# (::ffff:192.0.2.1, as inet_ntop writes it) is two groups.
+ip6_hex() {
+    local addr=$1 head tail group out='' n=0 v4
+    case "$addr" in
+        *.*)
+            v4=${addr##*:}
+            valid_cidr4 "$v4/32" || return 1
+            v4=$(ip4_int "$v4")
+            addr="${addr%:*}:$(printf '%x:%x' $((v4 >> 16)) $((v4 & 65535)))"
+            ;;
+    esac
+    case "$addr" in
+        *::*::* | *:::*) return 1 ;;
+        *::*) head=${addr%%::*} tail=${addr#*::} ;;
+        *) head=$addr tail='' ;;
+    esac
+    for group in $(echo "$head $tail" | tr ':' ' '); do
+        [[ $group =~ ^[0-9A-Fa-f]{1,4}$ ]] || return 1
+        n=$((n + 1))
+    done
+    case "$addr" in *::*) [ "$n" -le 7 ] || return 1 ;; *) [ "$n" -eq 8 ] || return 1 ;; esac
+    for group in $(echo "$head" | tr ':' ' '); do out=$out$(printf '%04x' "0x$group"); done
+    while [ "$n" -lt 8 ]; do out=${out}0000; n=$((n + 1)); done
+    for group in $(echo "$tail" | tr ':' ' '); do out=$out$(printf '%04x' "0x$group"); done
+    echo "$out"
+}
+
+# Whether two 32-hex-digit addresses agree in their first $3 bits
+hex_prefix_equal() {
+    local nibbles=$(($3 / 4)) rest=$(($3 % 4)) mask
+    [ "${1:0:$nibbles}" = "${2:0:$nibbles}" ] || return 1
+    [ "$rest" -gt 0 ] || return 0
+    mask=$(((0xF << (4 - rest)) & 0xF))
+    [ $((16#${1:$nibbles:1} & mask)) -eq $((16#${2:$nibbles:1} & mask)) ]
 }
 
 # ─── Files ───────────────────────────────────────────────────────────────────
@@ -259,10 +412,13 @@ firewall_state() {
     conf=$(conf_file "$1")
     [ -f "$conf" ] || die "no config for link $1"
     FORWARD=$(meta "$conf" forward) NAT=$(meta "$conf" nat) IFOUT=$(meta "$conf" ifout) ADDRESS=$(meta "$conf" address)
-    ADDRESS6=$(meta "$conf" address6)
-    if ! valid_bool "${FORWARD:-false}" || ! valid_bool "${NAT:-false}"; then die "invalid forward/nat in $conf"; fi
+    ADDRESS6=$(meta "$conf" address6) INBOUND=$(meta "$conf" inbound)
+    if ! valid_bool "${FORWARD:-false}" || ! valid_bool "${NAT:-false}" || ! valid_bool "${INBOUND:-false}"; then die "invalid forward/nat/inbound in $conf"; fi
     if [ "${NAT:-false}" = true ]; then
         [[ $IFOUT =~ $re_ifname ]] || die "invalid ifout in $conf"
+    fi
+    # The link's subnet and prefix: what NAT masquerades, what macOS lets in replies-only
+    if [ "${NAT:-false}" = true ] || [ "${FORWARD:-false}" = true ]; then
         NETWORK=$(network_of "$ADDRESS")
         if [ -n "$ADDRESS6" ]; then valid_cidr6 "$ADDRESS6" || die "invalid address6 in $conf"; fi
     fi
@@ -274,33 +430,47 @@ firewall_state() {
 iptables_forward() {
     local tool
     for tool in iptables ip6tables; do
-        xtables_forward "$tool" "$@"
+        xtables_forward "$tool" "$@" || return 1
     done
 }
 
 xtables_forward() {
-    local iptables=$1 link=$2 iface=$3 enable=$4 listing rule
+    local iptables=$1 link=$2 iface=$3 enable=$4 inbound=$5 listing rule ours
     command -v "$iptables" > /dev/null 2>&1 || return 0
     listing=$("$iptables" -S FORWARD 2> /dev/null) || return 0
 
     # Remove our previous rules. They're rebuilt from their parts rather than re-using the listed
     # line: iptables -S quotes the comment ("wgla:wg0"), and listing text is never evaluated.
-    local ours="^-A FORWARD -([io]) ([^ ]+) -m comment --comment \"?wgla:$link\"? -j ACCEPT\$"
+    ours=$(xtables_ours "$link")
     while IFS= read -r rule; do
         if [[ $rule =~ $ours ]]; then
-            "$iptables" -D FORWARD "-${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" -m comment --comment "wgla:$link" -j ACCEPT
+            if [ -n "${BASH_REMATCH[3]}" ]; then
+                "$iptables" -D FORWARD "-${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" -m conntrack --ctstate RELATED,ESTABLISHED -m comment --comment "wgla:$link" -j ACCEPT || return 1
+            else
+                "$iptables" -D FORWARD "-${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" -m comment --comment "wgla:$link" -j ACCEPT || return 1
+            fi
         fi
     done <<< "$listing"
 
     [ "$enable" = true ] || return 0
     # Nothing in this table drops forwarded traffic: leave it alone
     [ "$("$iptables" -S FORWARD)" != '-P FORWARD ACCEPT' ] || return 0
-    "$iptables" -I FORWARD 1 -o "$iface" -m comment --comment "wgla:$link" -j ACCEPT
-    "$iptables" -I FORWARD 1 -i "$iface" -m comment --comment "wgla:$link" -j ACCEPT
+    # Into the tunnel only replies to what peers started, unless the link takes connections in
+    if [ "$inbound" = true ]; then
+        "$iptables" -I FORWARD 1 -o "$iface" -m comment --comment "wgla:$link" -j ACCEPT || return 1
+    else
+        "$iptables" -I FORWARD 1 -o "$iface" -m conntrack --ctstate RELATED,ESTABLISHED -m comment --comment "wgla:$link" -j ACCEPT || return 1
+    fi
+    "$iptables" -I FORWARD 1 -i "$iface" -m comment --comment "wgla:$link" -j ACCEPT || return 1
 }
 
+# One of our accepts for a link in an `iptables -S FORWARD` listing: its own comment exactly
+# (wgla:wg1 is not wgla:wg10), with the direction, the interface and the replies-only match as
+# captures
+xtables_ours() { echo "^-A FORWARD -([io]) ([^ ]+)( -m conntrack --ctstate RELATED,ESTABLISHED)? -m comment --comment \"?wgla:$1\"? -j ACCEPT\$"; }
+
 firewall_up_linux() {
-    local link=$1 iface=$2 table="wg_$1" nat6
+    local link=$1 iface=$2 table="wg_$1" nat6 into rule
     {
         # Creating then deleting makes the replace atomic and work whether or not it exists
         echo "table inet $table"
@@ -308,7 +478,9 @@ firewall_up_linux() {
         if [ "${FORWARD:-false}" = true ] || [ "${NAT:-false}" = true ]; then
             echo "table inet $table {"
             if [ "${FORWARD:-false}" = true ]; then
-                echo "    chain forward { type filter hook forward priority 0; iifname \"$iface\" accept; oifname \"$iface\" accept; }"
+                into=''
+                while IFS= read -r rule; do into="$into$rule; "; done <<< "$(forward_in "$iface")"
+                echo "    chain forward { type filter hook forward priority 0; iifname \"$iface\" accept; $into}"
             fi
             if [ "${NAT:-false}" = true ]; then
                 nat6=''
@@ -317,13 +489,27 @@ firewall_up_linux() {
             fi
             echo "}"
         fi
-    } | nft -f -
-    iptables_forward "$link" "$iface" "${FORWARD:-false}"
+    } | nft -f - || return 1
+    # (Explicit returns: firewall-repair runs this where `set -e` doesn't apply)
+    iptables_forward "$link" "$iface" "${FORWARD:-false}" "${INBOUND:-false}"
+}
+
+# The nft rules for traffic into the tunnel, one per line as `nft list` prints them: only replies
+# to what peers started, the rest dropped (the chain's policy accepts: without the drop, nothing
+# would be refused), unless the link takes connections that start outside (`inbound`,
+# site-to-site). Peers' own traffic comes in on the interface and is accepted before these.
+forward_in() {
+    if [ "${INBOUND:-false}" = true ]; then
+        echo "oifname \"$1\" accept"
+    else
+        echo "oifname \"$1\" ct state established,related accept"
+        echo "oifname \"$1\" drop"
+    fi
 }
 
 firewall_down_linux() {
     nft delete table inet "wg_$1" 2> /dev/null || true
-    iptables_forward "$1" '' false
+    iptables_forward "$1" '' false false
 }
 
 firewall_up_darwin() {
@@ -334,49 +520,121 @@ firewall_up_darwin() {
         if [ -n "$ADDRESS6" ]; then rules="${rules}nat on $IFOUT inet6 from $ADDRESS6 to any -> ($IFOUT)"$'\n'; fi
     fi
     if [ "${FORWARD:-false}" = true ]; then
-        rules="${rules}pass in on $iface all"$'\n'"pass out on $iface all"$'\n'
+        rules="${rules}pass in on $iface all"$'\n'
+        if [ "${INBOUND:-false}" = true ]; then
+            rules="${rules}pass out on $iface all"$'\n'
+        else
+            rules="$rules$(pf_replies_only "$link" "$iface")"$'\n'
+        fi
     fi
 
     if [ -z "$rules" ]; then
         firewall_down_darwin "$link"
         return
     fi
-    printf '%s' "$rules" | pfctl -a "wg/$link" -f -
+    printf '%s' "$rules" | pfctl -a "wg/$link" -f - || return 1
     pfctl -e > /dev/null 2>&1 || true
 }
 
 firewall_down_darwin() { pfctl -a "wg/$1" -F all > /dev/null 2>&1 || true; }
 
+# Only replies into the tunnel on macOS, one rule per line as pfctl prints them. What comes in
+# elsewhere for the link's addresses is tagged, without state, so pf looks at it again on its way
+# out, where it is dropped. Replies to what peers started match the state `pass in on <utun>` made,
+# which pf checks before any rule. The server's own traffic to peers never came in: not tagged.
+# $3 = listed: as globs for `pfctl -s rules`, which prints the prefix with its host bits masked.
+pf_replies_only() {
+    local tag="wgla_in_$1" iface=$2 prefix=$ADDRESS6
+    if [ "${3:-}" = listed ]; then prefix="*:*/${ADDRESS6#*/}"; fi
+    echo "pass in on ! $iface inet from any to $NETWORK no state tag $tag"
+    if [ -n "$ADDRESS6" ]; then echo "pass in on ! $iface inet6 from any to $prefix no state tag $tag"; fi
+    echo "block drop out on $iface all tagged $tag"
+}
+
 firewall_up() { if [ "$OS" = Darwin ]; then firewall_up_darwin "$@"; else firewall_up_linux "$@"; fi; }
 
-# Whether the rules firewall-up installs are (still) there. Another tool can take them away:
-# `nft -f` of a ruleset that starts with "flush ruleset", a firewall restart.
+# Whether the rules firewall-up installs are there, as the link's config asks for them now: NAT for
+# its subnet (and prefix) out of its current ifout, forwarding into the tunnel replies-only or not.
+# Another tool can take them away (`nft -f` of a ruleset that starts with "flush ruleset", a
+# firewall restart). Each rule is matched as a whole line of the listing, as the tool prints it.
 firewall_present() {
-    local link=$1 iface=$2 table
+    local link=$1 iface=$2 rules rule
     if [ "${FORWARD:-false}" != true ] && [ "${NAT:-false}" != true ]; then return 0; fi
 
     if [ "$OS" = Darwin ]; then
-        if [ "${NAT:-false}" = true ] && [ -z "$(pfctl -a "wg/$link" -s nat 2> /dev/null)" ]; then return 1; fi
-        if [ "${FORWARD:-false}" = true ] && [ -z "$(pfctl -a "wg/$link" -s rules 2> /dev/null)" ]; then return 1; fi
+        if [ "${NAT:-false}" = true ]; then
+            rules=$(pfctl -a "wg/$link" -s nat 2> /dev/null) || return 1
+            has_line "$rules" "nat on $IFOUT inet from $NETWORK to any *" || return 1
+            if [ -n "$ADDRESS6" ]; then has_line "$rules" "nat on $IFOUT inet6 from *:* to any *" || return 1; fi
+        fi
+        if [ "${FORWARD:-false}" = true ]; then
+            rules=$(pfctl -a "wg/$link" -s rules 2> /dev/null) || return 1
+            has_line "$rules" "pass in on $iface all*" || return 1
+            if [ "${INBOUND:-false}" = true ]; then
+                has_line "$rules" "pass out on $iface all*" || return 1
+            else
+                has_line "$rules" "pass out on $iface all*" && return 1
+                while IFS= read -r rule; do
+                    has_line "$rules" "$rule" || return 1
+                done <<< "$(pf_replies_only "$link" "$iface" listed)"
+            fi
+        fi
         return 0
     fi
 
-    table=$(nft list table inet "wg_$link" 2> /dev/null) || return 1
-    if [ "${NAT:-false}" = true ] && [[ $table != *masquerade* ]]; then return 1; fi
+    rules=$(nft list table inet "wg_$link" 2> /dev/null) || return 1
+    if [ "${NAT:-false}" = true ]; then
+        has_line "$rules" "ip saddr $NETWORK oifname \"$IFOUT\" masquerade" || return 1
+        # nft prints the prefix with the host bits masked: only its length is known here
+        if [ -n "$ADDRESS6" ]; then has_line "$rules" "ip6 saddr *:*/${ADDRESS6#*/} oifname \"$IFOUT\" masquerade" || return 1; fi
+    fi
     if [ "${FORWARD:-false}" = true ]; then
-        [[ $table == *"iifname \"$iface\" accept"* ]] || return 1
+        has_line "$rules" "iifname \"$iface\" accept" || return 1
+        while IFS= read -r rule; do has_line "$rules" "$rule" || return 1; done <<< "$(forward_in "$iface")"
         # And, where iptables drops forwarded traffic, our accepts there
-        xtables_present iptables "$link" || return 1
-        xtables_present ip6tables "$link" || return 1
+        xtables_present iptables "$link" "$iface" || return 1
+        xtables_present ip6tables "$link" "$iface" || return 1
     fi
 }
 
+# Whether a line of $1 (leading whitespace aside) matches the glob $2. The globs above are built
+# from validated values only: addresses, interface names, digits.
+has_line() {
+    local line
+    while IFS= read -r line; do
+        line=${line#"${line%%[![:space:]]*}"}
+        # shellcheck disable=SC2053 # $2 is a glob on purpose
+        if [[ $line == $2 ]]; then return 0; fi
+    done <<< "$1"
+    return 1
+}
+
+# Our two accepts for a link's interface, each as firewall-up adds them now (replies-only or not)
 xtables_present() {
-    local iptables=$1 link=$2 listing
+    local iptables=$1 link=$2 iface=$3 listing rule ours in=0 out=0
     command -v "$iptables" > /dev/null 2>&1 || return 0
     listing=$("$iptables" -S FORWARD 2> /dev/null) || return 0
     [ "$listing" != '-P FORWARD ACCEPT' ] || return 0
-    [ "$(grep -c -- "wgla:$link" <<< "$listing")" -ge 2 ]
+    ours=$(xtables_ours "$link")
+    while IFS= read -r rule; do
+        if [[ $rule =~ $ours ]] && [ "${BASH_REMATCH[2]}" = "$iface" ]; then
+            case "${BASH_REMATCH[1]}:${BASH_REMATCH[3]:+replies}:${INBOUND:-false}" in
+                i::*) in=1 ;;
+                o::true | o:replies:false) out=1 ;;
+            esac
+        fi
+    done <<< "$listing"
+    [ "$in" = 1 ] && [ "$out" = 1 ]
+}
+
+# One firewall change at a time. The repair timer reads a link's config and rules and acts on
+# what it read: that must not interleave with firewall-up/-down from the app or a hook, or it
+# could put back the rules of a link that was just stopped or had forwarding turned off. In
+# $CONF_DIR, which only root can write. macOS has no flock(1), and no repair timer either.
+firewall_lock() {
+    command -v flock > /dev/null 2>&1 && [ -d "$CONF_DIR" ] || return 0
+    exec 9>> "$CONF_DIR/.wgla-firewall.lock"
+    flock -w 30 9 || die "another firewall change is still running"
 }
 
 # Only for the link's own interface: forward accepts for any other one (eth0, docker0) would
@@ -399,6 +657,13 @@ case "$command" in
     version)
         echo "$VERSION"
         ;;
+    policy)
+        # What this server lets links allow their peers to route (see "Route policy" above)
+        args 0 $# "$command"
+        for key in allow_default_route allow_own_networks; do
+            if policy_allows "$key"; then echo "$key=true"; else echo "$key=false"; fi
+        done
+        ;;
 
     # Runtime state (wg)
     interfaces)
@@ -413,11 +678,22 @@ case "$command" in
         args 1 $# "$command"; iface_arg "$1"
         TMP=$(mktemp "${TMPDIR:-/tmp}/wgla.XXXXXX")
         read_input "$TMP"
+        link_settings "$1"
         validate_peer "$TMP"
         # Through a pipe, like wg-quick does: Ubuntu's AppArmor profile for wg only lets it open
         # files under /etc/wireguard, so it can't read a temp file in /tmp
         # shellcheck disable=SC2002
         cat "$TMP" | wg addconf "$1" /dev/stdin
+        ;;
+    link-key)
+        # A running link's new private key, on stdin (never on a command line), applied live
+        args 1 $# "$command"; iface_arg "$1"
+        TMP=$(mktemp "${TMPDIR:-/tmp}/wgla.XXXXXX")
+        read_input "$TMP"
+        key=$(tr -d '\n' < "$TMP")
+        [[ $key =~ $re_key ]] || die "invalid private key"
+        # Through a pipe, as for peer-add: AppArmor lets wg open files under /etc/wireguard only
+        printf '%s\n' "$key" | wg set "$1" private-key /dev/stdin
         ;;
     peer-remove)
         args 2 $# "$command"; iface_arg "$1"; key_arg "$2"
@@ -425,6 +701,8 @@ case "$command" in
         ;;
     peer-ips)
         args 3 $# "$command"; iface_arg "$1"; key_arg "$2"; ips_arg "$3"
+        link_settings "$1"
+        check_routes "$3"
         # wg takes the list without spaces ("10.0.0.2/32,fd12::2/128")
         wg set "$1" peer "$2" allowed-ips "${3// /}"
         ;;
@@ -503,6 +781,7 @@ case "$command" in
     # Firewall (also called by the PostUp/PostDown hooks)
     firewall-up)
         args 2 $# "$command"; name_arg "$1"; iface_arg "$2"; own_iface_arg "$1" "$2"
+        firewall_lock
         firewall_state "$1"
         firewall_up "$1" "$2"
         ;;
@@ -516,29 +795,31 @@ case "$command" in
         # Every running link that lost its rules gets them back. For the timer wg:install sets
         # up (as root, every minute); a link whose config can't be read doesn't stop the others.
         args 0 $# "$command"
+        # Locked before it looks: what is running and what the configs ask for is read under the
+        # lock, so a link stopped (or changed) meanwhile gets its firewall-down after this
+        firewall_lock
         running=$(wg show interfaces 2> /dev/null) || running=''
         for iface in $running; do
-            link=$iface
-            if [ "$OS" = Darwin ]; then
-                link=''
-                for file in "$RUN_DIR"/*.name; do
-                    if [ -e "$file" ] && [ "$(head -n 1 "$file")" = "$iface" ]; then link=$(basename "$file" .name); fi
-                done
-            fi
+            link=$(link_of_iface "$iface")
             if [[ $link =~ $re_name ]] && [ -f "$(conf_file "$link")" ]; then
-                (
+                # In a subshell, which exits on die. `set -e` doesn't apply in a condition, so every
+                # failure is an explicit exit, and the success line only follows a success.
+                # <4>/<3>: a warning/an error in the journal, where the timer's every run is not
+                # worth a line.
+                if ! (
                     firewall_state "$link"
-                    if ! firewall_present "$link" "$iface"; then
-                        firewall_up "$link" "$iface"
-                        # <4>: a warning in the journal, where the timer's every run is not worth a line
-                        echo "<4>wgla-helper: link $link had lost its firewall rules; they are back"
-                    fi
-                ) || true
+                    if firewall_present "$link" "$iface"; then exit 0; fi
+                    firewall_up "$link" "$iface" || exit 1
+                    echo "<4>wgla-helper: link $link had lost its firewall rules; they are back"
+                ); then
+                    echo "<3>wgla-helper: link $link is missing its firewall rules, and they could not be put back"
+                fi
             fi
         done
         ;;
     firewall-down)
         args 1 $# "$command"; name_arg "$1"
+        firewall_lock
         if [ "$OS" = Darwin ]; then firewall_down_darwin "$1"; else firewall_down_linux "$1"; fi
         ;;
 

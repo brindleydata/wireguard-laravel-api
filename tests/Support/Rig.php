@@ -41,11 +41,13 @@ final class Rig
         mkdir($this->tmp, 0700, true);
         self::$dirs[] = $this->tmp;
 
-        $config = array_merge(require dirname(__DIR__, 2).'/config/wireguard.php', ['hostname' => $hostname]);
+        $config = require dirname(__DIR__, 2).'/config/wireguard.php';
 
         $this->shell = new FakeShell;
         $driver = $os === 'mac' ? new MacDriver($this->shell, $config['helper']) : new LinuxDriver($this->shell, $config['helper']);
         $this->host = new FakeHost($os, $this->shell);
+        // A new link's endpoint is detected as this name
+        $this->host->hostname = $hostname;
 
         $this->wg = new WireGuard(
             config: $config,

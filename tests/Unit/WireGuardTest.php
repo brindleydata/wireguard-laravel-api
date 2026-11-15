@@ -5,12 +5,7 @@ use App\Exceptions\CommandFailedException;
 use App\Exceptions\ConflictException;
 use App\Exceptions\NotFoundException;
 use App\Exceptions\SystemException;
-use App\Services\ConfigBuilder;
-use App\Services\IpAllocator;
 use App\Services\KeyManager;
-use App\Services\Os\LinuxDriver;
-use App\Services\WireGuard;
-use App\Validation\WireGuardValidator;
 use Tests\Fakes\CommandFailed;
 use Tests\Support\Rig;
 
@@ -305,7 +300,7 @@ it('shows a hand-written config but refuses to change it', function (string $os,
 
     // Regenerating it would drop the routing table setting, the hook, the comment and the keepalive
     expect(fn () => $change($rig->wg, $key[1]))
-        ->toThrow(ConflictException::class, "Link office has settings this app doesn't manage (Table, PostUp, comments, PersistentKeepalive), and a change made here would drop them.");
+        ->toThrow(ConflictException::class, "Link office has settings this app doesn't manage (Table, PostUp, comments, PersistentKeepalive): a change made here would drop them, or break the link.");
 
     $link = $rig->wg->getLink('office');
     expect($rig->host->conf('office'))->toBe($conf)
@@ -320,6 +315,17 @@ it('shows a hand-written config but refuses to change it', function (string $os,
     'a peer change' => [fn ($wg, string $key) => $wg->updatePeer('office', $key, ['name' => 'branch'])],
     'removing a peer' => [fn ($wg, string $key) => $wg->removePeer('office', $key)],
 ]);
+
+it('refuses to change a hand-written config without what the app needs', function (string $key) {
+    // Without a ListenPort wg-quick picks a port at each start: the app would write port 0
+    $rig = new Rig('linux');
+    $rig->wg->createLink('wg0', '10.0.0.1/24', 51820, up: false);
+    $rig->host->confs['wg0'] = preg_replace("/^{$key} = .*\\n/m", '', $rig->host->conf('wg0'));
+    $conf = $rig->host->conf('wg0');
+
+    expect(fn () => $rig->wg->addPeer('wg0'))->toThrow(ConflictException::class, "Link wg0 has settings this app doesn't manage (no {$key})")
+        ->and($rig->host->conf('wg0'))->toBe($conf);
+})->with(['ListenPort', 'PrivateKey', 'Address']);
 
 it('refuses to change a running hand-written link before touching the interface', function () {
     $rig = new Rig('linux');
@@ -525,27 +531,6 @@ it('says so when a link that did not start could not be removed again', function
         ->and($rig->wg->listLinks())->toBe(['wg0'])
         ->and($rig->host->interfaceOf('wg0'))->toBeNull();
 });
-
-it('leaves out the up line older versions wrote, and manages their configs as before', function (string $os, bool $up) {
-    $rig = new Rig($os);
-    $rig->wg->createLink('wg0', '10.0.0.1/24', 51820, forward: true, up: $up);
-    $peer = $rig->wg->addPeer('wg0', name: 'laptop');
-
-    // Whether a link runs is the host's to say: the app wrote this line once and never read it
-    expect($rig->host->conf('wg0'))->not->toContain('# up');
-    $old = $rig->host->confs['wg0'] = str_replace('# format = ', '# up = '.($up ? 'true' : 'false')."\n# format = ", $rig->host->conf('wg0'));
-    expect($old)->toContain("# nat = false\n# up = ");
-
-    // A change it can't make keeps the config as it was, line and all
-    $rig->host->failNextStart = true;
-    expect(fn () => $rig->wg->updateLink('wg0', ['port' => 51999, 'up' => true]))->toThrow(SystemException::class, 'was undone')
-        ->and($rig->host->conf('wg0'))->toBe($old);
-
-    $rig->wg->updatePeer('wg0', $peer->public_key, ['name' => 'phone']);
-
-    expect($rig->host->conf('wg0'))->not->toContain('# up')->toContain('# name = phone', "# nat = false\n# format = 2\n")
-        ->and($rig->wg->getLink('wg0')->up)->toBe($up);
-})->with('os')->with(['running' => [true], 'stopped' => [false]]);
 
 it('hands configs and peers to the helper on stdin and keeps locks in the shared directory', function (string $os) {
     $rig = new Rig($os);
@@ -1031,37 +1016,6 @@ it('follows the link when a peer happens to have had the same value', function (
         ->and($rig->host->conf('wg0'))->not->toContain('# dns');
 });
 
-it('records once what the peers of an older config had of their own', function (string $os, bool $up) {
-    $rig = new Rig($os);
-    $rig->wg->createLink('wg0', '10.0.0.1/24', 51820, dns: '9.9.9.9', up: $up);
-    $plain = $rig->wg->addPeer('wg0');
-    $custom = $rig->wg->addPeer('wg0');
-    $rig->wg->updatePeer('wg0', $custom->public_key, ['dns' => '1.1.1.1', 'allowed_ips' => '10.0.0.0/24']);
-    // As an older version left it: the peer's own values only in its client config, stored whole
-    $rig->host->confs['wg0'] = asFormat1($rig->host->conf('wg0'), $rig->host, 'wg0', [
-        $plain->public_key => $rig->wg->getPeerConfig('wg0', $plain->public_key),
-        $custom->public_key => $rig->wg->getPeerConfig('wg0', $custom->public_key),
-    ]);
-    expect($rig->host->conf('wg0'))->not->toContain('# format')->not->toContain('1.1.1.1');
-
-    // Readable as it is, and the first change brings it up to date
-    expect($rig->wg->getLink('wg0')->peers[1]->clientSettings())->toBe(['dns' => null, 'keepalive' => null, 'allowed_ips' => null]);
-    $rig->wg->updateLink('wg0', ['dns' => '8.8.4.4']);
-
-    expect($rig->host->conf('wg0'))->toContain("# format = 2\n", "# dns = 1.1.1.1\n# allowed_ips = 10.0.0.0/24\nPublicKey = {$custom->public_key}\n")
-        ->and($rig->wg->getLink('wg0')->peers[0]->clientSettings())->toBe(['dns' => null, 'keepalive' => null, 'allowed_ips' => null])
-        ->and($rig->wg->getPeerConfig('wg0', $plain->public_key))->toContain("DNS = 8.8.4.4\n")
-        ->and($rig->wg->getPeerConfig('wg0', $custom->public_key))->toContain("DNS = 1.1.1.1\n", "AllowedIPs = 10.0.0.0/24\n");
-
-    // Nothing is read out of a stored file again but the key: not even one edited by hand
-    $safe = KeyManager::pubkeyToSafe($plain->public_key);
-    $rig->host->clients["wg0/{$safe}"] = str_replace('DNS = 9.9.9.9', 'DNS = 4.4.4.4', $rig->host->clients["wg0/{$safe}"]);
-    $rig->wg->updateLink('wg0', ['keepalive' => 30]);
-
-    expect($rig->wg->getPeerConfig('wg0', $plain->public_key))->toContain("DNS = 8.8.4.4\n")
-        ->and($rig->wg->getLink('wg0')->peers[0]->dns)->toBeNull();
-})->with('os')->with(['running' => true, 'stopped' => false]);
-
 // ─── Moving a link, and other leftovers ─────────────────────────────
 
 it('moves a link to another subnet with its peers, when told to', function (string $os, bool $up) {
@@ -1193,17 +1147,39 @@ it('stores only a peer\'s private key and builds its client config when asked', 
         ->toContain("PrivateKey = {$peer->private_key}\n", "Address = 10.0.0.2/32, fd12::2/128\n", "DNS = 1.1.1.1\n", 'Endpoint = vpn.example.test:51821');
 })->with('os');
 
-it('builds a client config for what this server is called now', function () {
+it('keeps where a link\'s clients connect: detected once, then as told', function () {
     $rig = new Rig('linux'); // vpn.example.test
-    $rig->wg->createLink('wg0', '10.0.0.1/24', 51820);
+    $link = $rig->wg->createLink('wg0', '10.0.0.1/24', 51820);
     $peer = $rig->wg->addPeer('wg0');
+    $endpoint = fn () => preg_match('/^Endpoint = (.+)$/m', $rig->wg->getPeerConfig('wg0', $peer->public_key), $m) ? $m[1] : null;
 
-    // The same host after WIREGUARD_HOSTNAME changed: nothing was stored that could be stale
-    $config = array_merge(require dirname(__DIR__, 2).'/config/wireguard.php', ['hostname' => 'new.example.test']);
-    $driver = new LinuxDriver($rig->shell, $config['helper']);
-    $renamed = new WireGuard($config, $driver, new WireGuardValidator, new KeyManager, new ConfigBuilder($config, $driver), new IpAllocator, "{$rig->tmp}/locks");
+    expect($link->endpoint)->toBe('vpn.example.test')
+        ->and($rig->host->conf('wg0'))->toContain("# endpoint = vpn.example.test\n")
+        ->and($endpoint())->toBe('vpn.example.test:51820');
 
-    expect($renamed->getPeerConfig('wg0', $peer->public_key))->toContain('Endpoint = new.example.test:51820', "PrivateKey = {$peer->private_key}\n");
+    // The machine renamed: a client config doesn't point elsewhere behind its back
+    $rig->host->hostname = 'new.example.test';
+    expect($endpoint())->toBe('vpn.example.test:51820');
+
+    // Told: a host takes the link's port; host:port where a router forwards another one, which
+    // stays when the link's own port changes
+    expect($rig->wg->updateLink('wg0', ['endpoint' => 'vpn.example.org'])->endpoint)->toBe('vpn.example.org')
+        ->and($endpoint())->toBe('vpn.example.org:51820');
+    $rig->wg->updateLink('wg0', ['endpoint' => 'vpn.example.org:443']);
+    $rig->wg->updateLink('wg0', ['port' => 51821]);
+    expect($endpoint())->toBe('vpn.example.org:443');
+
+    // Empty: detected anew. Given at creation: kept as given
+    $rig->wg->updateLink('wg0', ['endpoint' => null]);
+    expect($endpoint())->toBe('new.example.test:51821')
+        ->and($rig->wg->createLink('wg1', '10.1.0.1/24', 51822, endpoint: '2001:DB8::7')->endpoint)->toBe('[2001:db8::7]')
+        ->and(fn () => $rig->wg->updateLink('wg1', ['endpoint' => 'vpn.example.org:']))->toThrow(InvalidArgumentException::class, 'Invalid endpoint');
+
+    // A link written before endpoints were stored with it: detected whenever a config is built
+    $rig->host->confs['wg0'] = preg_replace('/^# endpoint = .*\n/m', '', $rig->host->conf('wg0'));
+    $rig->host->hostname = 'third.example.test';
+    expect($rig->wg->getLink('wg0')->endpoint)->toBeNull()
+        ->and($endpoint())->toBe('new.example.test:51821', 'Detected once per process');
 });
 
 it('changes and shows a peer whose private key is not stored here', function () {
@@ -1214,8 +1190,11 @@ it('changes and shows a peer whose private key is not stored here', function () 
 
     $updated = $rig->wg->updatePeer('wg0', $peer->public_key, ['name' => 'someone', 'enabled' => false]);
 
-    expect($updated)->name->toBe('someone')->enabled->toBeFalse()->client_config->toBeNull()
-        ->and($rig->wg->getPeerConfig('wg0', $peer->public_key))->toBeNull('There is no config without its key')
+    // Its config comes without the PrivateKey line: the device adds its own. No QR code of that
+    expect($updated)->name->toBe('someone')->enabled->toBeFalse()
+        ->and($updated->client_config)->toContain("PublicKey = {$rig->wg->getLink('wg0')->public_key}\n")->not->toContain('PrivateKey')
+        ->and($rig->wg->getPeerConfig('wg0', $peer->public_key))->toBe($updated->client_config)
+        ->and(fn () => $rig->wg->getPeerConfig('wg0', $peer->public_key, with_key: true))->toThrow(InvalidArgumentException::class, "isn't stored here")
         ->and($rig->wg->getPeer('wg0', KeyManager::pubkeyToSafe($peer->public_key))->name)->toBe('someone')
         ->and($rig->wg->getPeer('wg0', 'not-a-key'))->toBeNull()
         ->and($rig->wg->getPeer('nope', $peer->public_key))->toBeNull();
@@ -1258,6 +1237,39 @@ it('gives a link an MTU, for its interface and its clients', function (string $o
         ->and($rig->wg->getLink('wg0')->toArray()['client'])->toBe(['dns' => '9.9.9.9', 'keepalive' => 20, 'allowed_ips' => null]);
 })->with('os');
 
+it('keeps the MTU of a config that writes it without spaces', function () {
+    // `MTU=1400` reads like the app's own `MTU = 1400`: managed, so a change must keep it
+    $rig = new Rig('linux');
+    $rig->wg->createLink('wg0', '10.0.0.1/24', 51820, up: false, mtu: 1400);
+    $rig->host->confs['wg0'] = str_replace('MTU = 1400', 'MTU=1400', $rig->host->confs['wg0']);
+
+    expect($rig->wg->updateLink('wg0', ['dns' => '1.1.1.1'])->mtu)->toBe(1400)
+        ->and($rig->host->conf('wg0'))->toContain("MTU = 1400\n");
+});
+
+it('takes what a link has already as no change: no restart, no new IPv6 prefix', function (string $os) {
+    $rig = new Rig($os);
+    $link = $rig->wg->createLink('wg0', '10.0.0.1/24', 51820, address6: 'auto', mtu: 1400);
+    $peer = $rig->wg->addPeer('wg0');
+    $restarts = fn () => count($rig->shell->callsTo('sudo -n :helper down :name'));
+    $before = $restarts();
+
+    // What a client that always sends the whole state sends, mask or not
+    foreach ([['port' => 51820, 'address' => '10.0.0.1/24', 'address6' => 'auto', 'mtu' => 1400, 'up' => true], ['address' => '10.0.0.1', 'move_peers' => true]] as $params) {
+        $same = $rig->wg->updateLink('wg0', $params);
+        expect($same)->address6->toBe($link->address6)->listen_port->toBe(51820)->address->toBe('10.0.0.1/24');
+    }
+
+    expect($restarts())->toBe($before)
+        ->and($rig->wg->getPeer('wg0', $peer->public_key)->allowed_ips)->toBe($peer->allowed_ips);
+
+    // A link without IPv6 still gets a prefix from `auto`; the real changes still restart
+    $rig->wg->updateLink('wg0', ['address6' => null]);
+    expect($rig->wg->updateLink('wg0', ['address6' => 'auto'])->address6)->not->toBeNull()->not->toBe($link->address6)
+        ->and($rig->wg->updateLink('wg0', ['port' => 51821])->listen_port)->toBe(51821)
+        ->and($restarts())->toBe($before + 3);
+})->with('os');
+
 it('refuses an MTU the link could not use', function () {
     $rig = new Rig('linux');
     $rig->wg->createLink('wg0', '10.0.0.1/24', 51820, mtu: 1000);
@@ -1288,15 +1300,24 @@ it('connects to a peer itself when the peer has a remote', function (string $os,
         expect($added()[0])->toContain("AllowedIPs = 10.0.0.2/32\nEndpoint = branch.example.com:51820\nPersistentKeepalive = 25\n");
     }
 
-    // Somewhere else: `wg` can't take an endpoint away again, so the peer is put on the interface anew
+    // Somewhere else: set on the peer where it is, without taking it off the interface
     $before = $removed();
     $moved = $rig->wg->updatePeer('wg0', $branch->public_key, ['remote' => '[2001:DB8::7]:51821']);
     expect($moved->remote)->toBe('[2001:db8::7]:51821')
         ->and($rig->wg->getLink('wg0')->peers[0]->remote)->toBe('[2001:db8::7]:51821');
     if ($up) {
-        expect($removed())->toBe($before + 1)->and(array_last($added()))->toContain("Endpoint = [2001:db8::7]:51821\n")
+        expect($removed())->toBe($before)->and(array_last($added()))->toContain("Endpoint = [2001:db8::7]:51821\n")
             ->and($rig->host->runtimePeers('wg0'))->toHaveKey($branch->public_key);
     }
+
+    // `wg` can't take an endpoint away again: the peer is put on the interface anew, without it
+    $rig->wg->updatePeer('wg0', $branch->public_key, ['remote' => null]);
+    expect($rig->host->conf('wg0'))->not->toContain('Endpoint');
+    if ($up) {
+        expect($removed())->toBe($before + 1)->and(array_last($added()))->not->toContain('Endpoint')
+            ->and($rig->host->runtimePeers('wg0'))->toHaveKey($branch->public_key);
+    }
+    $rig->wg->updatePeer('wg0', $branch->public_key, ['remote' => '[2001:DB8::7]:51821']);
 
     // Kept while disabled and through a restart; gone when taken out
     $rig->wg->updatePeer('wg0', $branch->public_key, ['enabled' => false]);
@@ -1361,6 +1382,261 @@ it('gives a peer new keys and keeps everything else about it', function (string 
         expect($rig->host->runtimePeers('wg0'))->not->toHaveKey($again->public_key);
     }
 })->with('os')->with(['running' => true, 'stopped' => false]);
+
+// ─── A peer change the host doesn't take ────────────────────────────
+
+it('stores a new peer\'s private key before the peer is anywhere', function (string $os, bool $up) {
+    $rig = new Rig($os);
+    $rig->wg->createLink('wg0', '10.0.0.1/24', 51820, up: $up);
+    $from = count($rig->shell->calls);
+
+    $rig->wg->addPeer('wg0');
+
+    $writes = ['sudo -n :helper client-write :link :key', 'sudo -n :helper conf-write :name', 'sudo -n :helper peer-add :iface'];
+    $order = array_values(array_intersect(array_column(array_slice($rig->shell->calls, $from), 'command'), $writes));
+    expect($order)->toBe($up ? $writes : array_slice($writes, 0, 2));
+
+    // A key that can't be stored: no peer either, so none is ever there without its key
+    $rig->shell->failOnce('sudo -n :helper client-write :link :key', message: 'No space left on device');
+    expect(fn () => $rig->wg->addPeer('wg0'))->toThrow(CommandFailedException::class, 'No space left on device')
+        ->and($rig->wg->getLink('wg0')->peers)->toHaveCount(1)
+        ->and($rig->host->confPeers('wg0'))->toHaveCount(1);
+})->with('os')->with(['running' => true, 'stopped' => false]);
+
+it('adds no peer when the interface does not take it, and keeps no key for it', function (string $os) {
+    $rig = new Rig($os);
+    $rig->wg->createLink('wg0', '10.0.0.1/24', 51820);
+    $conf = $rig->host->conf('wg0');
+
+    // wg resolves a remote when it sets it
+    $rig->shell->failOnce('sudo -n :helper peer-add :iface', message: 'Name or service not known');
+    expect(fn () => $rig->wg->addPeer('wg0', remote: 'nowhere.example.com:51820'))->toThrow(SystemException::class, 'was undone: Name or service not known');
+
+    expect($rig->host->conf('wg0'))->toBe($conf)
+        ->and($rig->host->runtimePeers('wg0'))->toBe([])
+        ->and($rig->host->clients)->toBe([]);
+    expect($rig->wg->addPeer('wg0')->allowed_ips)->toBe('10.0.0.2/32', 'Its address was never taken');
+})->with('os');
+
+it('keeps a peer as it was when its new remote does not resolve', function (string $os) {
+    $rig = new Rig($os);
+    $rig->wg->createLink('wg0', '10.0.0.1/24', 51820);
+    $branch = $rig->wg->addPeer('wg0', name: 'branch', remote: 'a.example.com:51820');
+    $conf = $rig->host->conf('wg0');
+
+    // A new address too: that one is set first, and set back
+    $rig->shell->failOnce('sudo -n :helper peer-add :iface', fn (array $b, ?string $input) => str_contains((string) $input, 'b.example.com'), 'Name or service not known');
+    expect(fn () => $rig->wg->updatePeer('wg0', $branch->public_key, ['remote' => 'b.example.com:51820', 'ip' => '10.0.0.9']))
+        ->toThrow(SystemException::class, 'was undone: Name or service not known');
+
+    expect($rig->host->conf('wg0'))->toBe($conf)
+        ->and($rig->host->runtimePeers('wg0'))->toBe([$branch->public_key => '10.0.0.2/32']);
+
+    // The next change, which rewrites the config from the live peers, still has it
+    $rig->wg->addPeer('wg0', name: 'other');
+    expect($rig->wg->getPeer('wg0', $branch->public_key))->name->toBe('branch')->remote->toBe('a.example.com:51820')->allowed_ips->toBe('10.0.0.2/32')
+        ->and($rig->wg->getPeerConfig('wg0', $branch->public_key))->toBe($branch->client_config);
+})->with('os');
+
+it('puts a peer back on the interface when taking its remote away fails', function (string $os) {
+    $rig = new Rig($os);
+    $rig->wg->createLink('wg0', '10.0.0.1/24', 51820);
+    $branch = $rig->wg->addPeer('wg0', name: 'branch', remote: 'a.example.com:51820');
+    $conf = $rig->host->conf('wg0');
+
+    // Off the interface, then on again without its endpoint: that last step fails
+    $rig->shell->failOnce('sudo -n :helper peer-add :iface', fn (array $b, ?string $input) => ! str_contains((string) $input, 'Endpoint'));
+    expect(fn () => $rig->wg->updatePeer('wg0', $branch->public_key, ['remote' => null]))->toThrow(SystemException::class, 'was undone');
+
+    expect($rig->host->conf('wg0'))->toBe($conf)
+        ->and($rig->host->runtimePeers('wg0'))->toBe([$branch->public_key => '10.0.0.2/32'])
+        ->and(array_last(array_column($rig->shell->callsTo('sudo -n :helper peer-add :iface'), 'input')))->toContain("Endpoint = a.example.com:51820\n");
+})->with('os');
+
+it('keeps a peer\'s old keys when the new ones do not make it onto the interface', function (string $os, string $failing) {
+    $rig = new Rig($os);
+    $rig->wg->createLink('wg0', '10.0.0.1/24', 51820);
+    $laptop = $rig->wg->addPeer('wg0', name: 'laptop', remote: 'laptop.example.com:51820');
+    $conf = $rig->host->conf('wg0');
+
+    // The new key is added first; when that fails (its remote doesn't resolve), the old one is
+    // still there. When the old one can't be taken off, the new one goes again.
+    $failing === 'adding the new key'
+        ? $rig->shell->failOnce('sudo -n :helper peer-add :iface', message: 'Name or service not known')
+        : $rig->shell->failOnce('sudo -n :helper peer-remove :iface :pubkey', fn (array $b) => $b['pubkey'] === $laptop->public_key);
+    expect(fn () => $rig->wg->rekeyPeer('wg0', $laptop->public_key))->toThrow(SystemException::class, 'was undone');
+
+    expect($rig->host->conf('wg0'))->toBe($conf)
+        ->and($rig->host->runtimePeers('wg0'))->toBe([$laptop->public_key => '10.0.0.2/32'])
+        ->and($rig->wg->getPeerConfig('wg0', $laptop->public_key))->toBe($laptop->client_config)
+        ->and($rig->host->clients)->toHaveCount(1, 'The new key is gone again');
+})->with('os')->with(['adding the new key', 'taking the old key off']);
+
+// ─── What may reach peers, and what peers may route ─────────────────
+
+it('forwards into the tunnel only replies, unless the link takes connections in', function (string $os) {
+    $rig = new Rig($os);
+    $link = $rig->wg->createLink('wg0', '10.0.0.1/24', 51820, forward: true);
+
+    expect($link->inbound)->toBeFalse()
+        ->and($link->toArray())->toMatchArray(['inbound' => false, 'firewall' => 'ok'])
+        ->and($rig->host->conf('wg0'))->toContain("# inbound = false\n")
+        ->and($rig->host->firewall['wg0'])->toBe(['forward' => true, 'nat' => false]);
+
+    // Site-to-site, where the far side starts connections too: the running link's rules change
+    $starts = count($rig->shell->callsTo('sudo -n :helper up :name'));
+    expect($rig->wg->updateLink('wg0', ['inbound' => true])->inbound)->toBeTrue()
+        ->and($rig->host->firewall['wg0'])->toBe(['forward' => true, 'nat' => false, 'inbound' => true])
+        ->and(count($rig->shell->callsTo('sudo -n :helper up :name')))->toBe($starts, 'Without a restart');
+})->with('os');
+
+it('lets a link allow its peers a default route or the server\'s own networks only where the server does', function (string $os, string $setting, string $network) {
+    $rig = new Rig($os);
+    $rig->wg->createLink('wg0', '10.0.0.1/24', 51820);
+    $peer = $rig->wg->addPeer('wg0');
+
+    // Neither allows it: the server's own traffic would go to the peer, or it would lose its network
+    expect(fn () => $rig->wg->updatePeer('wg0', $peer->public_key, ['networks' => $network]))->toThrow(InvalidArgumentException::class, "Only on a link with {$setting}")
+        ->and(fn () => $rig->wg->updateLink('wg0', [$setting => true]))->toThrow(ConflictException::class, "This server doesn't let links allow that ({$setting})")
+        ->and(fn () => $rig->wg->createLink('wg1', '10.1.0.1/24', 51821, ...[$setting => true]))->toThrow(ConflictException::class, $setting);
+
+    // The server's policy (wg:install) allows it, then the link
+    $rig->host->policy[$setting] = true;
+    expect(fn () => $rig->wg->updatePeer('wg0', $peer->public_key, ['networks' => $network]))->toThrow(InvalidArgumentException::class, "Only on a link with {$setting}");
+    expect($rig->wg->updateLink('wg0', [$setting => true])->toArray()[$setting])->toBeTrue()
+        ->and($rig->host->conf('wg0'))->toContain("# {$setting} = true\n")
+        ->and($rig->wg->updatePeer('wg0', $peer->public_key, ['networks' => $network])->networks)->toBe($network);
+
+    // Not off again while a peer routes it; and when the server takes its leave back, no new one
+    expect(fn () => $rig->wg->updateLink('wg0', [$setting => false]))->toThrow(ConflictException::class, 'Its peers route what that would no longer allow');
+    $rig->host->policy[$setting] = false;
+    expect(fn () => $rig->wg->addPeer('wg0', networks: $network))->toThrow(InvalidArgumentException::class, '--'.str_replace('_', '-', $setting).'=true');
+})->with('os')->with([
+    'a default route' => ['allow_default_route', '0.0.0.0/0'],
+    'the server\'s own LAN' => ['allow_own_networks', '192.0.2.0/24'],
+]);
+
+it('gives a default route of a family to one peer only, whatever else is routed', function () {
+    $rig = new Rig('linux');
+    $rig->host->policy['allow_default_route'] = true;
+    $rig->wg->createLink('wg0', '10.0.0.1/24', 51820, allow_default_route: true);
+    $rig->wg->createLink('wg1', '10.1.0.1/24', 51821, allow_default_route: true);
+
+    // The least specific route: it clashes with nothing more specific, here or on another link
+    $exit = $rig->wg->addPeer('wg0', networks: '0.0.0.0/0, ::/0');
+    $branch = $rig->wg->addPeer('wg0', networks: '192.168.9.0/24');
+    expect($exit->networks)->toBe('0.0.0.0/0, ::/0')->and($branch->networks)->toBe('192.168.9.0/24')
+        ->and($rig->wg->createLink('wg2', '10.2.0.1/24', 51822)->address)->toBe('10.2.0.1/24');
+
+    // But only one peer can have it
+    expect(fn () => $rig->wg->addPeer('wg0', networks: '0.0.0.0/0'))->toThrow(ConflictException::class, '0.0.0.0/0 overlaps 0.0.0.0/0 of peer')
+        ->and(fn () => $rig->wg->addPeer('wg1', networks: '::/0'))->toThrow(ConflictException::class, '::/0 overlaps ::/0 of link wg0');
+});
+
+it('refuses a remote whose name doesn\'t resolve, before anything is written', function (string $os) {
+    // wg resolves it when the link starts, and a name that doesn't resolve keeps the whole link down
+    $rig = new Rig($os);
+    $rig->wg->createLink('wg0', '10.0.0.1/24', 51820);
+    $peer = $rig->wg->addPeer('wg0', remote: 'branch.example.com:51820');
+    $rig->host->unresolvable = ['brnach.example.com'];
+    $conf = $rig->host->conf('wg0');
+
+    expect(fn () => $rig->wg->addPeer('wg0', remote: 'brnach.example.com:51820'))->toThrow(InvalidArgumentException::class, "brnach.example.com doesn't resolve")
+        ->and(fn () => $rig->wg->updatePeer('wg0', $peer->public_key, ['remote' => 'brnach.example.com:51820']))->toThrow(InvalidArgumentException::class, "doesn't resolve")
+        ->and($rig->host->conf('wg0'))->toBe($conf)
+        // An address isn't looked up
+        ->and($rig->wg->updatePeer('wg0', $peer->public_key, ['remote' => '203.0.113.7:51820'])->remote)->toBe('203.0.113.7:51820');
+})->with('os');
+
+// ─── Keys of their own; new keys for a link ─────────────────────────
+
+it('gives a link new keys, live: its peers keep theirs, their configs have its new public key', function (string $os, bool $up) {
+    $rig = new Rig($os);
+    $old = $rig->wg->createLink('wg0', '10.0.0.1/24', 51820, up: $up);
+    $peer = $rig->wg->addPeer('wg0', name: 'laptop');
+    $starts = count($rig->shell->callsTo('sudo -n :helper up :name'));
+
+    $link = $rig->wg->rekeyLink('wg0');
+
+    expect($link->public_key)->not->toBe($old->public_key)
+        ->and($link->peers)->toHaveCount(1)
+        ->and($link->peers[0])->public_key->toBe($peer->public_key)->name->toBe('laptop')
+        ->and($rig->wg->getPeerConfig('wg0', $peer->public_key))->toContain("PublicKey = {$link->public_key}\n", "PrivateKey = {$peer->private_key}\n")
+        ->and($rig->host->conf('wg0'))->not->toContain($old->public_key)
+        ->and(count($rig->shell->callsTo('sudo -n :helper up :name')))->toBe($starts, 'No restart');
+    if ($up) {
+        // On the interface, without the key ever being on a command line
+        expect($rig->host->interfaces[$rig->host->interfaceOf('wg0')]['private_key'])->toBe(preg_match('/^PrivateKey = (\S+)$/m', $rig->host->conf('wg0'), $m) ? $m[1] : null)
+            ->and($rig->shell->callsTo('sudo -n :helper link-key :iface')[0]['bound'])->not->toContain($m[1]);
+
+        // The interface refuses it: the config goes back
+        $conf = $rig->host->conf('wg0');
+        $rig->shell->failOnce('sudo -n :helper link-key :iface');
+        expect(fn () => $rig->wg->rekeyLink('wg0'))->toThrow(SystemException::class, 'was undone')
+            ->and($rig->host->conf('wg0'))->toBe($conf);
+    }
+})->with('os')->with(['running' => true, 'stopped' => false]);
+
+it('takes keys of their own: a link\'s private key, a peer\'s public and preshared keys', function (string $os) {
+    // As for two servers of this kind that are each other's peer (site-to-site)
+    $rig = new Rig($os);
+    $keys = new KeyManager;
+    $link_key = $keys->genkey();
+    $device_key = $keys->genkey();
+    $psk = $keys->genpsk();
+
+    $link = $rig->wg->createLink('wg0', '10.0.0.1/24', 51820, private_key: $link_key);
+    $peer = $rig->wg->addPeer('wg0', public_key: KeyManager::pubkeyToSafe($keys->pubkey($device_key)), preshared_key: $psk, remote: '203.0.113.7:51820');
+
+    // No private key is stored for it: its config comes without the PrivateKey line, no QR code
+    expect($link->public_key)->toBe($keys->pubkey($link_key))
+        ->and($peer)->public_key->toBe($keys->pubkey($device_key))->private_key->toBeNull()
+        ->and($peer->client_config)->toContain("PresharedKey = {$psk}\n", "PublicKey = {$link->public_key}\n")->not->toContain('PrivateKey')
+        ->and($rig->host->clients)->toBe([])
+        ->and(fn () => $rig->wg->getPeerConfig('wg0', $peer->public_key, with_key: true))->toThrow(InvalidArgumentException::class, "isn't stored here")
+        ->and(fn () => $rig->wg->addPeer('wg0', public_key: $peer->public_key))->toThrow(ConflictException::class, 'a peer with that public key already')
+        ->and(fn () => $rig->wg->addPeer('wg0', public_key: 'not a key'))->toThrow(InvalidArgumentException::class, 'Invalid public key')
+        ->and(fn () => $rig->wg->createLink('wg1', '10.1.0.1/24', private_key: 'abc'))->toThrow(InvalidArgumentException::class, 'Invalid private key');
+})->with('os');
+
+it('adds a peer with client settings of its own, or disabled', function (string $os) {
+    $rig = new Rig($os);
+    $rig->wg->createLink('wg0', '10.0.0.1/24', 51820);
+
+    $phone = $rig->wg->addPeer('wg0', dns: '1.1.1.1', keepalive: 0, allowed_ips: '10.0.0.0/24');
+    $spare = $rig->wg->addPeer('wg0', enabled: false);
+
+    expect($phone->clientSettings())->toBe(['dns' => '1.1.1.1', 'keepalive' => 0, 'allowed_ips' => '10.0.0.0/24'])
+        ->and($phone->client_config)->toContain("DNS = 1.1.1.1\n", "AllowedIPs = 10.0.0.0/24\n", 'PersistentKeepalive = 0')
+        ->and($spare->enabled)->toBeFalse()
+        ->and($rig->host->runtimePeers('wg0'))->toBe([$phone->public_key => '10.0.0.2/32'])
+        ->and($rig->host->conf('wg0'))->toContain("# [Peer] disabled\n# PublicKey = {$spare->public_key}\n")
+        ->and($spare->client_config)->toContain("PrivateKey = {$spare->private_key}\n", 'Address = 10.0.0.3/32');
+})->with('os');
+
+it('starts no link whose peers\' remote names don\'t resolve, so it doesn\'t hang', function (string $os) {
+    // wg-quick would retry for minutes, then fail the whole link
+    $rig = new Rig($os);
+    $rig->wg->createLink('wg0', '10.0.0.1/24', 51820);
+    $rig->wg->addPeer('wg0', name: 'branch', remote: 'branch.example.com:51820');
+    $rig->host->unresolvable = ['branch.example.com'];
+    $calls = fn () => array_column(array_filter($rig->shell->calls, fn (array $call) => preg_match('/ (up|down) /', $call['bound'])), 'bound');
+    $before = $calls();
+
+    // Running: a restart is refused before anything stops
+    expect(fn () => $rig->wg->updateLink('wg0', ['port' => 51821]))->toThrow(SystemException::class, "branch.example.com, the remote of peer branch of link wg0, doesn't resolve now")
+        ->and($calls())->toBe($before)
+        ->and($rig->wg->getLink('wg0'))->up->toBeTrue()->listen_port->toBe(51820);
+
+    // Stopped: not started
+    $rig->wg->updateLink('wg0', ['up' => false]);
+    $before = $calls();
+    expect(fn () => $rig->wg->updateLink('wg0', ['up' => true]))->toThrow(SystemException::class, "doesn't resolve now")
+        ->and(array_filter(array_slice($calls(), count($before)), fn (string $call) => str_contains($call, ' up ')))->toBe([]);
+
+    $rig->host->unresolvable = [];
+    expect($rig->wg->updateLink('wg0', ['up' => true])->up)->toBeTrue();
+})->with('os');
 
 // ─── Firewall rules that went missing; the server's own addresses ───
 

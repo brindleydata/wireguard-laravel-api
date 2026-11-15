@@ -26,6 +26,10 @@ class InterfaceInfo
         public readonly ?string $allowed_ips = null,
         public readonly ?int $mtu = null,  // the link's own MTU, for its interface and its clients; null: wg-quick's
         public readonly ?string $firewall = null,  // 'ok' or 'missing' for a running link with forward or NAT; else null
+        public readonly bool $inbound = false,  // forwarding into the tunnel takes connections that start outside, not only replies
+        public readonly bool $allow_default_route = false,  // its peers may route a default route (as far as the server allows)
+        public readonly bool $allow_own_networks = false,  // its peers may route networks holding the server's own addresses (likewise)
+        public readonly ?string $endpoint = null,  // where its clients connect: host, or host:port; null: detected when a config is built
     ) {}
 
     /** A copy with some properties replaced. */
@@ -51,12 +55,16 @@ class InterfaceInfo
             'interface' => $this->interface,
             'public_key' => $this->public_key,
             'listen_port' => $this->listen_port,
+            'endpoint' => $this->endpoint,
             'address' => $this->address,
             'address6' => $this->address6,
             'ifout' => $this->ifout,
             'mtu' => $this->mtu,
             'forward' => $this->forward,
             'nat' => $this->nat,
+            'inbound' => $this->inbound,
+            'allow_default_route' => $this->allow_default_route,
+            'allow_own_networks' => $this->allow_own_networks,
             'firewall' => $this->firewall,
             'up' => $this->up,
             'client' => $this->clientSettings(),

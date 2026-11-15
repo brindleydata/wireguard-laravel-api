@@ -16,7 +16,12 @@ class Server
     /** Seconds a healthy answer is good for. */
     protected const HEALTHY_FOR = 5;
 
-    protected int $healthyUntil = 0;
+    /**
+     * Until when the last healthy answer holds, for this process. Static: Octane makes this
+     * service (and the controller holding it) anew for every request, so an instance's own
+     * would never outlive the request that set it.
+     */
+    protected static int $healthyUntil = 0;
 
     public function __construct(
         protected OsDriver $os,
@@ -61,7 +66,7 @@ class Server
 
     public function status(): SystemStatus
     {
-        $hostname = config('wireguard.hostname') ?? gethostname();
+        $hostname = $this->os->hostname();
 
         return new SystemStatus(
             app: [
@@ -79,7 +84,7 @@ class Server
 
     public function ip(): array
     {
-        $ip_service = config('wireguard.ip_service', 'http://ifconfig.me/ip');
+        $ip_service = config('wireguard.ip_service', 'https://ifconfig.me/ip');
 
         return [
             'ipv4' => $this->os->publicIpv4($ip_service),
@@ -97,21 +102,25 @@ class Server
      * Whether the API can do its job: the root helper is installed, current and allowed by sudo.
      *
      * /health is public and asking means running sudo, so a healthy answer is kept for a few
-     * seconds (by this instance: an Octane worker). An unhealthy one never is: once the cause is
+     * seconds (by this process: an Octane worker). An unhealthy one never is: once the cause is
      * fixed, the next request says so.
      */
     public function healthy(): bool
     {
-        if (time() < $this->healthyUntil) {
+        if (time() < self::$healthyUntil) {
             return true;
         }
 
         $healthy = $this->os->helperStatus()['state'] === 'ok';
-        if ($healthy) {
-            $this->healthyUntil = time() + self::HEALTHY_FOR;
-        }
+        self::$healthyUntil = $healthy ? time() + self::HEALTHY_FOR : 0;
 
         return $healthy;
+    }
+
+    /** Forget a healthy answer, as a new process starts without one (tests start each case so). */
+    public static function forgetHealth(): void
+    {
+        self::$healthyUntil = 0;
     }
 
     /**

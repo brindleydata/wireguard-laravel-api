@@ -18,6 +18,18 @@ WEB=@WEB@
 DEPLOY=@DEPLOY@
 HELPER=''
 
+# A value from a .env file as Laravel's dotenv reads the usual lines: the last one for the key
+# (`export` and spaces around = allowed), "double-quoted" (\" \\ \$ undone), 'single-quoted' as
+# it is, or unquoted up to a # comment. Empty when the key isn't there.
+env_value() {
+    env_raw=$(sed -n -E "s/^[[:space:]]*(export[[:space:]]+)?$1[[:space:]]*=[[:space:]]*//p" "$2" 2> /dev/null | tail -n 1)
+    case $env_raw in
+        \"*) printf '%s\n' "$env_raw" | sed -E 's/^"(([^"\\]|\\.)*)".*$/\1/; s/\\(.)/\1/g' ;;
+        \'*) printf '%s\n' "$env_raw" | sed -E "s/^'([^']*)'.*$/\\1/" ;;
+        *) printf '%s\n' "$env_raw" | sed -E 's/#.*$//; s/[[:space:]]+$//' ;;
+    esac
+}
+
 # Not installed (the placeholders are unfilled): the project this script is in, the shell's
 # php, the web user from its .env (else whoever runs this), and the project's owner as the
 # deploy user. The pattern isn't a placeholder, so it survives filling them in.
@@ -33,11 +45,11 @@ case $APP in
         done
         APP=$(cd "$(dirname "$self")/.." && pwd -P)
         PHP=$(command -v php) || { echo 'wgla: no php on the PATH' >&2; exit 1; }
-        WEB=$(sed -n 's/^WGLA_WEB_USER=//p' "$APP/.env" 2> /dev/null | tail -n 1 | tr -d "\"'")
+        WEB=$(env_value WGLA_WEB_USER "$APP/.env")
         [ -n "$WEB" ] || WEB=$(id -un)
         DEPLOY=$(stat -c %U "$APP" 2> /dev/null || stat -f %Su "$APP")  # GNU, else BSD (macOS)
         # No root helper installed: the one beside this script (see artisan below)
-        installed=$(sed -n 's/^WIREGUARD_HELPER=//p' "$APP/.env" 2> /dev/null | tail -n 1 | tr -d "\"'")
+        installed=$(env_value WIREGUARD_HELPER "$APP/.env")
         [ -e "${installed:-/usr/local/sbin/wgla-helper}" ] || HELPER=$APP/bin/wgla-helper
         ;;
 esac
@@ -62,6 +74,11 @@ artisan() {
     fi
 }
 
+# Any command as $user: directly when we are that user, else through sudo
+as_user() {
+    if [ "$(id -un)" != "$user" ]; then sudo -H -u "$user" -- "$@"; else "$@"; fi
+}
+
 # Listing and help run as whoever asks (root: as the deploy user)
 user=$(id -un)
 [ "$user" != root ] || user=$DEPLOY
@@ -81,7 +98,19 @@ case "$command" in
         exit
         ;;
     help) if [ $# -gt 0 ]; then set -- help "wg:${1#wg:}"; else set -- wg:help; fi ;;
-    install | update) set -- "wg:$command" "$@"; user=$DEPLOY ;;
+    install) set -- "wg:$command" "$@"; user=$DEPLOY ;;
+    update)
+        set -- "wg:$command" "$@"; user=$DEPLOY
+        # An update that never ended (wg:update keeps a record in git's directory until it is
+        # over) may have left vendor/ half installed, so that artisan can't even start to go
+        # back: first what the code on disk needs
+        # shellcheck disable=SC2016 # expanded by that sh
+        if as_user sh -c 'cd "$1" && [ -f "$(git rev-parse --git-path wgla-update 2> /dev/null)" ]' sh "$APP" > /dev/null 2>&1; then
+            echo "wgla: an update didn't end; installing what the code on disk needs first, so wg:update can go back" >&2
+            as_user composer install --no-dev --optimize-autoloader --no-interaction --working-dir="$APP" \
+                || echo 'wgla: composer install failed; trying wg:update all the same' >&2
+        fi
+        ;;
     *) set -- "wg:$command" "$@"; user=$WEB; uses_helper=1 ;;
 esac
 

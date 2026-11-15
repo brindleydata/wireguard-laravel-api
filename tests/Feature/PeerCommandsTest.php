@@ -158,6 +158,56 @@ it('sets a link\'s MTU and a peer\'s remote, and shows what a link hands out', f
         ->and($wg->getLink('wg0')->peers[0]->remote)->toBeNull();
 });
 
+it('sets what reaches a link\'s peers and what they may route', function () {
+    expect(cliJson('wg:link:create', ['link' => 'wg1', 'ip' => '10.1.0.1/24', '--forward' => 'true', '--inbound' => 'true']))->toMatchArray(['inbound' => true, 'allow_default_route' => false])
+        ->and(cliJson('wg:link:update', ['link' => 'wg1', '--allow-own-networks' => 'true']))->toHaveKey('error');
+
+    $this->host->policy['allow_own_networks'] = true;
+    $this->artisan('wg:link:update', ['link' => 'wg1', '--allow-own-networks' => 'true', '--inbound' => 'false'])
+        ->expectsOutputToContain('Inbound: replies only')
+        ->expectsOutputToContain("Peers may route: this server's own networks")
+        ->assertSuccessful();
+    $this->artisan('wg:link:update', ['link' => 'wg1', '--inbound' => 'treu'])->expectsOutputToContain('--inbound must be true or false')->assertFailed();
+});
+
+it('takes keys from files, never as options, and gives a link new keys', function () {
+    // An option is in `ps` for every user on the machine; a file (or stdin) isn't
+    $keys = new KeyManager;
+    $psk = $keys->genpsk();
+    $file = tempnam(sys_get_temp_dir(), 'wgla');
+    file_put_contents($file, "{$psk}\n");
+
+    try {
+        $peer = cliJson('wg:peer:create', ['link' => 'wg0', '--public-key' => $keys->pubkey($keys->genkey()), '--preshared-key-file' => $file, '--keepalive' => '0', '--enabled' => 'false']);
+        expect($peer)->toMatchArray(['enabled' => false, 'client' => ['dns' => null, 'keepalive' => 0, 'allowed_ips' => null]])->not->toHaveKey('private_key')
+            ->and($peer['client_config'])->toContain("PresharedKey = {$psk}\n")->not->toContain('PrivateKey');
+        expect(cliJson('wg:peer:create', ['link' => 'wg0', '--preshared-key-file' => '/nonexistent']))->toBe(['error' => "Can't read /nonexistent (--preshared-key-file)."]);
+
+        // Its config ends the output, the note that the device adds its key comes before it: from
+        // [Interface] on, the output is a config (`wgla peer … | sed -n '/^\[Interface\]/,$p'`)
+        foreach (['wg:peer:create' => ['--public-key' => $keys->pubkey($keys->genkey())], 'wg:peer' => ['pubkey' => $peer['public_key']]] as $command => $arguments) {
+            Artisan::call($command, ['link' => 'wg0', ...$arguments]);
+            $output = Artisan::output();
+            expect($output)->toContain('the device adds it (PrivateKey)')
+                ->and(array_filter(explode("\n", strstr($output, '[Interface]')), fn (string $line) => ! preg_match('/^(\[(Interface|Peer)\]|\w+ = .+|)$/', trim($line))))->toBe([]);
+        }
+    } finally {
+        unlink($file);
+    }
+
+    $before = cliJson('wg:link', ['link' => 'wg0'])['public_key'];
+    expect(cliJson('wg:link:rekey', ['link' => 'wg0'])['public_key'])->not->toBe($before)
+        ->and(cliJson('wg:link:update', ['link' => 'wg0', '--endpoint' => '[2001:db8::7]:443'])['endpoint'])->toBe('[2001:db8::7]:443');
+});
+
+it('takes an empty option on create as the default, as the API takes null', function () {
+    $this->artisan('wg:link:create', ['link' => 'wg1', 'ip' => '10.1.0.1/24', '--port' => '', '--mtu' => '', '--keepalive' => '', '--ifout' => '', '--dns' => ''])
+        ->assertSuccessful();
+
+    expect(app(WireGuard::class)->getLink('wg1'))->mtu->toBeNull()->keepalive->toBeNull()->dns->toBeNull()
+        ->listen_port->toBeGreaterThanOrEqual(33000);
+});
+
 it('says when a link\'s firewall rules are missing, and repairs them', function () {
     $wg = app(WireGuard::class);
     $wg->updateLink('wg0', ['forward' => true]);
@@ -223,8 +273,22 @@ it('answers changes with --json like the API does', function () {
     expect($rekeyed['public_key'])->not->toBe($peer['public_key'])->and($rekeyed)->toHaveKey('private_key');
 
     expect(cliJson('wg:peer:delete', ['link' => 'wg1', 'pubkey' => $rekeyed['public_key']]))->toBe(['message' => 'Removed peer from wg1'])
-        ->and(cliJson('wg:link:delete', ['link' => 'wg1']))->toBe(['message' => 'Deleted link: wg1'])
-        ->and(cliJson('wg:link:update', ['link' => 'wg0']))->toBe(['message' => 'No options given: nothing to update.']);
+        ->and(cliJson('wg:link:delete', ['link' => 'wg1']))->toBe(['message' => 'Deleted link: wg1']);
+});
+
+it('answers an update without options like PATCH {}: as it is, nothing written', function () {
+    config(['wireguard.api_key' => 'k']);
+    $auth = ['api-key' => 'k'];
+    $safe = KeyManager::pubkeyToSafe($key = app(WireGuard::class)->addPeer('wg0', name: 'laptop')->public_key);
+    $writes = fn () => count($this->host->shell->callsTo('sudo -n :helper conf-write :name'));
+    $before = $writes();
+
+    expect(cliJson('wg:link:update', ['link' => 'wg0']))->toBe($this->patchJson('/link/wg0', [], $auth)->assertOk()->json())
+        ->and(cliJson('wg:peer:update', ['link' => 'wg0', 'pubkey' => $key]))->toBe($this->patchJson("/link/wg0/peer/{$safe}", [], $auth)->assertOk()->json())
+        ->and($writes())->toBe($before);
+
+    $this->artisan('wg:link:update', ['link' => 'wg0'])->expectsOutputToContain('No options given: nothing to update.')->assertSuccessful();
+    $this->patchJson('/link/wg9', [], $auth)->assertNotFound();
 });
 
 it('fails with --json as {"error": …} and a non-zero exit code', function (string $command, array $arguments, string $error) {
@@ -284,10 +348,10 @@ it('shows a peer with its details above its client config', function () {
         ->expectsOutputToContain('DNS = 1.1.1.1')
         ->assertSuccessful();
 
-    // One whose private key isn't stored here is shown all the same
+    // One whose private key isn't stored here: its config without the PrivateKey line, no QR code
     $this->host->clients = [];
-    $this->artisan('wg:peer', ['link' => 'wg0', 'pubkey' => $key])->expectsOutputToContain('It has no client config')->assertSuccessful();
-    $this->artisan('wg:peer', ['link' => 'wg0', 'pubkey' => $key, '--qr' => true])->expectsOutputToContain('no client config')->assertFailed();
+    $this->artisan('wg:peer', ['link' => 'wg0', 'pubkey' => $key])->expectsOutputToContain('the device adds it (PrivateKey)')->assertSuccessful();
+    $this->artisan('wg:peer', ['link' => 'wg0', 'pubkey' => $key, '--qr' => true])->expectsOutputToContain("isn't stored here")->assertFailed();
 });
 
 it('names the release in wg:status as it is tagged', function (string $version) {

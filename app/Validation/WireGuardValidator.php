@@ -3,6 +3,7 @@
 namespace App\Validation;
 
 use App\Services\IpAllocator;
+use App\Services\KeyManager;
 use InvalidArgumentException;
 
 /**
@@ -129,12 +130,13 @@ class WireGuardValidator
     }
 
     /**
-     * A peer's label: 1-64 characters, any script, no control characters. Returns it trimmed.
+     * A peer's label: 1-64 characters, any script, no control characters or line and paragraph
+     * separators (U+2028/U+2029 end a line for some readers). Returns it trimmed.
      */
     public function peerName(string $name): string
     {
         $name = trim($name);
-        if ($name === '' || ! mb_check_encoding($name, 'UTF-8') || mb_strlen($name) > 64 || preg_match('/\p{Cc}/u', $name)) {
+        if ($name === '' || ! mb_check_encoding($name, 'UTF-8') || mb_strlen($name) > 64 || preg_match('/[\p{Cc}\p{Zl}\p{Zp}]/u', $name)) {
             throw new InvalidArgumentException('A peer name must be 1-64 characters, without line breaks or control characters.');
         }
 
@@ -144,7 +146,8 @@ class WireGuardValidator
     /**
      * Networks behind a peer (site-to-site), as a comma-separated list of CIDRs of either family.
      * Returns them as network addresses (192.168.1.5/24 → 192.168.1.0/24, which is what wg reports),
-     * without duplicates. A default route would send all of the server's traffic to the peer.
+     * without duplicates. A default route (/0) passes here: whether the peer may take the server's
+     * own traffic is its link's and the server's to say (WireGuard::routeProblems()).
      *
      * @return list<string>
      */
@@ -156,8 +159,11 @@ class WireGuardValidator
         $result = [];
         foreach ($this->entries($networks) as $entry) {
             $network = IpAllocator::networkCidr($entry);
-            if (str_ends_with($network, '/0')) {
-                throw new InvalidArgumentException("{$entry} is a default route: it would send all of the server's traffic to the peer.");
+            if (IpAllocator::isDefaultRoute($network)) {
+                // It holds those reserved ranges too, but the more specific routes stay where they are
+                $result[] = $network;
+
+                continue;
             }
             foreach ($reserved as $range) {
                 if (IpAllocator::overlaps($network, $range)) {
@@ -190,7 +196,8 @@ class WireGuardValidator
 
     /**
      * Where the server reaches a peer it has to connect to itself: host:port, with the host an
-     * IPv4 address, a name, or an IPv6 address in brackets. Returns it as it is written.
+     * IPv4 address, a name, or an IPv6 address in brackets. Returns it as it is written. An
+     * IPv4-mapped IPv6 address ([::ffff:1.2.3.4]) is its IPv4 address.
      */
     public function remote(string $remote): string
     {
@@ -200,8 +207,67 @@ class WireGuardValidator
             || ($m[1] !== '' ? ! filter_var($m[1], FILTER_VALIDATE_IP, FILTER_FLAG_IPV6) : ! filter_var($m[2], FILTER_VALIDATE_IP, FILTER_FLAG_IPV4) && ! $this->isHostname($m[2]))) {
             throw new InvalidArgumentException("Invalid remote (host:port, an IPv6 address in brackets): {$remote}");
         }
+        if ($m[1] === '') {
+            return "{$m[2]}:".(int) $m[3];
+        }
 
-        return ($m[1] !== '' ? '['.inet_ntop(inet_pton($m[1])).']' : $m[2]).':'.(int) $m[3];
+        // inet_ntop() writes an IPv4 address embedded in an IPv6 one with dots, which no endpoint has
+        $ip = inet_ntop(inet_pton($m[1]));
+        if (str_contains($ip, '.')) {
+            if (! str_starts_with($ip, '::ffff:')) {
+                throw new InvalidArgumentException("Invalid remote (an IPv4-compatible IPv6 address; give the IPv4 address): {$remote}");
+            }
+
+            return substr($ip, 7).':'.(int) $m[3];
+        }
+
+        return "[{$ip}]:".(int) $m[3];
+    }
+
+    /**
+     * Where a link's clients connect: a host (a name, an IPv4 address or an IPv6 one, with or
+     * without brackets), or host:port where another port leads to the link (a forwarded one).
+     * Returns it as it is written: an IPv6 address in brackets, canonical; an IPv4-mapped one as
+     * its IPv4 address.
+     */
+    public function endpoint(string $endpoint): string
+    {
+        $endpoint = trim($endpoint);
+        // host:port: a bracketed IPv6 address, or anything with a single colon
+        if (preg_match('/^(\[[^]]*\]|[^:]+):\d+$/', $endpoint)) {
+            return $this->remote($endpoint);
+        }
+
+        $host = preg_match('/^\[(.*)\]$/', $endpoint, $m) ? $m[1] : $endpoint;
+        if (filter_var($host, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6)) {
+            // As remote() writes it: inet_ntop() writes an IPv4 address in an IPv6 one with dots
+            $ip = inet_ntop(inet_pton($host));
+            if (! str_contains($ip, '.')) {
+                return "[{$ip}]";
+            }
+            if (str_starts_with($ip, '::ffff:')) {
+                return substr($ip, 7);
+            }
+        }
+        if ($host === $endpoint && (filter_var($host, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4) || $this->isHostname($host))) {
+            return $host;
+        }
+
+        throw new InvalidArgumentException("Invalid endpoint (a host, or host:port; an IPv6 address in brackets with a port): {$endpoint}");
+    }
+
+    /**
+     * A WireGuard key (32 bytes, as `wg genkey`/`wg pubkey` write it in base64, or in the URL-safe
+     * form of the API's routes). Returns it as wg writes it.
+     */
+    public function key(string $key, string $what = 'key'): string
+    {
+        $key = KeyManager::normalize(trim($key));
+        if (! KeyManager::isKey($key)) {
+            throw new InvalidArgumentException("Invalid {$what}: a WireGuard key is 32 bytes in base64, as wg genkey and wg pubkey write it.");
+        }
+
+        return $key;
     }
 
     public function validateKeepalive(int $seconds): void

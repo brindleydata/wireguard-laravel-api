@@ -9,6 +9,7 @@ use App\Setup\EnvFile;
 use App\Setup\Installer;
 use App\Setup\Step;
 use App\Setup\Steps\Server;
+use App\Setup\Updater;
 use Illuminate\Console\Command;
 
 class WgInstall extends WgCommand
@@ -16,12 +17,13 @@ class WgInstall extends WgCommand
     use RunsSetupSteps;
 
     protected $signature = 'wg:install
-        {--step=* : Only these steps: packages, web-user, permissions, environment, forwarding, pf, helper, sudoers, apparmor, firewall, shortcut, server, health}
+        {--step=* : Only these steps: packages, web-user, permissions, environment, forwarding, pf, helper, sudoers, policy, apparmor, firewall, shortcut, server, health}
         {--print : Print the commands as a shell script instead of checking and running anything}
         {--yes : Fix everything without asking (needs passwordless sudo)}
         {--user= : User that runs the API}
-        {--hostname= : Public hostname or IP that VPN clients connect to}
         {--forward= : Whether links route traffic for their peers (true/false)}
+        {--allow-default-route= : Whether peers may route a default route, 0.0.0.0/0 or ::/0 (true/false; default false)}
+        {--allow-own-networks= : Whether peers may route networks with this server\'s own addresses or gateway (true/false; default false)}
         {--tls= : letsencrypt, cert or http}
         {--port= : Port the API listens on}
         {--domain= : Domain for the Let\'s Encrypt certificate}
@@ -31,6 +33,21 @@ class WgInstall extends WgCommand
         {--admin-port= : Local port of FrankenPHP\'s admin API (default: 2019, or the next free one)}';
 
     protected $description = 'Set up this server step by step (re-run any time to check it)';
+
+    /** The answers options give: answer => option. */
+    public const OPTIONS = [
+        'web_user' => 'user',
+        'forward' => 'forward',
+        'allow_default_route' => 'allow-default-route',
+        'allow_own_networks' => 'allow-own-networks',
+        'tls' => 'tls',
+        'port' => 'port',
+        'domain' => 'domain',
+        'cert' => 'cert',
+        'key' => 'key',
+        'bind' => 'bind',
+        'admin_port' => 'admin-port',
+    ];
 
     /** Runs as the deploy user, who owns the code. */
     protected function runsAsWebUser(): bool
@@ -46,7 +63,11 @@ class WgInstall extends WgCommand
         $interactive = ! $print && ! $yes && $this->interactive();
 
         try {
-            $forward = $this->flag('forward');
+            $flags = array_map(fn (string $option) => $this->flag($option), [
+                'forward' => 'forward',
+                'allow_default_route' => 'allow-default-route',
+                'allow_own_networks' => 'allow-own-networks',
+            ]);
             $admin_port = $this->number('admin-port');
             if ($admin_port !== null && ($admin_port < 1 || $admin_port > 65535)) {
                 throw new \InvalidArgumentException('--admin-port must be a port number.');
@@ -57,15 +78,8 @@ class WgInstall extends WgCommand
             return Command::FAILURE;
         }
         $ctx = $installer->context([
-            'web_user' => $this->option('user'),
-            'hostname' => $this->option('hostname'),
-            'forward' => $forward,
-            'tls' => $this->option('tls'),
-            'port' => $this->option('port'),
-            'domain' => $this->option('domain'),
-            'cert' => $this->option('cert'),
-            'key' => $this->option('key'),
-            'bind' => $this->option('bind'),
+            ...array_map(fn (string $option) => $this->option($option), self::OPTIONS),
+            ...$flags,
             'admin_port' => $admin_port === null ? null : (string) $admin_port,
         ]);
 
@@ -80,21 +94,32 @@ class WgInstall extends WgCommand
             $selected = array_values(array_filter($steps, fn (Step $step) => in_array($step->key(), $only, true)));
         }
 
-        if (! $print) {
-            if ($ctx->deployUser === 'root') {
-                $this->error('Run this as the user that owns the app code, not as root; it uses sudo where needed.');
+        // A script printed as root would make root the code's owner (and the shortcut's deploy user)
+        if ($ctx->deployUser === 'root') {
+            $this->error('Run this as the user that owns the app code, not as root; it uses sudo where needed.');
 
-                return Command::FAILURE;
-            }
-            if (! $installer->sudoReady($interactive)) {
-                $this->error($interactive ? 'This needs sudo.' : 'Without a terminal (or with --yes) this needs passwordless sudo.');
-
-                return Command::FAILURE;
-            }
+            return Command::FAILURE;
         }
 
         if ($print) {
-            $this->line("#!/bin/sh\n# php artisan wg:install --print, for {$ctx->app()}\nset -e");
+            return $this->printScript($selected ?? $steps, $ctx) ? Command::SUCCESS : Command::FAILURE;
+        }
+
+        // The code may be between two versions, without the new one's setup: set up from that,
+        // this server would run neither. wg:update goes back first, then updates anew.
+        $updater = app(Updater::class);
+        if (($update = $updater->unfinished($ctx)) !== null) {
+            $this->error(($update['from'] !== null && $update['to'] !== null
+                ? "An update from {$updater->name($ctx, $update['from'])} to {$updater->name($ctx, $update['to'])} didn't end"
+                : "{$updater->recordPath($ctx)} says an update didn't end").'. Run php artisan wg:update first: it goes back to where that one started.');
+
+            return Command::FAILURE;
+        }
+
+        if (! $installer->sudoReady($interactive)) {
+            $this->error($interactive ? 'This needs sudo.' : 'Without a terminal (or with --yes) this needs passwordless sudo.');
+
+            return Command::FAILURE;
         }
 
         $pending = [];
@@ -108,21 +133,12 @@ class WgInstall extends WgCommand
             }
             $step->after($ctx);
 
-            if ($print) {
-                // Only prints: the answers aren't saved either
-                $this->printStep($step, $ctx);
-
-                continue;
-            }
-
             $installer->save($ctx);
             if (! $this->fix($installer, $step, $ctx, $interactive, $yes)) {
                 $pending[] = $step->title();
             }
-        }
-
-        if ($print) {
-            return Command::SUCCESS;
+            // Once more: the environment step may just have created .env
+            $installer->save($ctx);
         }
 
         $this->newLine();
@@ -136,6 +152,56 @@ class WgInstall extends WgCommand
         $this->summary($ctx, $installer);
 
         return Command::SUCCESS;
+    }
+
+    /**
+     * --print: the steps' commands as a shell script, nothing checked, run or saved. Every
+     * question is answered first, so the script's one PHP step (editing .env) gets every answer
+     * and saves it there, as a run here would: wg:update reads them back.
+     *
+     * @param  list<Step>  $steps
+     */
+    protected function printScript(array $steps, Context $ctx): bool
+    {
+        $planned = [];
+        foreach ($steps as $step) {
+            if (! $step->applies($ctx)) {
+                continue;
+            }
+            if (! $this->answer($step, $ctx, false)) {
+                return false;
+            }
+            $step->after($ctx);
+            $planned[] = $step;
+        }
+
+        $this->line("#!/bin/sh\n# php artisan wg:install --print, for {$ctx->app()}\nset -e");
+        foreach ($planned as $step) {
+            $this->printStep($step, $ctx);
+        }
+
+        return true;
+    }
+
+    protected function printStep(Step $step, Context $ctx): void
+    {
+        $plan = $step->plan($ctx);
+        if ($plan === []) {
+            return;
+        }
+
+        $options = '';
+        foreach (self::OPTIONS as $answer => $option) {
+            if (($value = $ctx->answer($answer)) !== null) {
+                $options .= " --{$option}=".escapeshellarg(is_bool($value) ? ($value ? 'true' : 'false') : (string) $value);
+            }
+        }
+
+        $this->line("\n# {$step->title()}");
+        foreach ($plan as $action) {
+            $this->line("# {$action->description}");
+            $this->line($action->command ?? escapeshellarg($ctx->php).' '.escapeshellarg($ctx->app('artisan'))." wg:install --step={$step->key()} --yes{$options}");
+        }
     }
 
     protected function summary(Context $ctx, Installer $installer): void

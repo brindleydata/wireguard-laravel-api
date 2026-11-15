@@ -28,6 +28,20 @@ class FakeShell extends Shell
         return $this;
     }
 
+    /** @var list<array{command: string, when: (callable(array, ?string): bool)|null, message: string}> */
+    protected array $failures = [];
+
+    /**
+     * Make the next call of $command fail once (one that $when accepts, given its bindings and
+     * input), as a non-zero exit with $message; later calls are handled as usual.
+     */
+    public function failOnce(string $command, ?callable $when = null, string $message = 'simulated failure'): static
+    {
+        $this->failures[] = compact('command', 'when', 'message');
+
+        return $this;
+    }
+
     /**
      * Handle every command without a dedicated handler.
      */
@@ -42,6 +56,14 @@ class FakeShell extends Shell
     {
         $bound = $this->bind($command, $bindings);
         $this->calls[] = compact('command', 'bindings', 'input', 'bound');
+
+        foreach ($this->failures as $i => $failure) {
+            if ($failure['command'] === $command && ($failure['when'] === null || ($failure['when'])($bindings, $input))) {
+                unset($this->failures[$i]);
+
+                throw new CommandFailed($failure['message']);
+            }
+        }
 
         if (isset($this->handlers[$command])) {
             return trim((string) ($this->handlers[$command])($bindings, $input));

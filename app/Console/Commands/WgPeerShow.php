@@ -31,10 +31,10 @@ class WgPeerShow extends WgCommand
         }
 
         if ($this->option('qr') && ! $this->json()) {
-            if ($config === null) {
-                return $this->failed('This peer has no client config: its private key is not stored here.');
-            }
             try {
+                // The whole config, its private key included: a peer with a key of its own has none
+                $config = $wg->getPeerConfig($link, $pubkey, with_key: true)
+                    ?? throw new \InvalidArgumentException("There is no client config of a peer of {$link}: it runs without a config here.");
                 $this->line(app(QrCode::class)->terminal($config));
             } catch (\InvalidArgumentException $e) {
                 return $this->failed($e->getMessage());
@@ -43,7 +43,7 @@ class WgPeerShow extends WgCommand
             return Command::SUCCESS;
         }
 
-        return $this->respond([...$peer->toArray(), 'client_config' => $config], function () use ($peer, $config) {
+        return $this->respond([...$peer->toArray(), 'client_config' => $config], function () use ($peer, $config, $link) {
             $this->info("Peer {$peer->public_key}".($peer->name === null ? '' : " ({$peer->name})"));
             foreach ($this->details($peer) as $line) {
                 $this->line($line);
@@ -52,9 +52,14 @@ class WgPeerShow extends WgCommand
             $this->line('');
 
             if ($config === null) {
-                $this->warn('It has no client config: its private key is not stored here.');
+                $this->warn("There is no client config of it: {$link} runs without a config here.");
 
                 return;
+            }
+            // Before the config, which ends the output: `wgla peer … | sed -n '/^\[Interface\]/,$p'`
+            // is a config wg can read
+            if (! preg_match('/^PrivateKey = /m', $config)) {
+                $this->warn('Its private key is its own, not stored here: the device adds it (PrivateKey).');
             }
             $this->info('Client configuration:');
             $this->line('');

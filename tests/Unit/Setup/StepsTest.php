@@ -7,14 +7,18 @@ use App\Setup\Steps\AppArmor;
 use App\Setup\Steps\Environment;
 use App\Setup\Steps\FirewallRepair;
 use App\Setup\Steps\Forwarding;
+use App\Setup\Steps\Health;
 use App\Setup\Steps\Helper;
 use App\Setup\Steps\Permissions;
 use App\Setup\Steps\PfAnchors;
+use App\Setup\Steps\Policy;
 use App\Setup\Steps\Server;
 use App\Setup\Steps\Shortcut;
 use App\Setup\Steps\Sudoers;
 use App\Setup\Steps\WebUser;
 use App\Setup\Updater;
+use Illuminate\Support\Sleep;
+use Symfony\Component\Process\ExecutableFinder;
 use Symfony\Component\Process\Process;
 use Tests\Fakes\CommandFailed;
 use Tests\Fakes\FakeShell;
@@ -28,6 +32,7 @@ afterEach(function () {
     if (isset($this->tmp) && is_dir($this->tmp)) {
         exec('rm -rf '.escapeshellarg($this->tmp));
     }
+    Sleep::fake(false);
 });
 
 /**
@@ -41,7 +46,7 @@ function setupContext(string $os = 'linux', array $answers = []): Context
     mkdir("{$tmp}/root/etc", 0755, true);
     copy(HelperSandbox::path(), "{$tmp}/app/bin/wgla-helper");
     copy(dirname(HelperSandbox::path()).'/wgla', "{$tmp}/app/bin/wgla");
-    file_put_contents("{$tmp}/app/.env.example", "APP_KEY=\nAPI_KEY=\nWIREGUARD_HOSTNAME=\n");
+    file_put_contents("{$tmp}/app/.env.example", "APP_KEY=\nAPI_KEY=\n");
 
     return new Context(
         os: $os,
@@ -73,8 +78,84 @@ it('edits .env values in place and keeps everything else', function () {
         ->and(fn () => $env->set('X', "a\nb"))->toThrow(InvalidArgumentException::class);
 });
 
+it('reads back what it writes, as Laravel reads it, however often it is saved', function (string $value) {
+    $ctx = setupContext();
+    $env = new EnvFile($ctx->app('.env'));
+    file_put_contents($env->path, "APP_NAME=x\n");
+
+    $env->set('WGLA_SERVER_CERT', $value);
+    $written = file_get_contents($env->path);
+    // What the installer does on every run: read the answer, save it again
+    $env->set('WGLA_SERVER_CERT', (string) $env->get('WGLA_SERVER_CERT'));
+
+    expect($env->get('WGLA_SERVER_CERT'))->toBe($value)
+        ->and(Dotenv\Dotenv::parse($written)['WGLA_SERVER_CERT'])->toBe($value, "Laravel's dotenv reads the same")
+        ->and(file_get_contents($env->path))->toBe($written, 'Saved again, nothing changes');
+})->with([
+    'a plain path' => '/etc/ssl/api.pem',
+    'spaces' => '/etc/ssl/my certs/api.pem',
+    'backslashes' => 'C:\\certs\\api.pem',
+    'a trailing backslash' => 'dir\\',
+    'double quotes' => 'say "hi"',
+    'a single quote' => "it's",
+    'a dollar sign' => '/etc/ssl/$HOME/api.pem',
+    'a variable reference' => '${APP_NAME}',
+    'a hash' => 'cert #2',
+    'escape-like text' => '\\n\\t\\$',
+    'unicode' => '/etc/ssl/сертификат.pem',
+    'empty' => '',
+]);
+
+it('reads values as Laravel does, however an admin wrote them', function (string $line, string $value) {
+    $ctx = setupContext();
+    $env = new EnvFile($ctx->app('.env'));
+    file_put_contents($env->path, "APP_NAME=x\n{$line}\nOTHER=y\n");
+
+    expect($env->get('API_KEY'))->toBe($value)
+        ->and(Dotenv\Dotenv::parse((string) file_get_contents($env->path))['API_KEY'])->toBe($value, "Laravel's dotenv reads the same");
+
+    // And a new value takes that line's place
+    $env->set('API_KEY', 'new');
+    expect($env->get('API_KEY'))->toBe('new')
+        ->and(Dotenv\Dotenv::parse((string) file_get_contents($env->path))['API_KEY'])->toBe('new');
+})->with([
+    'a comment after the value' => ['API_KEY=abc123 # rotated in May', 'abc123'],
+    'a comment after a tab' => ["API_KEY=abc123\t# note", 'abc123'],
+    'double quotes with escapes' => ['API_KEY="a \\"b\\" \\\\ \\$c" # note', 'a "b" \\ $c'],
+    'single quotes, taken literally' => ["API_KEY='a \\\"b\\\" \$c' # note", 'a \\"b\\" $c'],
+    'spaces around =' => ['API_KEY = abc123', 'abc123'],
+    'export' => ['export API_KEY=abc123', 'abc123'],
+    'empty' => ['API_KEY=', ''],
+    // As dotenv: the last line counts
+    'twice' => ["API_KEY=old\nAPI_KEY=abc123", 'abc123'],
+]);
+
+it('reads .env values in shell scripts as Laravel does', function (string $script) {
+    // The scripts that read .env without PHP: bin/wgla (sh), and update.sh (bash) on the server
+    // it checks. A value cut at the = and stripped of quotes keeps its comment: WGLA_WEB_USER=x # y
+    preg_match('/^env_value\(\) \{\n.*?^\}\n/ms', (string) file_get_contents(__DIR__.'/../../../'.$script), $function);
+    expect($function)->not->toBe([], "{$script} has env_value()");
+    $tmp = $this->tmp = sys_get_temp_dir().'/wgla_env_'.bin2hex(random_bytes(4));
+    mkdir($tmp);
+    file_put_contents("{$tmp}/env.sh", $function[0]);
+
+    foreach ([
+        'WGLA_WEB_USER=www-data', 'WGLA_WEB_USER=www-data # runs the API', "WGLA_WEB_USER=www-data\t# a tab", 'WGLA_WEB_USER=www-data#no space',
+        'WGLA_WEB_USER="www-data" # quoted', "WGLA_WEB_USER='www-data' # single", 'WGLA_WEB_USER="a #b"', "WGLA_WEB_USER='a #b'",
+        'WGLA_WEB_USER="a \\"b\\" \\\\ \\$c"', "WGLA_WEB_USER='a \\\"b\\\" \$c'", 'export WGLA_WEB_USER = www-data', '  WGLA_WEB_USER=www-data  ',
+        'WGLA_WEB_USER=', 'WGLA_WEB_USER= # nothing', 'WGLA_WEB_USER=""', 'WGLA_WEB_USER=a=b', "WGLA_WEB_USER=old\nWGLA_WEB_USER=new",
+        'WIREGUARD_HELPER=/usr/local/sbin/wgla-helper # installed', 'OTHER_WGLA_WEB_USER=no',
+    ] as $line) {
+        file_put_contents("{$tmp}/.env", "APP_NAME=x\n{$line}\nOTHER=y\n");
+        $process = new Process([str_ends_with($script, '.sh') ? 'bash' : 'sh', '-c', '. ./env.sh; env_value WGLA_WEB_USER .env'], $tmp);
+        $process->run();
+
+        expect($process->getOutput())->toBe((Dotenv\Dotenv::parse((string) file_get_contents("{$tmp}/.env"))['WGLA_WEB_USER'] ?? '')."\n", $line);
+    }
+})->with(['bin/wgla', 'tests/e2e/update.sh']);
+
 it('creates .env with fresh keys and makes it private', function (bool $separate) {
-    $ctx = setupContext(answers: ['hostname' => 'vpn.example.com', 'web_user' => $separate ? 'www-data' : 'deploy']);
+    $ctx = setupContext(answers: ['web_user' => $separate ? 'www-data' : 'deploy']);
     $step = new Environment((new FakeShell)->otherwise(fn () => throw new CommandFailed('not a git checkout')));
 
     expect($step->check($ctx))->toBe(['There is no .env file']);
@@ -85,7 +166,6 @@ it('creates .env with fresh keys and makes it private', function (bool $separate
 
     expect($env->get('APP_KEY'))->toStartWith('base64:')
         ->and($env->get('API_KEY'))->toMatch('/^[0-9a-f]{64}$/')
-        ->and($env->get('WIREGUARD_HOSTNAME'))->toBe('vpn.example.com')
         ->and($env->get('OCTANE_SERVER'))->toBe('frankenphp')
         ->and($plan[1]->command)->toBe($separate
             ? "sudo chgrp 'www-data' '{$ctx->app('.env')}' && chmod 640 '{$ctx->app('.env')}'"
@@ -97,8 +177,56 @@ it('creates .env with fresh keys and makes it private', function (bool $separate
     expect($env->get('API_KEY'))->toBe($key);
 })->with(['separate web user' => true, 'same user (macOS dev)' => false]);
 
+it('asks nothing about where VPN clients connect: each link has that in its config', function () {
+    $ctx = setupContext(answers: ['web_user' => 'deploy']);
+    $step = new Environment((new FakeShell)->otherwise(fn () => throw new CommandFailed('not a git checkout')));
+    $installer = new Installer((new FakeShell)->otherwise(fn () => 'deploy'), $ctx->helperPath);
+
+    ($step->plan($ctx)[0]->callback)($ctx);
+    $env = new EnvFile($ctx->app('.env'));
+
+    expect($step->questions($ctx))->toBe([])
+        ->and(file_get_contents($env->path))->not->toContain('WIREGUARD_HOSTNAME');
+
+    // A server set up before has one in .env: nothing reads it, and it stays as it is
+    $env->set('WIREGUARD_HOSTNAME', 'vpn.example.com');
+    $saved = $installer->context([], $ctx->app(), $ctx->root);
+    $installer->save($saved);
+
+    expect($step->check($ctx))->toBe([])
+        ->and($saved->answers)->not->toHaveKey('hostname')
+        ->and($env->get('WIREGUARD_HOSTNAME'))->toBe('vpn.example.com');
+});
+
+it("offers the machine's name as the domain for Let's Encrypt, when it is one", function (string $name, ?string $domain) {
+    $ctx = setupContext(answers: ['tls' => 'letsencrypt']);
+    $server = new class(new FakeShell, $name) extends Server
+    {
+        public function __construct(FakeShell $shell, private string $name)
+        {
+            parent::__construct($shell);
+        }
+
+        protected function hostname(): string
+        {
+            return $this->name;
+        }
+    };
+
+    expect(collect($server->questions($ctx))->firstWhere('key', 'domain')->defaultFor($ctx))->toBe($domain);
+
+    // And with a certificate of one's own, the API's address has that name
+    $ctx->answers = [...$ctx->answers, 'tls' => 'cert', 'port' => '8443'];
+    expect($server->publicUrl($ctx))->toBe("https://{$name}:8443");
+})->with([
+    'a domain name' => ['vpn.example.com', 'vpn.example.com'],
+    'an internationalized one' => ['vpn.xn--e1afmkfd.xn--p1ai', 'vpn.xn--e1afmkfd.xn--p1ai'],
+    'a name of its own only' => ['vpn', null],
+    'an IP address' => ['192.0.2.10', null],
+]);
+
 it('records the checked-out release as APP_VERSION', function () {
-    $ctx = setupContext(answers: ['hostname' => 'vpn.example.com']);
+    $ctx = setupContext();
     $release = 'v1.2.0';
     $step = new Environment((new FakeShell)->on('git -C :app describe --tags --always --dirty', function () use (&$release) {
         return $release;
@@ -172,6 +300,56 @@ it('never installs a sudo rule that visudo rejects', function (bool $valid) {
         ->and($rc === 0)->toBe($valid)
         ->and(str_contains($log, 'install -o root'))->toBe($valid);
 })->with(['accepted' => true, 'rejected' => false]);
+
+// ─── Route policy ───────────────────────────────────────────────────
+
+it('writes what peers may route to a file of root\'s, right after the sudo rule', function (array $answers, string $content) {
+    $ctx = setupContext(answers: $answers);
+    $step = new Policy(new FakeShell);
+    $keys = array_map(fn ($step) => $step->key(), (new Installer(new FakeShell))->steps());
+
+    expect($step->applies($ctx))->toBeTrue()
+        ->and($step->applies(new Context('mac', $ctx->appPath, 'deploy', 'staff', '/usr/bin/php', $ctx->helperPath, $ctx->bundledHelper)))->toBeTrue()
+        ->and(array_search('policy', $keys, true))->toBe(array_search('sudoers', $keys, true) + 1)
+        ->and(array_map(fn ($question) => [$question->key, $question->type, $question->defaultFor($ctx)], $step->questions($ctx)))
+        ->toBe([['allow_default_route', 'confirm', false], ['allow_own_networks', 'confirm', false]])
+        ->and($step->content($ctx))->toBe($content)
+        ->and($step->check($ctx))->toBe(['/etc/wgla/policy.conf is missing or out of date']);
+
+    // The planned command for real, with a sudo that runs it as us, minus the owner (root)
+    mkdir("{$this->tmp}/bin");
+    file_put_contents("{$this->tmp}/bin/sudo", "#!/bin/sh\necho \"\$*\" >> {$this->tmp}/sudo.log\n"
+        ."skip=; for a do shift; if [ -n \"\$skip\" ]; then skip=; elif [ \"\$a\" = -o ] || [ \"\$a\" = -g ]; then skip=1; else set -- \"\$@\" \"\$a\"; fi; done\nexec \"\$@\"\n");
+    chmod("{$this->tmp}/bin/sudo", 0755);
+    $process = Process::fromShellCommandline($step->plan($ctx)[0]->command, env: ['PATH' => "{$this->tmp}/bin:/usr/bin:/bin"]);
+    $process->run();
+    $file = $ctx->system(Policy::FILE);
+
+    expect($process->getExitCode())->toBe(0, $process->getErrorOutput())
+        ->and(file_get_contents("{$this->tmp}/sudo.log"))->toContain('install -d -o root -g root -m 755 '.dirname($file)."\n", 'install -o root -g root -m 644 /', " {$file}\n")
+        ->and(file_get_contents($file))->toBe($content)
+        ->and(sprintf('%o %o', fileperms($file) & 0777, fileperms(dirname($file)) & 0777))->toBe('644 755')
+        // Not root's here
+        ->and($step->check($ctx))->toBe(['/etc/wgla/policy.conf and its directory must be owned by root and writable by nobody else']);
+
+    // Another answer: another file
+    $ctx->answers['allow_own_networks'] = ! filter_var($answers['allow_own_networks'] ?? false, FILTER_VALIDATE_BOOLEAN);
+    expect($step->check($ctx))->toBe(['/etc/wgla/policy.conf is missing or out of date']);
+})->with([
+    'nothing answered: neither' => [[], "# Written by php artisan wg:install: what peers of any link may route (the root helper enforces it)\nallow_default_route=false\nallow_own_networks=false\n"],
+    'answered' => [['allow_default_route' => true, 'allow_own_networks' => false], "# Written by php artisan wg:install: what peers of any link may route (the root helper enforces it)\nallow_default_route=true\nallow_own_networks=false\n"],
+    // As .env has them, for a re-run or an update
+    'saved' => [['allow_default_route' => 'false', 'allow_own_networks' => 'true'], "# Written by php artisan wg:install: what peers of any link may route (the root helper enforces it)\nallow_default_route=false\nallow_own_networks=true\n"],
+]);
+
+it('writes the policy with macOS\'s root group, and its install, which has no -D', function () {
+    $command = (new Policy(new FakeShell))->plan($ctx = setupContext('mac'))[0]->command;
+
+    expect($command)->toContain("sudo install -d -o root -g wheel -m 755 '".dirname($ctx->system(Policy::FILE))."'")
+        ->toContain("sudo install -o root -g wheel -m 644 \"\$tmp\" '{$ctx->system(Policy::FILE)}'")
+        ->not->toContain(' -D ')
+        ->toStartWith('(')->toEndWith('exit $status)');
+});
 
 // ─── IP forwarding and pf ───────────────────────────────────────────
 
@@ -264,22 +442,88 @@ it('adds the pf anchors where pf accepts them, also repairing the old appended o
 
 // ─── File ownership ─────────────────────────────────────────────────
 
+/** The command that lists what the web user can change in the app (Permissions::changeable()). */
+const CHANGEABLE = 'sudo -n find :app -path :storage -prune -o ! -type l \( -user :user -print -o -exec sudo -n -u :user sh -c :test sh {} + \)';
+
 it('keeps the code, bootstrap/cache included, read-only for the web user', function () {
     $ctx = setupContext();
+    mkdir($ctx->app('bootstrap/cache'), 0755, true);
+    mkdir($ctx->app('app'));
     // The web user can write everything: a wrong ownership to fix
-    $shell = (new FakeShell)->on('sudo -n -u :user test -w :path', fn () => '')->on('sudo -n -u :user test -r :path', fn () => '');
+    $everything = array_map(fn (string $path) => $ctx->app($path), ['', 'app', 'artisan', 'bin', 'bin/wgla', 'bin/wgla-helper', 'bootstrap', 'bootstrap/cache', 'frankenphp']);
+    $shell = (new FakeShell)
+        ->on('sudo -n -u :user test -w :path', fn () => '')
+        ->on('sudo -n -u :user test -r :path', fn () => '')
+        ->on(CHANGEABLE, fn (array $b) => $b['user'] === 'www-data' && $b['storage'] === $ctx->app('storage') ? implode("\n", array_reverse($everything)) : throw new CommandFailed);
     $step = new Permissions($shell);
 
-    expect($step->check($ctx))
-        ->toContain('www-data can change the code in bootstrap/cache/')
-        ->toContain('www-data can change the code in app/')
-        ->toContain('www-data can change the code in the app directory');
+    expect($step->check($ctx))->toBe(['www-data can change the code: the app directory, app/, artisan, bin/, bin/wgla and 4 more']);
 
     [$code, $storage] = $step->plan($ctx);
     expect($code->command)->toBe("sudo chown -R 'deploy:deploy' '{$ctx->app()}' && sudo chmod -R go-w '{$ctx->app()}'")
         ->and($storage->command)->toContain("sudo chown -R 'www-data:www-data' '{$ctx->app('storage')}' &&")
         ->and($storage->command)->not->toContain('bootstrap/cache');
+
+    // Fixed: nothing but storage/
+    $shell->on(CHANGEABLE, fn () => '');
+    expect($step->check($ctx))->toBe([]);
+
+    // Not known is not fine
+    $shell->on(CHANGEABLE, fn () => throw new CommandFailed('sudo: a password is required'));
+    expect($step->check($ctx))->toBe(["It can't be told what www-data can change in the app"]);
 });
+
+it('finds every file outside storage/ that the web user can change, not only directories', function (bool $owner, array $expected) {
+    if (function_exists('posix_geteuid') && posix_geteuid() === 0) {
+        $this->markTestSkipped('root can write anything');
+    }
+    $ctx = setupContext();
+    $app = $ctx->app();
+    // As wg:install leaves it (read-only), but for what each case makes writable
+    foreach (['app', 'bootstrap/cache', 'deploy', '.git/hooks', 'storage/logs'] as $dir) {
+        mkdir("{$app}/{$dir}", 0755, true);
+    }
+    foreach (['artisan', 'frankenphp', 'app/Thing.php', 'deploy/Caddyfile', '.git/hooks/post-checkout', 'storage/logs/laravel.log', '.env'] as $file) {
+        file_put_contents("{$app}/{$file}", '');
+    }
+    symlink('storage/logs', "{$app}/logs"); // a symlink: its target is what counts
+    exec('chmod -R a-w '.escapeshellarg($app));
+    chmod("{$app}/frankenphp", 0755);
+    chmod("{$app}/.git/hooks/post-checkout", 0755);
+    chmod("{$app}/.git/hooks", 0755);
+    chmod("{$app}/storage", 0755);
+    chmod("{$app}/storage/logs", 0755);
+
+    // The real command, with a sudo that runs it as us. Owner: the web user is us, who owns all
+    // of it (and could make anything writable); else root, who owns none of it here.
+    mkdir("{$this->tmp}/bin");
+    file_put_contents("{$this->tmp}/bin/sudo", "#!/bin/sh\nwhile [ \$# -gt 0 ]; do case \$1 in -u) shift 2 ;; -*) shift ;; *) break ;; esac; done\nexec \"\$@\"\n");
+    chmod("{$this->tmp}/bin/sudo", 0755);
+    $shell = (new FakeShell)->on(CHANGEABLE, function () use (&$shell) {
+        $process = Process::fromShellCommandline(end($shell->calls)['bound'], env: ['PATH' => "{$this->tmp}/bin:/usr/bin:/bin"]);
+        $process->run();
+
+        return $process->isSuccessful() ? $process->getOutput() : throw new CommandFailed($process->getErrorOutput());
+    });
+    $ctx->answers['web_user'] = $owner ? trim((string) shell_exec('id -un')) : 'root';
+    $step = new class($shell) extends Permissions
+    {
+        public function changeable(Context $ctx): ?array
+        {
+            return parent::changeable($ctx);
+        }
+    };
+
+    try {
+        expect($step->changeable($ctx))->toBe($expected);
+    } finally {
+        exec('chmod -R u+w '.escapeshellarg($app));
+    }
+})->with([
+    'what it can write' => [false, ['.git/hooks/', '.git/hooks/post-checkout', 'frankenphp']],
+    'what it owns, writable or not' => [true, ['the app directory', '.env', '.env.example', '.git/', '.git/hooks/', '.git/hooks/post-checkout', 'app/', 'app/Thing.php',
+        'artisan', 'bin/', 'bin/wgla', 'bin/wgla-helper', 'bootstrap/', 'bootstrap/cache/', 'deploy/', 'deploy/Caddyfile', 'frankenphp']],
+]);
 
 it('only applies when the API runs as its own user', function () {
     expect((new Permissions(new FakeShell))->applies(setupContext()))->toBeTrue()
@@ -307,11 +551,23 @@ it('installs the wgla shortcut root-owned, and again when it changes', function 
 it('runs each wgla command as the user it belongs to', function (array $args, array $env, string $expected) {
     $ctx = setupContext();
     mkdir("{$this->tmp}/bin");
-    foreach (['sudo', 'php'] as $stub) {
-        // Each prints its argv; php lists commands as `artisan list wg --raw` does
-        $list = $stub === 'php' ? "[ \"\$2\" = list ] && { printf 'wg:links         List WireGuard links\\nwg:link:create   Create a WireGuard link\\n'; exit; }\n" : '';
-        file_put_contents("{$this->tmp}/bin/{$stub}", "#!/bin/sh\n{$list}printf '%s' {$stub}; for a in \"\$@\"; do printf ' [%s]' \"\$a\"; done\n");
+    foreach (['sudo', 'php', 'composer'] as $stub) {
+        // Each prints its argv (a line each); php lists commands as `artisan list wg --raw` does,
+        // and sudo runs the check for an unfinished update for real, as the user it is given
+        $list = match ($stub) {
+            'php' => "[ \"\$2\" = list ] && { printf 'wg:links         List WireGuard links\\nwg:link:create   Create a WireGuard link\\n'; exit; }\n",
+            'sudo' => "[ \"\$5\" = sh ] && { shift 4; exec \"\$@\"; }\n",
+            default => '',
+        };
+        file_put_contents("{$this->tmp}/bin/{$stub}", "#!/bin/sh\n{$list}printf '%s' {$stub}; for a in \"\$@\"; do printf ' [%s]' \"\$a\"; done; echo\n");
         chmod("{$this->tmp}/bin/{$stub}", 0755);
+    }
+    // Where git keeps wg:update's record of an update in progress (relative to the app)
+    file_put_contents("{$this->tmp}/bin/git", "#!/bin/sh\n[ \"\$*\" = 'rev-parse --git-path wgla-update' ] && echo .git/wgla-update\n");
+    chmod("{$this->tmp}/bin/git", 0755);
+    if ($env['RECORD'] ?? false) {
+        mkdir($ctx->app('.git'));
+        file_put_contents($ctx->app('.git/wgla-update'), '{"from":"aaa111","to":"bbb222","frankenphp":null}');
     }
     // php is the stub; the web user is whoever runs the test when the case asks for it
     $me = trim((string) shell_exec('id -un'));
@@ -321,15 +577,19 @@ it('runs each wgla command as the user it belongs to', function (array $args, ar
     file_put_contents("{$this->tmp}/wgla", (new Shortcut(new FakeShell))->script($ctx));
     chmod("{$this->tmp}/wgla", 0755);
 
-    $process = new Process(["{$this->tmp}/wgla", ...$args], env: ['PATH' => "{$this->tmp}/bin:/usr/bin:/bin", ...array_diff_key($env, ['AS_WEB' => 1])]);
+    $process = new Process(["{$this->tmp}/wgla", ...$args], env: ['PATH' => "{$this->tmp}/bin:/usr/bin:/bin", ...array_diff_key($env, ['AS_WEB' => 1, 'RECORD' => 1])]);
     $process->run();
 
-    expect(trim($process->getOutput()))->toBe(strtr($expected, ['PHP' => "{$this->tmp}/bin/php", 'ARTISAN' => "{$ctx->app()}/artisan"]));
+    expect(trim($process->getOutput()))->toBe(strtr($expected, ['PHP' => "{$this->tmp}/bin/php", 'ARTISAN' => "{$ctx->app()}/artisan", 'APP' => $ctx->app()]), $process->getErrorOutput());
 })->with([
     'no command: the commands, as wgla takes them' => [[], [], "Usage: wgla <command> [arguments] [options]\n\n  links         List WireGuard links\n  link:create   Create a WireGuard link\n\nwgla help <command> shows its arguments and options."],
     'a link command' => [['links'], [], 'sudo [-H] [-u] [www-data] [--] [PHP] [ARTISAN] [wg:links]'],
     'arguments as given' => [['wg:peer:create', 'wg0', "--name=Ана's phone"], [], "sudo [-H] [-u] [www-data] [--] [PHP] [ARTISAN] [wg:peer:create] [wg0] [--name=Ана's phone]"],
     'install and update' => [['update', '--to=v1.2.0'], [], 'sudo [-H] [-u] [deploy] [--] [PHP] [ARTISAN] [wg:update] [--to=v1.2.0]'],
+    // It may have left vendor/ unable to boot artisan, which has to go back
+    'update after one that never ended: its dependencies first' => [['update'], ['RECORD' => true],
+        "sudo [-H] [-u] [deploy] [--] [composer] [install] [--no-dev] [--optimize-autoloader] [--no-interaction] [--working-dir=APP]\nsudo [-H] [-u] [deploy] [--] [PHP] [ARTISAN] [wg:update]"],
+    '... but no other command' => [['install'], ['RECORD' => true], 'sudo [-H] [-u] [deploy] [--] [PHP] [ARTISAN] [wg:install]'],
     'help, as whoever asks' => [['help'], [], 'php [ARTISAN] [wg:help]'],
     "a command's help" => [['help', 'peer:create'], [], 'php [ARTISAN] [help] [wg:peer:create]'],
     'a backup passphrase' => [['backup'], ['WGLA_BACKUP_PASSPHRASE' => 'secret phrase'], 'sudo [-H] [-u] [www-data] [--preserve-env=WGLA_BACKUP_PASSPHRASE] [--] [PHP] [ARTISAN] [wg:backup]'],
@@ -350,8 +610,15 @@ it('runs bin/wgla as is from a checkout: this project, the shell\'s php, users f
     // sudo -n fails when a password is needed (SUDO_NEEDS_PASSWORD)
     file_put_contents("{$this->tmp}/bin/sudo", "#!/bin/sh\nprintf sudo; for a in \"\$@\"; do printf ' [%s]' \"\$a\"; done; echo\n"
         ."[ \"\$1\" = -n ] && [ -n \"\$SUDO_NEEDS_PASSWORD\" ] && exit 1; exit 0\n");
-    chmod("{$this->tmp}/bin/php", 0755);
-    chmod("{$this->tmp}/bin/sudo", 0755);
+    file_put_contents("{$this->tmp}/bin/composer", "#!/bin/sh\nprintf composer; for a in \"\$@\"; do printf ' [%s]' \"\$a\"; done; echo\n");
+    file_put_contents("{$this->tmp}/bin/git", "#!/bin/sh\n[ \"\$*\" = 'rev-parse --git-path wgla-update' ] && echo .git/wgla-update\n");
+    foreach (['php', 'sudo', 'composer', 'git'] as $stub) {
+        chmod("{$this->tmp}/bin/{$stub}", 0755);
+    }
+    if ($env['RECORD'] ?? false) {
+        mkdir("{$app}/.git");
+        file_put_contents("{$app}/.git/wgla-update", '{"from":"aaa111","to":"bbb222","frankenphp":null}');
+    }
     // Run through a relative symlink elsewhere, as when it's linked into the PATH
     $command = "{$app}/bin/wgla";
     if ($symlink) {
@@ -359,14 +626,20 @@ it('runs bin/wgla as is from a checkout: this project, the shell\'s php, users f
         symlink('../checkout/bin/wgla', $command = "{$this->tmp}/links/wgla");
     }
 
-    $process = new Process([$command, ...$args], env: ['PATH' => "{$this->tmp}/bin:/usr/bin:/bin", ...$env]);
+    $process = new Process([$command, ...$args], env: ['PATH' => "{$this->tmp}/bin:/usr/bin:/bin", ...array_diff_key($env, ['RECORD' => 1])]);
     $process->run();
 
     expect(trim($process->getOutput()))->toBe(strtr($expected, [
-        'PHP' => "{$this->tmp}/bin/php", 'ARTISAN' => realpath($app).'/artisan', 'BESIDE' => realpath($app).'/bin/wgla-helper',
+        'PHP' => "{$this->tmp}/bin/php", 'ARTISAN' => realpath($app).'/artisan', 'BESIDE' => realpath($app).'/bin/wgla-helper', 'APP' => realpath($app),
     ]), $process->getErrorOutput());
 })->with([
     'the web user from .env' => ["WGLA_WEB_USER=\"www-data\"\nWIREGUARD_HELPER=INSTALLED\n", ['links'], [], 'sudo [-H] [-u] [www-data] [--] [PHP] [ARTISAN] [wg:links]', false],
+    // Read as Laravel reads them, not cut at the = and stripped of quotes
+    'the web user with a comment' => ["WGLA_WEB_USER=www-data # runs the API\nWIREGUARD_HELPER=INSTALLED # by wg:install\n", ['links'], [], 'sudo [-H] [-u] [www-data] [--] [PHP] [ARTISAN] [wg:links]', false],
+    '... quoted, with export and spaces' => ["export WGLA_WEB_USER = 'www-data' # x\nWIREGUARD_HELPER=\"INSTALLED\"\n", ['links'], [], 'sudo [-H] [-u] [www-data] [--] [PHP] [ARTISAN] [wg:links]', false],
+    '... the last one' => ["WGLA_WEB_USER=nobody\nWGLA_WEB_USER=www-data\nWIREGUARD_HELPER=INSTALLED\n", ['links'], [], 'sudo [-H] [-u] [www-data] [--] [PHP] [ARTISAN] [wg:links]', false],
+    'update after one that never ended, as the owner: its dependencies first' => ["WGLA_WEB_USER=www-data\n", ['update'], ['RECORD' => true],
+        "composer [install] [--no-dev] [--optimize-autoloader] [--no-interaction] [--working-dir=APP]\nphp [ARTISAN] [wg:update]", false],
     'no web user in .env: the API runs as you' => ["WIREGUARD_HELPER=INSTALLED\n", ['links'], [], 'php [ARTISAN] [wg:links]', false],
     'update as the owner of the project (you)' => ["WGLA_WEB_USER=www-data\n", ['update'], [], 'php [ARTISAN] [wg:update]', false],
     'through a symlink' => ["WGLA_WEB_USER=www-data\n", ['links'], [], 'sudo [-H] [-u] [www-data] [--] [PHP] [ARTISAN] [wg:links]', true],
@@ -432,7 +705,7 @@ it('refuses root as the web user', function () {
         ->and($question->defaultFor(setupContext('mac')))->toBe('deploy');
 });
 
-it('renders a systemd unit for each TLS mode', function (array $answers, string $site, string $tls, string $flags) {
+it('renders a systemd unit for each TLS mode', function (array $answers, string $site, string $tls, string $bind, string $flags) {
     $ctx = setupContext(answers: $answers);
     $unit = (new Server(new FakeShell))->unit($ctx);
 
@@ -440,15 +713,70 @@ it('renders a systemd unit for each TLS mode', function (array $answers, string 
         ->toContain("User=www-data\nGroup=www-data")
         ->toContain("Environment=\"WGLA_SITE_ADDRESS={$site}\"")
         ->toContain("Environment=\"WGLA_TLS_DIRECTIVE={$tls}\"")
+        ->toContain("Environment=\"WGLA_BIND_DIRECTIVE={$bind}\"")
         ->toContain("octane:start --server=frankenphp {$flags} --caddyfile={$ctx->app()}/deploy/Caddyfile")
         ->toContain('AmbientCapabilities=CAP_NET_BIND_SERVICE')
         ->not->toContain('NoNewPrivileges=');
 })->with([
-    "Let's Encrypt" => [['tls' => 'letsencrypt', 'domain' => 'api.example.com', 'port' => '443'], 'https://api.example.com', '', '--host=0.0.0.0 --port=443 --admin-port=2019 --https'],
-    "Let's Encrypt, other port" => [['tls' => 'letsencrypt', 'domain' => 'api.example.com', 'port' => '8443'], 'https://api.example.com:8443', '', '--host=0.0.0.0 --port=8443 --admin-port=2019 --https'],
-    'own certificate' => [['tls' => 'cert', 'cert' => '/c.pem', 'key' => '/k.pem', 'port' => '443'], ':443', 'tls /c.pem /k.pem', '--host=0.0.0.0 --port=443 --admin-port=2019 --https'],
-    'behind a proxy' => [['tls' => 'http', 'bind' => '127.0.0.1', 'port' => '8080'], 'http://127.0.0.1:8080', '', '--host=127.0.0.1 --port=8080 --admin-port=2019'],
+    "Let's Encrypt" => [['tls' => 'letsencrypt', 'domain' => 'api.example.com', 'port' => '443'], 'https://api.example.com', '', '', '--host=0.0.0.0 --port=443 --admin-port=2019 --https'],
+    "Let's Encrypt, other port" => [['tls' => 'letsencrypt', 'domain' => 'api.example.com', 'port' => '8443'], 'https://api.example.com:8443', '', '', '--host=0.0.0.0 --port=8443 --admin-port=2019 --https'],
+    'own certificate' => [['tls' => 'cert', 'cert' => '/c.pem', 'key' => '/k.pem', 'port' => '443'], ':443', 'tls /c.pem /k.pem', '', '--host=0.0.0.0 --port=443 --admin-port=2019 --https'],
+    // Listening on the bind address only, for whatever Host header the proxy passes on: an IP in
+    // the site address would only match the Host header, and Caddy would listen everywhere
+    'behind a proxy' => [['tls' => 'http', 'bind' => '127.0.0.1', 'port' => '8080'], 'http://:8080', '', 'bind 127.0.0.1', '--host=127.0.0.1 --port=8080 --admin-port=2019'],
+    'behind a proxy, on IPv6' => [['tls' => 'http', 'bind' => '::1', 'port' => '8080'], 'http://:8080', '', 'bind [::1]', '--host=::1 --port=8080 --admin-port=2019'],
 ]);
+
+it('puts an IPv6 address the API listens on in brackets wherever it makes a URL of it', function () {
+    $ctx = setupContext(answers: ['tls' => 'http', 'bind' => '::1', 'port' => '8080']);
+    $server = new Server(new FakeShell);
+    // The health check asks the API there
+    $shell = (new FakeShell)
+        ->on('sudo -n -u :user sudo -n :helper version', fn () => helperVersion())
+        ->on("curl -s -o /dev/null -w '%{http_code}' --max-time 3 :url", fn (array $b) => $b['url'] === 'http://[::1]:8080/health' ? '200' : '404');
+
+    expect($server->localUrl($ctx))->toBe(['http://[::1]:8080', ''])
+        ->and($server->publicUrl($ctx))->toBe('http://[::1]:8080 (behind your proxy)')
+        ->and((new Health($shell, $server))->check($ctx))->toBe([])
+        ->and($server->localUrl(setupContext(answers: ['tls' => 'http', 'bind' => '127.0.0.1', 'port' => '8080'])))->toBe(['http://127.0.0.1:8080', '']);
+});
+
+/** The curl that asks the API which code it runs (Server::staleness()). */
+const STATUS_CURL = "curl -s --max-time 3 -w '\\n%{http_code}' -H @- :url";
+
+/** An API that says it runs the code on disk, and an API key in .env to ask it with. */
+function currentApi(FakeShell $shell, Context $ctx): FakeShell
+{
+    file_put_contents($ctx->app('.env'), "API_KEY=secret\n");
+
+    return $shell->on(STATUS_CURL, fn () => json_encode(['app' => ['code' => App\Services\Server::codeFingerprint($ctx->app())]])."\n200");
+}
+
+it('restarts the API when deploy/Caddyfile changes, which a reload doesn\'t read', function () {
+    $ctx = setupContext(answers: ['tls' => 'http', 'bind' => '127.0.0.1', 'port' => '8080']);
+    touch($ctx->app('frankenphp'));
+    chmod($ctx->app('frankenphp'), 0755);
+    mkdir($ctx->app('deploy'));
+    file_put_contents($ctx->app('deploy/Caddyfile'), "{\$WGLA_SITE_ADDRESS} {\n}\n");
+    $shell = currentApi(new FakeShell, $ctx)
+        ->on('systemctl is-enabled wgla', fn () => 'enabled')
+        ->on('systemctl is-active wgla', fn () => 'active')
+        ->otherwise(fn () => throw new CommandFailed);
+    $step = new Server($shell);
+    mkdir(dirname($ctx->system(Server::UNIT)), 0755, true);
+    file_put_contents($ctx->system(Server::UNIT), $step->unit($ctx));
+
+    expect($step->check($ctx))->toBe([])
+        ->and($step->unit($ctx))->toContain("\n# Caddyfile sha256:".hash_file('sha256', $ctx->app('deploy/Caddyfile'))."\n");
+
+    // An update brings a new one. The code fingerprint leaves it out, and the unit's ExecReload
+    // (octane:reload) only restarts the workers.
+    file_put_contents($ctx->app('deploy/Caddyfile'), "{\$WGLA_SITE_ADDRESS} {\n\tencode gzip\n}\n");
+
+    expect($step->check($ctx))->toBe(['deploy/Caddyfile changed: the API only reads it when it starts'])
+        ->and(array_map(fn ($action) => $action->command, $step->plan($ctx))[1])
+        ->toBe('sudo systemctl daemon-reload && sudo systemctl enable wgla 2> /dev/null && sudo systemctl restart wgla');
+});
 
 it('explains the downsides of a non-standard HTTPS port', function () {
     $ctx = setupContext(answers: ['tls' => 'letsencrypt']);
@@ -473,6 +801,7 @@ it('wants the service installed, enabled and running', function () {
     expect($step->check($ctx))->toBe(['The wgla service is not enabled and running']);
 
     $shell->on('systemctl is-enabled wgla', fn () => 'enabled')->on('systemctl is-active wgla', fn () => 'active');
+    currentApi($shell, $ctx);
     expect($step->check($ctx))->toBe([]);
 
     $ctx->answers['port'] = '9090';
@@ -489,10 +818,13 @@ it('reloads a running API that still serves the code from before a deploy', func
         ->on('systemctl is-enabled wgla', fn () => 'enabled')
         ->on('systemctl is-active wgla', fn () => 'active')
         ->on(':bin version', fn () => 'FrankenPHP v99.0.0 PHP 8.5.0 Caddy v2.10.0')
-        ->on("curl -s --max-time 3 -w '\\n%{http_code}' -H @- :url", fn (array $b, ?string $input) => $b['url'] === 'http://127.0.0.1:8080/status' && $input === "api-key: secret\n"
+        ->on(STATUS_CURL, fn (array $b, ?string $input) => $b['url'] === 'http://127.0.0.1:8080/status' && $input === "api-key: secret\n"
             ? match ($running) {
                 'older code' => json_encode(['app' => ['code' => 'older0000000000']])."\n200",
                 'another key' => json_encode(['error' => 'Unauthorized'])."\n403",
+                'no answer' => throw new CommandFailed('curl: (28) Operation timed out after 3001 milliseconds'),
+                'an error' => "<html>Bad Gateway</html>\n502",
+                'no code' => json_encode(['status' => 'ok'])."\n200",
                 default => json_encode(['app' => ['code' => $onDisk]])."\n200",
             }
             : throw new CommandFailed);
@@ -507,7 +839,95 @@ it('reloads a running API that still serves the code from before a deploy', func
     'after a deploy' => ['older code', ['The API still runs the code from before the last deploy'], ['sudo systemctl reload wgla']],
     'after a new API key' => ['another key', ["The API doesn't take the API key in .env: it still runs with its old settings"], ['sudo systemctl restart wgla']],
     'up to date' => ['current', [], []],
+    // Can't tell is not current: whatever it runs, a restart runs what's on disk
+    'not answering (hanging, or not up)' => ['no answer', ["The API doesn't answer at http://127.0.0.1:8080/status, so it can't be told which code it runs"], ['sudo systemctl restart wgla']],
+    'failing' => ['an error', ["The API doesn't say which code it runs (http://127.0.0.1:8080/status answers 502)"], ['sudo systemctl restart wgla']],
+    'not saying' => ['no code', ["The API doesn't say which code it runs (http://127.0.0.1:8080/status answers 200)"], ['sudo systemctl restart wgla']],
 ]);
+
+it('can\'t ask the API which code it runs without an API key, and says how to set one', function () {
+    $ctx = setupContext(answers: ['tls' => 'http', 'bind' => '127.0.0.1', 'port' => '8080']);
+    touch($ctx->app('frankenphp'));
+    chmod($ctx->app('frankenphp'), 0755);
+    $shell = (new FakeShell)
+        ->on('systemctl is-enabled wgla', fn () => 'enabled')
+        ->on('systemctl is-active wgla', fn () => 'active')
+        ->on(':bin version', fn () => 'FrankenPHP v99.0.0 PHP 8.5.0 Caddy v2.10.0');
+    $step = new Server($shell);
+    mkdir(dirname($ctx->system(Server::UNIT)), 0755, true);
+    file_put_contents($ctx->system(Server::UNIT), $step->unit($ctx));
+
+    // A restart wouldn't change that: the environment step sets the key
+    expect($step->check($ctx))->toBe(['There is no API_KEY in .env to ask the API which code it runs'])
+        ->and($step->plan($ctx))->toBe([])
+        ->and($step->manual($ctx))->toBe('Set API_KEY in .env (php artisan wg:install --step=environment does).');
+});
+
+it('waits after its fix until the API serves the code on disk, for a while', function (string $before, int $answers, array $problems, int $waited) {
+    Sleep::fake();
+    $ctx = setupContext(answers: ['tls' => 'http', 'bind' => '127.0.0.1', 'port' => '8080']);
+    touch($ctx->app('frankenphp'));
+    chmod($ctx->app('frankenphp'), 0755);
+    file_put_contents($ctx->app('.env'), "API_KEY=secret\n");
+    // Until it has been asked $answers times, the API is what $before says: reloading (the old
+    // code), restarting (not up), or still running with an old key (which no wait changes)
+    $asked = 0;
+    $shell = (new FakeShell)
+        ->on('systemctl is-enabled wgla', fn () => 'enabled')
+        ->on('systemctl is-active wgla', fn () => 'active')
+        ->on(':bin version', fn () => 'FrankenPHP v99.0.0 PHP 8.5.0 Caddy v2.10.0')
+        ->on(STATUS_CURL, function () use (&$asked, $answers, $before, $ctx) {
+            return ++$asked > $answers ? json_encode(['app' => ['code' => App\Services\Server::codeFingerprint($ctx->app())]])."\n200" : match ($before) {
+                'old code' => json_encode(['app' => ['code' => 'older0000000000']])."\n200",
+                'not up' => throw new CommandFailed('curl: (7) Failed to connect'),
+                'old key' => json_encode(['error' => 'Unauthorized'])."\n403",
+            };
+        });
+    $step = new Server($shell);
+    mkdir(dirname($ctx->system(Server::UNIT)), 0755, true);
+    file_put_contents($ctx->system(Server::UNIT), $step->unit($ctx));
+
+    expect($step->recheck($ctx))->toBe($problems);
+    Sleep::assertSleptTimes($waited);
+})->with([
+    'reloaded at once' => ['old code', 0, [], 0],
+    'reloaded after a few seconds' => ['old code', 3, [], 3],
+    'restarted after a few seconds' => ['not up', 5, [], 5],
+    // Bounded: an update that never gets its code served fails, and goes back
+    'never reloaded' => ['old code', PHP_INT_MAX, ['The API still runs the code from before the last deploy'], Server::SETTLE_ATTEMPTS - 1],
+    'never up' => ['not up', PHP_INT_MAX, ["The API doesn't answer at http://127.0.0.1:8080/status, so it can't be told which code it runs"], Server::SETTLE_ATTEMPTS - 1],
+    'an old key: not waited for' => ['old key', PHP_INT_MAX, ["The API doesn't take the API key in .env: it still runs with its old settings"], 0],
+]);
+
+it('runs the app\'s own FrankenPHP, not another one on the PATH', function () {
+    $ctx = setupContext(answers: ['tls' => 'http', 'bind' => '127.0.0.1', 'port' => '8080']);
+    // The one this step downloads, and one that FrankenPHP's own installer put in /usr/local/bin
+    $other = "{$this->tmp}/usr/local/bin";
+    mkdir($other, 0755, true);
+    foreach ([$ctx->app('frankenphp'), "{$other}/frankenphp"] as $binary) {
+        file_put_contents($binary, "#!/bin/sh\n");
+        chmod($binary, 0755);
+    }
+    $unit = (new Server(new FakeShell))->unit($ctx);
+    preg_match('/^Environment="PATH=([^"]+)"$/m', $unit, $path);
+    expect($path)->not->toBe([], 'The unit sets the PATH');
+
+    // Octane takes the first frankenphp on the PATH, then looks in the app
+    expect((string) file_get_contents(__DIR__.'/../../../vendor/laravel/octane/src/FrankenPhp/Concerns/FindsFrankenPhpBinary.php'))
+        ->toContain("(new ExecutableFinder())->find('frankenphp', null, [base_path()])");
+    $find = function (string $path) use ($ctx) {
+        $before = getenv('PATH');
+        putenv("PATH={$path}");
+        try {
+            return (new ExecutableFinder)->find('frankenphp', null, [$ctx->app()]);
+        } finally {
+            putenv("PATH={$before}");
+        }
+    };
+
+    expect($find(str_replace(':/usr/local/bin:', ":{$other}:", $path[1])))->toBe($ctx->app('frankenphp'))
+        ->and($find(str_replace('/usr/local/bin', $other, Server::SERVICE_PATH)))->toBe("{$other}/frankenphp", 'Without the app first, the other one');
+});
 
 it('fingerprints the code by content, not by timestamps', function () {
     $ctx = setupContext();
@@ -535,14 +955,18 @@ it('fingerprints the code by content, not by timestamps', function () {
 // ─── Installer ──────────────────────────────────────────────────────
 
 it('saves answers in .env and reads them back on the next run', function () {
-    $ctx = setupContext(answers: ['tls' => 'cert', 'port' => '8443', 'forward' => false]);
+    $ctx = setupContext(answers: ['tls' => 'cert', 'port' => '8443', 'forward' => false, 'allow_default_route' => true, 'allow_own_networks' => false]);
     file_put_contents($ctx->app('.env'), "APP_KEY=x\n");
     $installer = new Installer((new FakeShell)->otherwise(fn () => 'deploy'), $ctx->helperPath);
 
     $installer->save($ctx);
     $again = $installer->context(['port' => '9443'], $ctx->app(), $ctx->root);
+    $env = new EnvFile($ctx->app('.env'));
 
-    expect((new EnvFile($ctx->app('.env')))->get('WGLA_SERVER_TLS'))->toBe('cert')
+    expect($env->get('WGLA_SERVER_TLS'))->toBe('cert')
+        ->and($env->get('WGLA_ALLOW_DEFAULT_ROUTE'))->toBe('true')
+        ->and($env->get('WGLA_ALLOW_OWN_NETWORKS'))->toBe('false')
+        ->and((new Policy(new FakeShell))->content($again))->toBe((new Policy(new FakeShell))->content($ctx), 'The same policy on the next run')
         ->and($again->answer('tls'))->toBe('cert')
         ->and($again->answer('forward'))->toBe('false')
         ->and($again->answer('port'))->toBe('9443', 'Options win over saved answers');
@@ -598,7 +1022,7 @@ it('replaces a FrankenPHP that is older than Octane needs, and restarts the API 
     $ctx = setupContext(answers: ['tls' => 'http', 'bind' => '127.0.0.1', 'port' => '8080']);
     touch($ctx->app('frankenphp'));
     chmod($ctx->app('frankenphp'), 0755);
-    $shell = (new FakeShell)
+    $shell = currentApi(new FakeShell, $ctx)
         ->on('systemctl is-enabled wgla', fn () => 'enabled')
         ->on('systemctl is-active wgla', fn () => 'active')
         ->on(':bin version', fn () => 'FrankenPHP v1.0.0 PHP 8.5.0 Caddy v2.8.0 h1:abc')
@@ -667,12 +1091,59 @@ it('keeps the installed FrankenPHP unless a complete, working one was downloaded
 
     expect($process->getExitCode())->toBe($exit, $process->getErrorOutput())
         ->and(file_get_contents($ctx->app('frankenphp')))->toBe($installed)
-        ->and(file_exists($ctx->app('frankenphp.new')))->toBeFalse('Nothing half-downloaded is left behind');
+        ->and(file_exists($ctx->app('frankenphp.new')))->toBeFalse('Nothing half-downloaded is left behind')
+        ->and(file_exists($ctx->app('frankenphp.previous')))->toBe($exit === 0, 'Only what was replaced is kept');
 })->with([
     'a working binary' => ["printf '#!/bin/sh\\necho FrankenPHP v9.9.9\\n' > frankenphp.new", 0, "#!/bin/sh\necho FrankenPHP v9.9.9\n"],
     'a failed download' => ['exit 22', 1, 'old binary'],
     'an error page instead of a binary' => ["printf '<html>rate limited</html>' > frankenphp.new", 1, 'old binary'],
 ]);
+
+it('keeps the FrankenPHP a download replaces, for the way back from a failed update to put back', function () {
+    $ctx = setupContext();
+    file_put_contents($ctx->app('frankenphp'), 'old binary');
+    chmod($ctx->app('frankenphp'), 0755);
+    mkdir("{$this->tmp}/bin");
+    file_put_contents("{$this->tmp}/bin/curl", "#!/bin/sh\nprintf '#!/bin/sh\\necho FrankenPHP v9.9.9\\n' > frankenphp.new\n");
+    chmod("{$this->tmp}/bin/curl", 0755);
+    $updater = new Updater((new FakeShell)->on('git -C :app rev-parse --git-path wgla-update', fn () => "{$this->tmp}/wgla-update"));
+    $before = $updater->begin($ctx, 'aaa111', 'bbb222')['frankenphp'];
+
+    expect($updater->restoreFrankenPhp($ctx, $before))->toBeFalse('Nothing replaced it yet');
+
+    // Stage 2 of the update downloads the current release
+    $process = Process::fromShellCommandline((new Server((new FakeShell)->otherwise(fn () => throw new CommandFailed)))->downloadFrankenPhp($ctx), env: ['PATH' => "{$this->tmp}/bin:/usr/bin:/bin"]);
+    $process->run();
+    expect($process->getExitCode())->toBe(0, $process->getErrorOutput())
+        ->and(file_get_contents($ctx->app('frankenphp.previous')))->toBe('old binary');
+
+    expect($updater->restoreFrankenPhp($ctx, $before))->toBeTrue()
+        ->and(file_get_contents($ctx->app('frankenphp')))->toBe('old binary')
+        ->and($updater->restoreFrankenPhp($ctx, $before))->toBeFalse('Back already');
+
+    // Replaced again, with the one from before gone: there's nothing to put back
+    file_put_contents($ctx->app('frankenphp'), 'another binary');
+    expect($updater->restoreFrankenPhp($ctx, $before))->toBeNull()
+        ->and(file_get_contents($ctx->app('frankenphp')))->toBe('another binary')
+        ->and($updater->restoreFrankenPhp($ctx, null))->toBeFalse('There was none before the update');
+});
+
+it('records an update in git\'s directory until it is over', function () {
+    $ctx = setupContext();
+    mkdir($ctx->app('.git'));
+    // As git prints it: relative to the directory it ran in (-C, the app)
+    $updater = new Updater((new FakeShell)->on('git -C :app rev-parse --git-path wgla-update', fn () => '.git/wgla-update'));
+
+    expect($updater->recordPath($ctx))->toBe($ctx->app('.git/wgla-update'))
+        ->and($updater->unfinished($ctx))->toBeNull();
+
+    $update = $updater->begin($ctx, 'aaa111', 'bbb222');
+
+    expect($update)->toBe(['from' => 'aaa111', 'to' => 'bbb222', 'frankenphp' => null], 'No FrankenPHP before it')
+        ->and($updater->unfinished($ctx))->toBe($update, 'What the next run reads')
+        ->and($updater->end($ctx))->toBeTrue()
+        ->and($updater->unfinished($ctx))->toBeNull();
+});
 
 it('tells an update whether FrankenPHP changed', function (?string $downloaded, int $exit, ?bool $changed) {
     $ctx = setupContext();

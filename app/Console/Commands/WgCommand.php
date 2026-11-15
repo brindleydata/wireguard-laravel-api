@@ -2,6 +2,7 @@
 
 namespace App\Console\Commands;
 
+use App\DTOs\InterfaceInfo;
 use App\Services\Server;
 use App\Services\WireGuard;
 use Closure;
@@ -114,12 +115,39 @@ class WgCommand extends Command
     }
 
     /**
-     * A whole-number option; null when it wasn't given.
+     * A key from the file an option names (- for stdin), its first line: a secret is never an
+     * option itself, which every user on the machine can read in `ps`. Null when not given.
+     */
+    protected function secretFrom(string $option): ?string
+    {
+        $file = $this->option($option);
+        if ($file === null || $file === '') {
+            return null;
+        }
+        $content = $file === '-' ? stream_get_contents(STDIN) : @file_get_contents($file);
+        if ($content === false) {
+            throw new InvalidArgumentException("Can't read {$file} (--{$option}).");
+        }
+
+        return trim(explode("\n", ltrim($content), 2)[0]);
+    }
+
+    /** What a link lets its peers route that would take the server's own traffic, in words. */
+    protected function routesAllowed(InterfaceInfo $link): string
+    {
+        return implode(', ', array_filter([
+            $link->allow_default_route ? 'a default route' : null,
+            $link->allow_own_networks ? "this server's own networks" : null,
+        ])) ?: 'networks of their own only';
+    }
+
+    /**
+     * A whole-number option; null when it wasn't given, or given empty (the default: `--mtu=`).
      */
     protected function number(string $name): ?int
     {
         $value = $this->option($name);
-        if ($value === null) {
+        if ($value === null || $value === '') {
             return null;
         }
 

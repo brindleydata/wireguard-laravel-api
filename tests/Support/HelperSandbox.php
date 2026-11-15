@@ -19,6 +19,9 @@ final class HelperSandbox
 {
     private const STUBS = ['wg', 'wg-quick', 'nft', 'iptables', 'ip6tables', 'systemctl', 'pfctl'];
 
+    /** Lookups of the host's own addresses (route policy): answered, but not in calls() */
+    private const QUIET_STUBS = ['ip', 'ifconfig', 'route'];
+
     public readonly string $dir;
 
     public readonly string $confDir;
@@ -48,8 +51,22 @@ final class HelperSandbox
         foreach (self::STUBS as $stub) {
             $this->addStub($stub);
         }
+        foreach (self::QUIET_STUBS as $stub) {
+            $this->addStub($stub, quiet: true);
+        }
         // Like a host where nothing in ip6tables drops forwarded traffic (tests change it as needed)
         $this->respond('ip6tables -S FORWARD', '-P FORWARD ACCEPT');
+        // The host's own addresses and gateway, as FakeHost has them
+        $this->respond('ip -o address show', "1: lo    inet 127.0.0.1/8 scope host lo\n2: eth0    inet 192.0.2.10/24 brd 192.0.2.255 scope global eth0\n2: eth0    inet6 2001:db8:f::10/64 scope global\n2: eth0    inet6 fe80::1/64 scope link");
+        $this->respond('ip route show default', 'default via 192.0.2.1 dev eth0 proto dhcp');
+        $this->respond('ifconfig -a', "lo0: flags=8049<UP,LOOPBACK,RUNNING,MULTICAST> mtu 16384\n\tinet 127.0.0.1 netmask 0xff000000\nen0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500\n\tinet6 fe80::1%en0 prefixlen 64 scopeid 0x4\n\tinet 192.0.2.10 netmask 0xffffff00 broadcast 192.0.2.255\n\tinet6 2001:db8:f::10 prefixlen 64 autoconf secured");
+        $this->respond('route -n get default', "   route to: default\ndestination: default\n       mask: default\n    gateway: 192.0.2.1\n  interface: en0");
+    }
+
+    /** The server's route policy (wg:install writes it as root; WGLA_POLICY points here) */
+    public function policy(bool $default_route = false, bool $own_networks = false): void
+    {
+        file_put_contents("{$this->dir}/policy.conf", "# Written by php artisan wg:install: what peers of any link may route (the root helper enforces it)\nallow_default_route=".($default_route ? 'true' : 'false')."\nallow_own_networks=".($own_networks ? 'true' : 'false')."\n");
     }
 
     public static function isRoot(): bool
@@ -75,6 +92,7 @@ final class HelperSandbox
             'WGLA_OS' => $this->os,
             'WGLA_CONF_DIR' => $this->confDir,
             'WGLA_RUN_DIR' => $this->runDir,
+            'WGLA_POLICY' => "{$this->dir}/policy.conf",
             'WGLA_SANDBOX' => $this->dir,
             'WGLA_INPUT' => "{$this->dir}/input",
             // Stubs first; no sbin dirs, so a real iptables/nft is never picked up
@@ -149,13 +167,16 @@ final class HelperSandbox
         self::$dirs = [];
     }
 
-    private function addStub(string $name): void
+    private function addStub(string $name, bool $quiet = false): void
     {
-        $stub = <<<'BASH'
+        $log = $quiet ? 'lookups' : 'calls';
+        $stub = <<<BASH
             #!/bin/bash
             # Records its argv and stdin, then prints/exits as configured by HelperSandbox::respond()
-            name=${0##*/}
-            { printf '%s' "$name"; printf '\037%s' "$@"; printf '\n'; } >> "$WGLA_SANDBOX/calls"
+            name=\${0##*/}
+            { printf '%s' "\$name"; printf '\\037%s' "\$@"; printf '\\n'; } >> "\$WGLA_SANDBOX/{$log}"
+            BASH;
+        $stub .= "\n".<<<'BASH'
             for arg in "$@"; do
                 if [ "$arg" = - ] || [ "$arg" = /dev/stdin ]; then
                     n=$(ls "$WGLA_SANDBOX" | grep -c '^stdin\.' || true)

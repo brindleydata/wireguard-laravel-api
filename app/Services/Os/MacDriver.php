@@ -91,6 +91,12 @@ class MacDriver extends BaseDriver
         return 'en0';
     }
 
+    public function resolves(string $host): bool
+    {
+        // The system resolver's answer: an address line, or nothing (with exit status 0) when it doesn't resolve
+        return preg_match('/^ipv?6?_?address: /m', (string) $this->shell->tryRun('dscacheutil -q host -a name :host', ['host' => $host], timeout: 10)) === 1;
+    }
+
     public function ownAddresses(): array
     {
         // "\tinet 192.0.2.10 netmask 0xffffff00 …", "\tinet6 fe80::1%lo0 prefixlen 64 …"

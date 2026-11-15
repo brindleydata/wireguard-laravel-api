@@ -3,6 +3,7 @@
 namespace App\Services;
 
 use App\Exceptions\CommandFailedException;
+use Symfony\Component\Process\Exception\ProcessTimedOutException;
 use Symfony\Component\Process\Process;
 
 class Shell
@@ -26,7 +27,12 @@ class Shell
             $process->setInput($input);
         }
 
-        $process->run();
+        try {
+            $process->run();
+        } catch (ProcessTimedOutException) {
+            // A failure like any other (a SystemException), not one the error handler takes for a bug
+            throw new CommandFailedException("Command timed out after {$timeout} seconds", $process->getCommandLine(), null, trim($process->getErrorOutput()));
+        }
 
         if (! $process->isSuccessful()) {
             throw CommandFailedException::fromProcess($process);

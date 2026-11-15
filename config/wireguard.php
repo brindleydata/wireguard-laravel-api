@@ -9,8 +9,8 @@ return [
     // The user the API runs as (set by wg:install). The wg:* link/peer commands must run as it too.
     'web_user' => env('WGLA_WEB_USER'),
 
-    'ip_service' => env('IP_SERVICE', 'http://ifconfig.me/ip'),
-    'hostname' => env('WIREGUARD_HOSTNAME'),
+    // Where this server is seen from outside, asked when a link's endpoint is detected
+    'ip_service' => env('IP_SERVICE', 'https://ifconfig.me/ip'),
 
     'templates' => [
         // Client-side configuration template. A line whose value doesn't exist is left out (MTU, PresharedKey).

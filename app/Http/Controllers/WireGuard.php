@@ -87,6 +87,11 @@ class WireGuard extends Controller
             'nat' => 'nullable|boolean',
             'up' => 'nullable|boolean',
             'mtu' => 'nullable|integer|min:576|max:65535',  // for the interface and its clients
+            'inbound' => 'nullable|boolean',              // forwarding into the tunnel: connections that start outside too
+            'allow_default_route' => 'nullable|boolean',  // peers may route a default route (where the server allows it)
+            'allow_own_networks' => 'nullable|boolean',   // peers may route the server's own networks (likewise)
+            'endpoint' => 'nullable|string',      // where its clients connect, host or host:port (else detected now, and kept)
+            'private_key' => 'nullable|string',   // its own key, to move a link here (else a new one)
         ]);
 
         $link = $this->wg->createLink(
@@ -102,6 +107,11 @@ class WireGuard extends Controller
             $data['up'] ?? true,
             $data['address6'] ?? null,
             $data['mtu'] ?? null,
+            (bool) ($data['inbound'] ?? false),
+            (bool) ($data['allow_default_route'] ?? false),
+            (bool) ($data['allow_own_networks'] ?? false),
+            $data['endpoint'] ?? null,
+            $data['private_key'] ?? null,
         );
 
         return response()->json($link->toArray(), 201);
@@ -118,23 +128,27 @@ class WireGuard extends Controller
     {
         $data = $this->fields($request, [
             'address' => 'nullable|string',
-            'address6' => 'nullable|string',  // IPv6 address and prefix, or "auto"; null removes it
+            'address6' => 'nullable|string',  // IPv6 address and prefix, or "auto" (kept if it has one); null removes it
             'port' => 'nullable|integer|min:1|max:65535',
             'ifout' => 'nullable|string|max:15',
             'dns' => 'nullable|string',                         // the link's client defaults:
-            'keepalive' => 'nullable|integer|min:0|max:65535',  // null goes back to the global one
+            'keepalive' => 'nullable|integer|min:0|max:65535',  // null goes back to the fixed default
             'allowed_ips' => 'nullable|string',
             'forward' => 'nullable|boolean',
             'nat' => 'nullable|boolean',
             'up' => 'nullable|boolean',
             'move_peers' => 'nullable|boolean',  // with a new address: peers keep their host number in it
             'mtu' => 'nullable|integer|min:576|max:65535',  // null: wg-quick's own again
+            'inbound' => 'nullable|boolean',
+            'allow_default_route' => 'nullable|boolean',
+            'allow_own_networks' => 'nullable|boolean',
+            'endpoint' => 'nullable|string',  // null: detected anew
         ]);
 
         // Only the fields that were sent. For most a null says nothing; for these it is a value:
         // no IPv6 address, or the global default instead of the link's own
         $params = array_filter($data, fn ($v) => $v !== null);
-        foreach (['address6', 'dns', 'keepalive', 'allowed_ips', 'mtu'] as $field) {
+        foreach (['address6', 'dns', 'keepalive', 'allowed_ips', 'mtu', 'endpoint'] as $field) {
             if ($request->exists($field)) {
                 $params[$field] = $data[$field] ?? null;
             }
@@ -143,6 +157,12 @@ class WireGuard extends Controller
         $link = $this->wg->updateLink($name, $params);
 
         return $link->toArray();
+    }
+
+    /** New keys for a link (its own key pair). Every client needs its new config: the link's public key is in it. */
+    public function linkRekey(string $name): array
+    {
+        return $this->wg->rekeyLink($name)->toArray();
     }
 
     /** Put a running link's forward/NAT rules back, when another tool took them away. */
@@ -180,9 +200,17 @@ class WireGuard extends Controller
             'name' => 'nullable|string',      // a label
             'networks' => 'nullable|string',  // networks behind the peer (site-to-site)
             'remote' => 'nullable|string',    // host:port the server connects to (else the peer connects)
+            'public_key' => 'nullable|string',     // its own key pair's (then no private key is stored here)
+            'preshared_key' => 'nullable|string',  // else a new one
+            'dns' => 'nullable|string',            // its own client settings (else its link's)
+            'keepalive' => 'nullable|integer|min:0|max:65535',
+            'allowed_ips' => 'nullable|string',
+            'enabled' => 'nullable|boolean',       // false: added disabled
         ]);
 
-        $peer = $this->wg->addPeer($link, $data['ip'] ?? null, $data['name'] ?? null, $data['networks'] ?? null, $data['remote'] ?? null);
+        $peer = $this->wg->addPeer($link, $data['ip'] ?? null, $data['name'] ?? null, $data['networks'] ?? null, $data['remote'] ?? null,
+            $data['public_key'] ?? null, $data['preshared_key'] ?? null, $data['dns'] ?? null, $data['keepalive'] ?? null, $data['allowed_ips'] ?? null,
+            (bool) ($data['enabled'] ?? true));
 
         return response()->json($peer->toArray(), 201);
     }
@@ -238,7 +266,8 @@ class WireGuard extends Controller
     /** The client config as a QR code (SVG) for the WireGuard apps. It holds the private key. */
     public function peerQr(QrCode $qr, string $link, string $pubkey): Response
     {
-        $config = $this->wg->getPeerConfig($link, $pubkey);
+        // The whole config, its private key included: a peer with a key of its own has none (422)
+        $config = $this->wg->getPeerConfig($link, $pubkey, with_key: true);
 
         if ($config === null) {
             abort(404, "Configuration not found for peer on {$link}");

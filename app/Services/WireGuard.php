@@ -80,12 +80,46 @@ class WireGuard
     }
 
     /**
-     * @param  string|null  $address6  IPv6 address and prefix for a dual-stack link, or 'auto' for a
-     *                                 random unique local /64
+     * New keys for a link (its own key pair), for when its private key got out. Applied live: no
+     * restart. Its peers keep their keys and preshared keys, but every client config changes (the
+     * server's public key is in it): all clients need their new one.
      */
-    public function createLink(string $name, string $ip, ?int $port = null, ?string $ifout = null, ?string $dns = null, ?int $keepalive = null, ?string $allowed_ips = null, bool $forward = false, bool $nat = false, bool $up = true, ?string $address6 = null, ?int $mtu = null): InterfaceInfo
+    public function rekeyLink(string $name): InterfaceInfo
     {
         $this->validator->validateInterfaceName($name);
+
+        return $this->withLock(function () use ($name) {
+            $content = $this->managedConf($name);
+            $iface = $this->runtimeInterface($name);
+            $privkey = $this->keys->genkey();
+
+            // The config first (rewritten from the live peers), then the interface: if that fails,
+            // the config goes back (applyLive())
+            $this->rewriteConf($name, preg_replace('/^PrivateKey\s*=.*$/m', "PrivateKey = {$privkey}", $content), $iface);
+            if ($iface !== null) {
+                $this->applyLive($name, $content, [[fn () => $this->os->setPrivateKey($iface, $privkey), null]]);
+            }
+
+            return $this->getLink($name) ?? throw new NotFoundException("Link does not exist: {$name}");
+        });
+    }
+
+    /**
+     * @param  string|null  $address6  IPv6 address and prefix for a dual-stack link, or 'auto' for a
+     *                                 random unique local /64
+     * @param  bool  $inbound  forwarding into the tunnel takes connections that start outside (site-to-site), not only replies
+     * @param  bool  $allow_default_route  its peers may route a default route, where the server's policy allows it
+     * @param  bool  $allow_own_networks  its peers may route networks holding the server's own addresses, likewise
+     * @param  string|null  $endpoint  where its clients connect (host, or host:port); null: detected now
+     *                                 (ConfigBuilder::detectedHost()) and kept
+     * @param  string|null  $private_key  its own key (moving a link here, or a peer of another server
+     *                                    that knows its public key); null: a new one
+     */
+    public function createLink(string $name, string $ip, ?int $port = null, ?string $ifout = null, ?string $dns = null, ?int $keepalive = null, ?string $allowed_ips = null, bool $forward = false, bool $nat = false, bool $up = true, ?string $address6 = null, ?int $mtu = null, bool $inbound = false, bool $allow_default_route = false, bool $allow_own_networks = false, ?string $endpoint = null, ?string $private_key = null): InterfaceInfo
+    {
+        $this->validator->validateInterfaceName($name);
+        $endpoint = $endpoint === null || $endpoint === '' ? null : $this->validator->endpoint($endpoint);
+        $private_key = $private_key === null || $private_key === '' ? null : $this->validator->key($private_key, 'private key');
 
         $address = $this->validator->linkAddress(str_contains($ip, '/') ? $ip : "{$ip}/24");
         $address6 = $this->resolveAddress6($address6, $address);
@@ -94,10 +128,11 @@ class WireGuard
         }
         ['dns' => $dns, 'allowed_ips' => $allowed_ips] = $this->validateSettings(['dns' => $dns, 'keepalive' => $keepalive, 'allowed_ips' => $allowed_ips, 'ifout' => $ifout]);
 
-        return $this->withLock(function () use ($name, $address, $address6, $port, $ifout, $dns, $keepalive, $allowed_ips, $forward, $nat, $up, $mtu) {
+        return $this->withLock(function () use ($name, $address, $address6, $port, $ifout, $dns, $keepalive, $allowed_ips, $forward, $nat, $up, $mtu, $inbound, $allow_default_route, $allow_own_networks, $endpoint, $private_key) {
             if (in_array($name, $this->listLinks(), true)) {
                 throw new ConflictException("Link already exists: {$name}");
             }
+            $this->assertPolicyAllows($allow_default_route, $allow_own_networks);
 
             $system_interfaces = $this->os->networkInterfaces();
             if (in_array($name, $system_interfaces, true)) {
@@ -113,9 +148,11 @@ class WireGuard
             $port = $port ?? $this->freePort($others);
             $this->validator->validatePort($port);
             $this->assertNoClash($port, $address, $others, $address6);
-            $privkey = $this->keys->genkey();
+            $privkey = $private_key ?? $this->keys->genkey();
+            // Kept: a client config never points elsewhere behind its back
+            $endpoint ??= $this->detectedEndpoint();
 
-            $content = $this->configBuilder->buildConfFile($address, $privkey, $port, $ifout, [], $dns, $keepalive, $allowed_ips, $forward, $nat, $address6, $mtu);
+            $content = $this->configBuilder->buildConfFile($address, $privkey, $port, $ifout, [], $dns, $keepalive, $allowed_ips, $forward, $nat, $address6, $mtu, $inbound, $allow_default_route, $allow_own_networks, $endpoint);
             $this->os->writeConfig($name, $content);
 
             if ($up) {
@@ -183,10 +220,20 @@ class WireGuard
      *
      * A new `address` in another subnet needs `move_peers`: each peer then keeps its host number
      * there (10.0.0.5 → 10.1.0.5), and every client needs its new config.
+     *
+     * `address6` 'auto' gives a link without IPv6 a random unique local /64; one that has IPv6
+     * keeps its prefix. A value the link has already is no change (no restart).
+     *
+     * `endpoint` is where its clients connect (host, or host:port); null (or '') detects it anew.
+     * Every client config changes with it: clients need their new one.
      */
     public function updateLink(string $name, array $params): InterfaceInfo
     {
         $this->validator->validateInterfaceName($name);
+        // Nothing asked: nothing written either, the link as it is
+        if ($params === []) {
+            return $this->getLink($name) ?? throw new NotFoundException("Link does not exist: {$name}");
+        }
 
         // Validate provided fields
         if (isset($params['port'])) {
@@ -197,6 +244,9 @@ class WireGuard
             str_contains($params['address'], '/')
                 ? $params['address'] = $this->validator->linkAddress($params['address'])
                 : $this->validator->validateIpAddress($params['address']);
+        }
+        if (array_key_exists('endpoint', $params)) {
+            $params['endpoint'] = in_array($params['endpoint'], [null, ''], true) ? $this->detectedEndpoint() : $this->validator->endpoint((string) $params['endpoint']);
         }
         // Format only: the full check needs the link's IPv4 address, read under the lock
         if (isset($params['address6']) && ! in_array($params['address6'], ['', 'none', 'auto'], true)) {
@@ -212,9 +262,22 @@ class WireGuard
 
         return $this->withLock(function () use ($name, $params) {
             $content = $this->managedConf($name);
-            $meta = ConfigBuilder::parseMetadata($content);
+            $parsed = $this->configBuilder->parseConfContent($content);
+            $meta = $parsed['metadata'];
             if (isset($params['address']) && ! str_contains($params['address'], '/')) {
                 $params['address'] = $this->validator->linkAddress($params['address'].'/'.(explode('/', $meta['address'] ?? '', 2)[1] ?? '24'));
+            }
+
+            // What the link has already is no change: sent again (a client that sends the whole
+            // state), it must not restart the link, and `auto` must not give it a new prefix
+            if (isset($params['address']) && $params['address'] === ($meta['address'] ?? null)) {
+                unset($params['address']);
+            }
+            if (isset($params['port']) && (int) $params['port'] === (int) ($parsed['interface']['ListenPort'] ?? 0)) {
+                unset($params['port']);
+            }
+            if (($params['address6'] ?? null) === 'auto' && isset($meta['address6'])) {
+                unset($params['address6']);
             }
 
             // IPv6: a new value (null removes it), else the current one, checked against the IPv4 address
@@ -246,8 +309,9 @@ class WireGuard
             $current_nat = ($meta['nat'] ?? 'false') === 'true';
             $current_ifout = $meta['ifout'] ?? $this->os->defaultOutboundInterface();
 
-            // The MTU is a line of the [Interface] section, not metadata
-            $current_mtu = preg_match('/^MTU = (\d+)$/m', $content, $m) ? (int) $m[1] : null;
+            // The MTU is a line of the [Interface] section, not metadata (read as the parser reads
+            // it: `MTU=1400` counts as managed, so it must not be lost)
+            $current_mtu = isset($parsed['interface']['MTU']) ? (int) $parsed['interface']['MTU'] : null;
             $mtu = array_key_exists('mtu', $params) ? (in_array($params['mtu'], [null, ''], true) ? null : (int) $params['mtu']) : $current_mtu;
             if ($mtu !== null) {
                 $this->validator->validateMtu($mtu, $address6 !== null);
@@ -257,10 +321,27 @@ class WireGuard
             $nat = array_key_exists('nat', $params) ? (bool) $params['nat'] : $current_nat;
             $ifout = $params['ifout'] ?? $current_ifout;
             $up = array_key_exists('up', $params) ? (bool) $params['up'] : $running;
+            $current_inbound = ($meta['inbound'] ?? 'false') === 'true';
+            $inbound = array_key_exists('inbound', $params) ? (bool) $params['inbound'] : $current_inbound;
+
+            // What its peers may route: on only where the server allows it, off only where no peer needs it
+            $routes = [];
+            foreach (['allow_default_route', 'allow_own_networks'] as $field) {
+                $routes[$field] = array_key_exists($field, $params) ? (bool) $params[$field] : ($meta[$field] ?? 'false') === 'true';
+            }
+            $this->assertPolicyAllows(
+                $routes['allow_default_route'] && ($meta['allow_default_route'] ?? 'false') !== 'true',
+                $routes['allow_own_networks'] && ($meta['allow_own_networks'] ?? 'false') !== 'true',
+            );
+            // (The tunnel addresses in the config are those of the current prefix)
+            $networks = array_merge([], ...array_map(fn (array $peer) => IpAllocator::networksOf($peer['AllowedIPs'] ?? '', $current6), $parsed['peers']));
+            if (($problems = $this->routeProblems($networks, $routes['allow_default_route'], $routes['allow_own_networks'])) !== []) {
+                throw new ConflictException("Its peers route what that would no longer allow: {$problems[0]}");
+            }
 
             // Metadata overrides, only for fields that were provided
             $overrides = [];
-            foreach (['ifout', 'address'] as $field) {
+            foreach (['ifout', 'address', 'endpoint'] as $field) {
                 if (isset($params[$field])) {
                     $overrides[$field] = (string) $params[$field];
                 }
@@ -276,7 +357,7 @@ class WireGuard
             }
             $overrides['address6'] = $address6;
             $overrides['mtu'] = $mtu;
-            foreach (['forward' => $forward, 'nat' => $nat] as $field => $value) {
+            foreach (['forward' => $forward, 'nat' => $nat, 'inbound' => $inbound, ...$routes] as $field => $value) {
                 if (array_key_exists($field, $params)) {
                     $overrides[$field] = $value ? 'true' : 'false';
                 }
@@ -293,6 +374,10 @@ class WireGuard
                 : null);
 
             try {
+                if ($up && (! $running || $restart)) {
+                    // Before anything stops: a link that runs keeps running if it couldn't start
+                    $this->assertRemotesResolve($name);
+                }
                 if ($running && (! $up || $restart)) {
                     $this->os->stopInterface($name);
                     $this->os->clearFirewall($name);
@@ -301,7 +386,7 @@ class WireGuard
                 if ($up && (! $running || $restart)) {
                     // PostUp installs the rules for the new state
                     $this->os->startInterface($name);
-                } elseif ($running && $up && ($forward !== $current_forward || $nat !== $current_nat || $ifout !== $current_ifout)) {
+                } elseif ($running && $up && ($forward !== $current_forward || $nat !== $current_nat || $ifout !== $current_ifout || $inbound !== $current_inbound)) {
                     // The rules come from the config rewritten above
                     $this->os->applyFirewall($name, $iface);
                 }
@@ -316,26 +401,39 @@ class WireGuard
 
     // ─── Peer operations ─────────────────────────────────────────────
     //
-    // On a running link a change is applied with `wg` and the .conf is then regenerated from the
-    // live interface. On a stopped link only the .conf is edited; wg-quick loads it on the next start.
+    // On a running link the .conf is regenerated from the live interface with the change, which
+    // is then applied with `wg` (applyLive(), undone if the host refuses it). On a stopped link
+    // only the .conf is edited; wg-quick loads it on the next start.
 
     /**
      * Add a peer: the next free address unless $ip is given, an optional label, and optional
      * networks behind it (site-to-site), which wg-quick routes to it.
+     *
+     * Its keys are made here, unless it brings its own public key (another server of this kind,
+     * a device that made its own): then no private key is stored, and its client config comes
+     * without the PrivateKey line. A preshared key may be given likewise (both sides need it).
+     * `dns`, `keepalive` and `allowed_ips` are its own client settings, as with updatePeer();
+     * `enabled` false adds it disabled (saved, not on the interface).
      */
-    public function addPeer(string $link_name, ?string $ip = null, ?string $name = null, ?string $networks = null, ?string $remote = null): PeerInfo
+    public function addPeer(string $link_name, ?string $ip = null, ?string $name = null, ?string $networks = null, ?string $remote = null, ?string $public_key = null, ?string $preshared_key = null, ?string $dns = null, ?int $keepalive = null, ?string $allowed_ips = null, bool $enabled = true): PeerInfo
     {
         $name = $name === null || $name === '' ? null : $this->validator->peerName($name);
         $networks = $networks === null || $networks === '' ? [] : $this->validator->networks($networks);
-        $remote = $remote === null || $remote === '' ? null : $this->validator->remote($remote);
+        $remote = $remote === null || $remote === '' ? null : $this->resolvableRemote($remote);
+        $public_key = $public_key === null || $public_key === '' ? null : $this->validator->key($public_key, 'public key');
+        $preshared_key = $preshared_key === null || $preshared_key === '' ? null : $this->validator->key($preshared_key, 'preshared key');
+        $own = $this->validateSettings(['dns' => $dns, 'keepalive' => $keepalive, 'allowed_ips' => $allowed_ips]);
 
-        return $this->withLock(function () use ($link_name, $ip, $name, $networks, $remote) {
+        return $this->withLock(function () use ($link_name, $ip, $name, $networks, $remote, $public_key, $preshared_key, $own, $enabled) {
             $iface = $this->runtimeInterface($link_name);
             $link = $this->loadLink($link_name, $iface);
             if ($link === null) {
                 throw new NotFoundException("Link does not exist: {$link_name}");
             }
             $conf = $this->managedConf($link_name);
+            if ($public_key !== null && $this->findPeer($link, $public_key) !== null) {
+                throw new ConflictException("Link {$link_name} has a peer with that public key already.");
+            }
 
             // Auto-assign IP if not provided
             $bare_ip = $ip === null || $ip === ''
@@ -347,33 +445,46 @@ class WireGuard
             $this->validator->validateNewPeerIp($bare_ip, $link->address, $existing_ips, $link->address6);
             $this->assertNetworksFree($link, $networks);
 
-            // Generate keys (base64)
-            $privkey = $this->keys->genkey();
-            $pubkey = $this->keys->pubkey($privkey);
-            $psk = $this->keys->genpsk();
+            // Generate keys (base64), unless it brought its own
+            $privkey = $public_key === null ? $this->keys->genkey() : null;
+            $pubkey = $public_key ?? $this->keys->pubkey($privkey);
 
             $peer = [
                 'public_key' => $pubkey,
-                'preshared_key' => $psk,
+                'preshared_key' => $preshared_key ?? $this->keys->genpsk(),
                 'allowed_ips' => implode(', ', [IpAllocator::peerAllowedIps($bare_ip, $link->address, $link->address6), ...$networks]),
                 'name' => $name,
                 'remote' => $remote,
+                'enabled' => $enabled,
+                'dns' => $own['dns'],
+                'keepalive' => $own['keepalive'] === null ? null : (string) $own['keepalive'],
+                'client_allowed_ips' => $own['allowed_ips'],
             ];
 
-            if ($iface !== null && $networks === []) {
-                // On stdin: the preshared key is never on a command line (the helper keeps it in a
-                // private temp file only while it checks it)
-                $this->os->addPeer($iface, $this->peerSection($peer));
-            }
-            $this->rewriteConf($link_name, $conf, $iface, peers: fn (array $peers) => $this->putPeer($peers, $peer));
-            if ($iface !== null && $networks !== []) {
-                // wg-quick routes the networks when the link starts
-                $this->restartOrRevert($link_name, $conf);
+            // Only its private key is stored (by base64url-safe public key): the client config is
+            // built from it whenever it is asked for. Stored first, so the peer is never there
+            // without it: a peer whose key is lost can't be used, and nobody would know its key
+            if ($privkey !== null) {
+                $this->os->writeClientConfig($link_name, KeyManager::pubkeyToSafe($pubkey), ConfigBuilder::clientKeyFile($privkey));
             }
 
-            // Only its private key is stored (by base64url-safe public key): the client config is
-            // built from it whenever it is asked for
-            $this->os->writeClientConfig($link_name, KeyManager::pubkeyToSafe($pubkey), ConfigBuilder::clientKeyFile($privkey));
+            try {
+                $this->rewriteConf($link_name, $conf, $iface, peers: fn (array $peers) => $this->putPeer($peers, $peer));
+                if ($iface !== null && $enabled && $networks === []) {
+                    // On stdin: the preshared key is never on a command line (the helper keeps it
+                    // in a private temp file only while it checks it)
+                    $this->applyLive($link_name, $conf, [[fn () => $this->os->addPeer($iface, $this->peerSection($peer)), null]]);
+                } elseif ($iface !== null && $enabled) {
+                    // wg-quick routes the networks when the link starts
+                    $this->restartOrRevert($link_name, $conf);
+                }
+            } catch (\Throwable $e) {
+                if ($privkey !== null) {
+                    $this->forgetKey($link_name, $pubkey);
+                }
+
+                throw $e;
+            }
 
             return $this->peerInfo($peer, $link->address6, $link, $privkey, reveal: true);
         });
@@ -435,10 +546,11 @@ class WireGuard
 
     /**
      * A peer's client config, built now from the link's settings, the peer's own and its stored
-     * private key: it is always current. Null when the peer doesn't exist or its key isn't
-     * stored here (a peer added elsewhere).
+     * private key: it is always current. A peer whose key isn't stored here (it brought its own,
+     * or its config was written by hand) gets it without the PrivateKey line: the device adds its
+     * own. Null when the peer doesn't exist. $with_key: refuse that (a QR code is the whole config).
      */
-    public function getPeerConfig(string $link_name, string $pubkey): ?string
+    public function getPeerConfig(string $link_name, string $pubkey, bool $with_key = false): ?string
     {
         $pubkey = KeyManager::normalize($pubkey);
         if (! $this->isLinkName($link_name) || ! KeyManager::isKey($pubkey)) {
@@ -446,18 +558,42 @@ class WireGuard
         }
         $link = $this->loadLink($link_name, $this->runtimeInterface($link_name));
         $peer = $link === null ? null : $this->findPeer($link, $pubkey);
+        // Nor for an interface something else started: it isn't this app's to hand out configs for
+        if ($peer === null || ! $this->os->configExists($link_name)) {
+            return null;
+        }
 
-        return $peer === null ? null : $this->clientConfig($link, $peer);
+        $privkey = $this->storedKey($link_name, $pubkey);
+        if ($with_key && $privkey === null) {
+            throw new InvalidArgumentException("The private key of peer {$pubkey} isn't stored here (it has a key of its own): its config has no PrivateKey line, so there is no QR code of it.");
+        }
+
+        return $this->clientConfig($link, $peer, $privkey);
+    }
+
+    /** Where this server is reached as an endpoint, as it is written: detected (ConfigBuilder::detectedHost()). */
+    protected function detectedEndpoint(): string
+    {
+        $host = $this->configBuilder->detectedHost(fresh: true);
+        try {
+            return $this->validator->endpoint($host);
+        } catch (InvalidArgumentException) {
+            throw new InvalidArgumentException("This server's name ({$host}) is no address clients can connect to: give the link one (endpoint).");
+        }
+    }
+
+    /** A peer's private key as stored here, or null (one that brought its own key has none here). */
+    protected function storedKey(string $link_name, string $pubkey): ?string
+    {
+        return ConfigBuilder::clientPrivateKey($this->os->readClientConfig($link_name, KeyManager::pubkeyToSafe($pubkey)));
     }
 
     /**
-     * $privkey: the peer's private key when the caller has it, else the stored one.
+     * $privkey: the peer's private key when the caller has it, else the stored one (if any).
      */
     protected function clientConfig(InterfaceInfo $link, PeerInfo $peer, ?string $privkey = null): ?string
     {
-        $privkey ??= ConfigBuilder::clientPrivateKey($this->os->readClientConfig($link->name, KeyManager::pubkeyToSafe($peer->public_key)));
-
-        return $privkey === null ? null : $this->configBuilder->buildClientConfig($link, $peer, $privkey);
+        return $this->configBuilder->buildClientConfig($link, $peer, $privkey ?? $this->storedKey($link->name, $peer->public_key));
     }
 
     /**
@@ -479,6 +615,13 @@ class WireGuard
     public function updatePeer(string $link_name, string $pubkey, array $params): PeerInfo
     {
         $pubkey = KeyManager::normalize($pubkey);
+        // Nothing asked: nothing written either, the peer as it is (with its client config, as after a change)
+        if ($params === []) {
+            $link = $this->getLink($link_name) ?? throw new NotFoundException("Link does not exist: {$link_name}");
+            $peer = $this->findPeer($link, $pubkey) ?? throw new NotFoundException("Peer not found: {$pubkey}");
+
+            return $peer->with(client_config: $this->clientConfig($link, $peer));
+        }
         $params = $this->validateSettings($params);
         if (array_key_exists('name', $params)) {
             $params['name'] = $params['name'] === null || $params['name'] === '' ? null : $this->validator->peerName((string) $params['name']);
@@ -487,7 +630,7 @@ class WireGuard
             $params['networks'] = $params['networks'] === null || $params['networks'] === '' ? [] : $this->validator->networks((string) $params['networks']);
         }
         if (array_key_exists('remote', $params)) {
-            $params['remote'] = $params['remote'] === null || $params['remote'] === '' ? null : $this->validator->remote((string) $params['remote']);
+            $params['remote'] = $params['remote'] === null || $params['remote'] === '' ? null : $this->resolvableRemote((string) $params['remote']);
         }
 
         return $this->withLock(function () use ($link_name, $pubkey, $params) {
@@ -538,26 +681,37 @@ class WireGuard
                 }
             }
 
-            // Live changes, unless the routed networks change: then the link restarts with the config
+            // Live changes, unless the routed networks change: then the link restarts with the config.
+            // Each with what puts the peer back as it was, should a later one fail.
             $reroute = $iface !== null && ($target->enabled ? $old_networks : []) != ($enabled ? $networks : []);
-            $live = $iface !== null && ! $reroute;
-            if ($live && ! $target->enabled && $enabled) {
-                $this->os->addPeer($iface, $this->peerSection($peer));
-            } elseif ($live && $target->enabled && $enabled && $allowed_ips !== $target->allowed_ips) {
-                $this->os->setPeerAllowedIps($iface, $pubkey, $allowed_ips);
-            }
-            $saved = $this->rewriteConf($link_name, $conf, $iface, peers: fn (array $peers) => $this->putPeer($peers, $peer));
-            if ($live && $target->enabled) {
-                // Off the interface only now: the config is rewritten from the live peers, and a
-                // peer that isn't among them any more would lose its place and what is saved with it
-                if (! $enabled) {
-                    $this->os->removePeer($iface, $pubkey);
-                } elseif ($peer['remote'] !== $target->remote) {
-                    // `wg` can set where to connect to, but not take it away again: once more, anew
-                    $this->os->removePeer($iface, $pubkey);
-                    $this->os->addPeer($iface, $this->peerSection($peer));
+            $steps = [];
+            if ($iface !== null && ! $reroute) {
+                $before = ['public_key' => $pubkey, 'preshared_key' => $target->preshared_key, 'allowed_ips' => $target->allowed_ips, 'remote' => $target->remote];
+                if (! $target->enabled && $enabled) {
+                    $steps[] = [fn () => $this->os->addPeer($iface, $this->peerSection($peer)), null];
+                } elseif ($target->enabled && ! $enabled) {
+                    $steps[] = [fn () => $this->os->removePeer($iface, $pubkey), null];
+                } elseif ($target->enabled) {
+                    if ($allowed_ips !== $target->allowed_ips) {
+                        $steps[] = [
+                            fn () => $this->os->setPeerAllowedIps($iface, $pubkey, $allowed_ips),
+                            fn () => $this->os->setPeerAllowedIps($iface, $pubkey, (string) $target->allowed_ips),
+                        ];
+                    }
+                    if ($peer['remote'] !== $target->remote) {
+                        if ($peer['remote'] === null) {
+                            // `wg` can set where to connect to, but not take that away: off the
+                            // interface, and on again without it
+                            $steps[] = [fn () => $this->os->removePeer($iface, $pubkey), fn () => $this->os->addPeer($iface, $this->peerSection($before))];
+                        }
+                        // For a peer that is on the interface, this only sets where to connect to
+                        $steps[] = [fn () => $this->os->addPeer($iface, $this->peerSection($peer)), null];
+                    }
                 }
             }
+
+            $saved = $this->rewriteConf($link_name, $conf, $iface, peers: fn (array $peers) => $this->putPeer($peers, $peer));
+            $this->applyLive($link_name, $conf, $steps);
             if ($reroute) {
                 $this->restartOrRevert($link_name, $conf);
             }
@@ -592,22 +746,38 @@ class WireGuard
             $privkey = $this->keys->genkey();
             $keys = ['public_key' => $this->keys->pubkey($privkey), 'preshared_key' => $this->keys->genpsk()];
 
-            // In its place in the config, with everything saved with it
-            $saved = $this->rewriteConf($link_name, $conf, $iface, peers: fn (array $peers) => array_map(
-                fn (array $p) => $p['public_key'] === $pubkey ? [...$p, ...$keys] : $p,
-                $peers,
-            ));
-            $peer = array_find($saved, fn (array $p) => $p['public_key'] === $keys['public_key']);
-            // The traffic counted so far was the old key's
-            $peer = array_diff_key($peer, array_flip(['endpoint', 'latest_handshake', 'transfer_rx', 'transfer_tx']));
+            // The new private key first: the peer is never there without its key
+            $this->os->writeClientConfig($link_name, KeyManager::pubkeyToSafe($keys['public_key']), ConfigBuilder::clientKeyFile($privkey));
 
-            if ($iface !== null && $target->enabled) {
-                // After the config, which is rewritten from the live peers: the old key was still there
-                $this->os->removePeer($iface, $pubkey);
-                $this->os->addPeer($iface, $this->peerSection($peer));
+            try {
+                // In its place in the config, with everything saved with it
+                $saved = $this->rewriteConf($link_name, $conf, $iface, peers: fn (array $peers) => array_map(
+                    fn (array $p) => $p['public_key'] === $pubkey ? [...$p, ...$keys] : $p,
+                    $peers,
+                ));
+                $peer = array_find($saved, fn (array $p) => $p['public_key'] === $keys['public_key']);
+                // The traffic counted so far was the old key's
+                $peer = array_diff_key($peer, array_flip(['endpoint', 'latest_handshake', 'transfer_rx', 'transfer_tx']));
+
+                if ($iface !== null && $target->enabled) {
+                    // After the config, which is rewritten from the live peers: the old key was still
+                    // there. The new one first: it takes the allowed IPs over, and if it can't be
+                    // added (its remote doesn't resolve), the old one is still there as it was.
+                    $old = [...$peer, 'public_key' => $pubkey, 'preshared_key' => $target->preshared_key];
+                    $this->applyLive($link_name, $conf, [
+                        [fn () => $this->os->addPeer($iface, $this->peerSection($peer)), function () use ($iface, $keys, $old) {
+                            $this->os->removePeer($iface, $keys['public_key']);
+                            $this->os->addPeer($iface, $this->peerSection($old)); // its allowed IPs back
+                        }],
+                        [fn () => $this->os->removePeer($iface, $pubkey), null],
+                    ]);
+                }
+            } catch (\Throwable $e) {
+                $this->forgetKey($link_name, $keys['public_key']);
+
+                throw $e;
             }
 
-            $this->os->writeClientConfig($link_name, KeyManager::pubkeyToSafe($keys['public_key']), ConfigBuilder::clientKeyFile($privkey));
             try {
                 $this->os->deleteClientConfig($link_name, KeyManager::pubkeyToSafe($pubkey));
             } catch (CommandFailedException $e) {
@@ -619,39 +789,19 @@ class WireGuard
     }
 
     /**
-     * Peers of a config from before a peer's own client settings were stored with it (format 1).
-     * Back then they only showed in its client config: whatever that has and its link doesn't
-     * hand out was the peer's own, so it is recorded as such. Once: the config is then written
-     * in the current format, and nothing is ever inferred again.
-     *
-     * @param  array  $meta  the link's metadata the client configs were written with
-     * @param  callable(string): ?string  $client  a peer's stored client config, by public key
+     * A peer's remote, validated, whose host resolves now if it is a name: wg resolves it when the
+     * link starts, and a name that doesn't resolve keeps the whole link from starting (wg-quick
+     * fails on it). Checked when it is set, so a typo is a 422 now, not a link that won't start.
      */
-    protected function adoptClientSettings(array $meta, array $peers, callable $client): array
+    protected function resolvableRemote(string $remote): string
     {
-        $defaults = $this->configBuilder->clientDefaults($meta);
-        $same = fn (string $a, string $b) => str_replace(' ', '', $a) === str_replace(' ', '', $b);
-
-        foreach ($peers as $i => $peer) {
-            if (! KeyManager::isKey($peer['public_key']) || ($content = $client($peer['public_key'])) === null) {
-                continue;
-            }
-
-            $stored = $this->configBuilder->parseClientConfig($content);
-            foreach (['dns' => 'DNS', 'keepalive' => 'PersistentKeepalive', 'allowed_ips' => 'AllowedIPs'] as $setting => $key) {
-                $field = $setting === 'allowed_ips' ? 'client_allowed_ips' : $setting;
-                if (isset($peer[$field]) || ! isset($stored[$key]) || $same($stored[$key], $defaults[$setting])) {
-                    continue;
-                }
-                try {
-                    $peers[$i][$field] = (string) $this->validateSettings([$setting => $stored[$key]])[$setting];
-                } catch (InvalidArgumentException) {
-                    // Not a value the app would have written: the peer follows its link
-                }
-            }
+        $remote = $this->validator->remote($remote);
+        $host = substr($remote, 0, strrpos($remote, ':'));
+        if (! str_starts_with($host, '[') && filter_var($host, FILTER_VALIDATE_IP) === false && ! $this->os->resolves($host)) {
+            throw new InvalidArgumentException("{$host} doesn't resolve: a link doesn't start with a peer whose name doesn't resolve. Check the name, or give an address.");
         }
 
-        return $peers;
+        return $remote;
     }
 
     /**
@@ -754,14 +904,15 @@ class WireGuard
         return [
             ...$problems,
             ...$this->clashes($plan['port'], $plan['address'], $others, $plan['address6'], $plan['networks']),
-            ...$this->coveredOwnAddresses($plan['networks']),
+            ...$this->routeProblems($plan['networks'], $plan['allow_default_route'], $plan['allow_own_networks']),
         ];
     }
 
     /**
      * Recreate a link from an exported config, for this server: the config is rebuilt by this
      * OS's driver (hooks, helper path), a missing outbound interface falls back to the default
-     * route's, and client configs are re-rendered with this server's hostname (keeping per-peer
+     * route's, and its endpoint (where its clients connect) stays as backed up unless $endpoint
+     * points it elsewhere (keeping per-peer
      * overrides).
      *
      * With $replace it takes the place of an existing link of that name, which is only touched
@@ -773,17 +924,14 @@ class WireGuard
      * @param  array<string, string>  $clients  safe pubkey => client config
      * @return array{ifout: array{0: ?string, 1: string}|null, clients: int, start_error: ?string}
      */
-    public function restoreLink(string $name, string $conf, array $clients, bool $up, bool $replace = false): array
+    public function restoreLink(string $name, string $conf, array $clients, bool $up, bool $replace = false, ?string $endpoint = null): array
     {
         $plan = $this->restorePlan($name, $conf);
+        $endpoint = $endpoint === null || $endpoint === '' ? null : $this->validator->endpoint($endpoint);
 
-        return $this->withLock(function () use ($name, $plan, $clients, $up, $replace) {
+        return $this->withLock(function () use ($name, $plan, $clients, $up, $replace, $endpoint) {
             ['meta' => $meta, 'address' => $address, 'address6' => $address6, 'peers' => $peers] = $plan;
             $clients = array_filter($clients, 'is_string');
-            // A backup from before peers' own client settings were stored with them
-            if ((int) ($meta['format'] ?? 1) < ConfigBuilder::FORMAT) {
-                $peers = $this->adoptClientSettings($meta, $peers, fn (string $pubkey) => $clients[KeyManager::pubkeyToSafe($pubkey)] ?? null);
-            }
 
             $exists = in_array($name, $this->listLinks(), true);
             if ($exists && ! $replace) {
@@ -795,8 +943,8 @@ class WireGuard
                 throw new ConflictException("A network interface named {$name} already exists");
             }
             $this->assertNoClash($plan['port'], $address, $this->otherLinks($name), $address6, $plan['networks']);
-            if (($covered = $this->coveredOwnAddresses($plan['networks'])) !== []) {
-                throw new ConflictException($covered[0]);
+            if (($problems = $this->routeProblems($plan['networks'], $plan['allow_default_route'], $plan['allow_own_networks'])) !== []) {
+                throw new ConflictException($problems[0]);
             }
 
             $ifout = $meta['ifout'] ?? null;
@@ -806,17 +954,51 @@ class WireGuard
                 $ifout = $moved[1];
             }
 
+            $endpoint ??= $meta['endpoint'] ?? null;
             $content = $this->buildConf($plan['interface'], array_merge($meta, [
                 'address' => $address,
                 'address6' => $address6,
                 'port' => $plan['port'],
                 'ifout' => $ifout,
+                'endpoint' => $endpoint,
             ]), $peers);
 
-            // A link being replaced is untouched so far, and stays so if the helper refuses the
-            // new config: that is checked before it takes the old one's place
+            // The peers' private keys first, as anywhere: a peer is never there without its key.
+            // (Their client configs are built from them, for this server.)
+            $safe_keys = fn (array $peers) => array_map(fn (array $peer) => KeyManager::pubkeyToSafe($peer['public_key']), array_filter($peers, fn (array $peer) => KeyManager::isKey($peer['public_key'])));
+            $keys = [];
+            foreach ($peers as $peer) {
+                $privkey = KeyManager::isKey($peer['public_key']) ? ConfigBuilder::clientPrivateKey($clients[KeyManager::pubkeyToSafe($peer['public_key'])] ?? null) : null;
+                if ($privkey !== null) {
+                    $keys[KeyManager::pubkeyToSafe($peer['public_key'])] = $privkey;
+                }
+            }
+            $restored_peers = $safe_keys($peers);
+            $old_peers = $old === null ? [] : $safe_keys($this->confPeers($this->configBuilder->parseConfContent($old)['peers']));
+            // Best effort: a key without a peer opens nothing
+            $forget = function (array $safe) use ($name) {
+                foreach ($safe as $key) {
+                    try {
+                        $this->os->deleteClientConfig($name, $key);
+                    } catch (CommandFailedException) {
+                    }
+                }
+            };
+            foreach ($keys as $safe => $privkey) {
+                $this->os->writeClientConfig($name, $safe, ConfigBuilder::clientKeyFile($privkey));
+            }
+
+            // A link being replaced is untouched so far (but for the keys of peers it shares with
+            // the restored one: the same keys), and stays so if the helper refuses the new config:
+            // that is checked before it takes the old one's place
             $was_running = $exists && $this->runtimeInterface($name) !== null;
-            $this->os->writeConfig($name, $content);
+            try {
+                $this->os->writeConfig($name, $content);
+            } catch (\Throwable $e) {
+                $forget(array_diff(array_keys($keys), $old_peers));
+
+                throw $e;
+            }
 
             if ($old !== null) {
                 try {
@@ -825,32 +1007,21 @@ class WireGuard
                     // Only a running link must stop (as in deleteLink). It still runs: its own config again
                     if ($was_running) {
                         $this->os->writeConfig($name, $old);
+                        $forget(array_diff(array_keys($keys), $old_peers));
 
                         throw $e;
                     }
                 }
                 $this->os->clearFirewall($name);
-                try {
-                    // The keys of the link it replaces. Those of the restored peers are written
-                    // next either way; one that stays behind opens nothing any more
-                    $this->os->deleteClientConfigDir($name);
-                } catch (CommandFailedException) {
-                }
+                // The keys of the peers of the link it replaces that the restored one doesn't have
+                $forget(array_diff($old_peers, $restored_peers));
             }
-
-            // The peers' private keys: their client configs are built from them, for this server
-            $restored = 0;
-            foreach ($peers as $peer) {
-                $privkey = KeyManager::isKey($peer['public_key']) ? ConfigBuilder::clientPrivateKey($clients[KeyManager::pubkeyToSafe($peer['public_key'])] ?? null) : null;
-                if ($privkey !== null) {
-                    $this->os->writeClientConfig($name, KeyManager::pubkeyToSafe($peer['public_key']), ConfigBuilder::clientKeyFile($privkey));
-                    $restored++;
-                }
-            }
+            $restored = count($keys);
 
             $start_error = null;
             if ($up) {
                 try {
+                    $this->assertRemotesResolve($name);
                     $this->os->startInterface($name);
                 } catch (\Throwable $e) {
                     // Half started or not at all: down, and not coming up at boot
@@ -863,7 +1034,7 @@ class WireGuard
                 }
             }
 
-            return ['ifout' => $moved, 'clients' => $restored, 'start_error' => $start_error];
+            return ['ifout' => $moved, 'clients' => $restored, 'start_error' => $start_error, 'endpoint' => $endpoint];
         });
     }
 
@@ -871,7 +1042,7 @@ class WireGuard
      * A backed-up config, checked and taken apart for restoreLink(). Throws when it can't be
      * restored: an invalid name, address, port or setting, or lines the app doesn't write.
      *
-     * @return array{interface: array, meta: array, address: string, address6: ?string, port: int, peers: list<array>, networks: list<string>}
+     * @return array{interface: array, meta: array, address: string, address6: ?string, port: int, peers: list<array>, networks: list<string>, allow_default_route: bool, allow_own_networks: bool}
      */
     protected function restorePlan(string $name, string $conf): array
     {
@@ -891,7 +1062,8 @@ class WireGuard
         // Networks behind its peers need routes too, which no other link may have
         $networks = array_merge([], ...array_map(fn (array $peer) => IpAllocator::networksOf($peer['allowed_ips'], $address6), $peers));
 
-        return ['interface' => $parsed['interface'], 'meta' => $meta, 'address' => $address, 'address6' => $address6, 'port' => $port, 'peers' => $peers, 'networks' => $networks];
+        return ['interface' => $parsed['interface'], 'meta' => $meta, 'address' => $address, 'address6' => $address6, 'port' => $port, 'peers' => $peers, 'networks' => $networks,
+            'allow_default_route' => ($meta['allow_default_route'] ?? 'false') === 'true', 'allow_own_networks' => ($meta['allow_own_networks'] ?? 'false') === 'true'];
     }
 
     // ─── Runtime state ───────────────────────────────────────────────
@@ -972,7 +1144,17 @@ class WireGuard
             keepalive: isset($meta['keepalive']) ? (int) $meta['keepalive'] : null,
             allowed_ips: $meta['allowed_ips'] ?? null,
             mtu: isset($parsed['interface']['MTU']) ? (int) $parsed['interface']['MTU'] : null,
+            inbound: self::flag($meta, 'inbound'),
+            allow_default_route: self::flag($meta, 'allow_default_route'),
+            allow_own_networks: self::flag($meta, 'allow_own_networks'),
+            endpoint: $meta['endpoint'] ?? null,
         );
+    }
+
+    /** A link setting that is true or false in its metadata (absent: false). */
+    protected static function flag(array $meta, string $key): bool
+    {
+        return ($meta[$key] ?? 'false') === 'true';
     }
 
     protected function getLinkFromConfig(string $name): ?InterfaceInfo
@@ -990,7 +1172,8 @@ class WireGuard
 
         return new InterfaceInfo(
             name: $name,
-            public_key: $private_key !== '' ? $this->keys->pubkey($private_key) : '',
+            // A hand-written config's key may be no key at all: then it has no public key either
+            public_key: KeyManager::isKey($private_key) ? $this->keys->pubkey($private_key) : '',
             listen_port: (int) ($interface['ListenPort'] ?? 0),
             address: $metadata['address'] ?? trim(explode(',', $interface['Address'] ?? '(none)')[0]),
             ifout: $metadata['ifout'] ?? $this->os->defaultOutboundInterface(),
@@ -1003,6 +1186,10 @@ class WireGuard
             keepalive: isset($metadata['keepalive']) ? (int) $metadata['keepalive'] : null,
             allowed_ips: $metadata['allowed_ips'] ?? null,
             mtu: isset($interface['MTU']) ? (int) $interface['MTU'] : null,
+            inbound: self::flag($metadata, 'inbound'),
+            allow_default_route: self::flag($metadata, 'allow_default_route'),
+            allow_own_networks: self::flag($metadata, 'allow_own_networks'),
+            endpoint: $metadata['endpoint'] ?? null,
         );
     }
 
@@ -1079,7 +1266,7 @@ class WireGuard
                 && ! ($settings['address'] !== '' && IpAllocator::overlaps($entry, $settings['address']))
                 && ! ($settings['address6'] !== '' && IpAllocator::overlaps($entry, $settings['address6'])));
             foreach ($routed as $network) {
-                foreach (array_filter([$address, $address6]) as $own) {
+                foreach (IpAllocator::isDefaultRoute($network) ? [] : array_filter([$address, $address6]) as $own) {
                     if (IpAllocator::overlaps($own, $network)) {
                         $problems[] = "{$own} overlaps {$network}, routed to a peer of link {$other}";
                     }
@@ -1087,7 +1274,7 @@ class WireGuard
             }
             foreach ($networks as $network) {
                 foreach (array_filter([$settings['address'], $settings['address6'], ...$routed]) as $entry) {
-                    if (IpAllocator::overlaps($network, $entry)) {
+                    if ($this->routesClash($network, $entry)) {
                         $problems[] = "{$network} overlaps {$entry} of link {$other}";
                     }
                 }
@@ -1095,6 +1282,18 @@ class WireGuard
         }
 
         return $problems;
+    }
+
+    /**
+     * Whether two routes (a network behind a peer, a link's subnet, another peer's network) can't
+     * both be: they overlap. A default route is the least specific: what else is routed still goes
+     * where it goes. Only another default route of the same family can't share it.
+     */
+    protected function routesClash(string $a, string $b): bool
+    {
+        return IpAllocator::isDefaultRoute($a) || IpAllocator::isDefaultRoute($b)
+            ? IpAllocator::isDefaultRoute($a) && IpAllocator::isDefaultRoute($b) && IpAllocator::sameFamily($a, $b)
+            : IpAllocator::overlaps($a, $b);
     }
 
     protected function assertNoClash(?int $port, ?string $address, array $others, ?string $address6 = null, array $networks = []): void
@@ -1106,33 +1305,35 @@ class WireGuard
 
     /**
      * Networks behind a peer can't overlap the link's own addresses, another peer's addresses or
-     * networks, or another link's subnets and peers: each route can only lead to one peer.
+     * networks, or another link's subnets and peers: each route can only lead to one peer. And
+     * what would take the server's own traffic needs the link's and the server's leave
+     * (routeProblems()).
      *
      * @param  list<string>  $networks
      * @param  string|null  $pubkey  the peer they're for, when it exists already
      */
     protected function assertNetworksFree(InterfaceInfo $link, array $networks, ?string $pubkey = null): void
     {
-        if (($problems = $this->coveredOwnAddresses($networks)) !== []) {
+        if (($problems = $this->routeProblems($networks, $link->allow_default_route, $link->allow_own_networks)) !== []) {
             throw new InvalidArgumentException($problems[0]);
         }
 
         foreach ($networks as $network) {
-            foreach (array_filter([$link->address, $link->address6]) as $own) {
+            foreach (IpAllocator::isDefaultRoute($network) ? [] : array_filter([$link->address, $link->address6]) as $own) {
                 if (IpAllocator::overlaps($network, $own)) {
                     throw new InvalidArgumentException("{$network} overlaps the link's own addresses ({$own}).");
                 }
             }
             foreach ($link->peers as $peer) {
                 foreach ($peer->public_key === $pubkey ? [] : array_map('trim', explode(',', (string) $peer->allowed_ips)) as $entry) {
-                    if ($entry !== '' && IpAllocator::overlaps($network, $entry)) {
+                    if ($entry !== '' && $this->routesClash($network, $entry)) {
                         throw new ConflictException("{$network} overlaps {$entry} of peer ".($peer->name ?? $peer->public_key));
                     }
                 }
             }
             foreach ($this->otherLinks($link->name) as $other => $settings) {
                 foreach (array_filter([$settings['address'], $settings['address6'], ...$settings['peers']]) as $entry) {
-                    if (IpAllocator::overlaps($network, $entry)) {
+                    if ($this->routesClash($network, $entry)) {
                         throw new ConflictException("{$network} overlaps {$entry} of link {$other}");
                     }
                 }
@@ -1141,15 +1342,68 @@ class WireGuard
     }
 
     /**
-     * Networks that cover an address the server needs itself: one of its interfaces', or its
-     * default gateway. Routed to a peer, that traffic would go into the tunnel instead, and the
-     * server would be cut off from its own network. (A link's own addresses are checked apart.)
+     * What of $networks (behind a link's peers) would take the server's own traffic without the
+     * leave to: a default route, or a network that covers an address the server uses itself (one
+     * of its interfaces', its gateway: the server would lose its network). Each needs the link's
+     * setting (allow_default_route, allow_own_networks) and the server's policy, which wg:install
+     * sets and the root helper enforces too.
      *
      * @param  list<string>  $networks
      * @return list<string> what is wrong, one line per network
      */
+    protected function routeProblems(array $networks, bool $allow_default_route, bool $allow_own_networks): array
+    {
+        $policy = null;
+        $server = function (string $key) use (&$policy): bool {
+            $policy ??= $this->os->routePolicy();
+
+            return $policy[$key];
+        };
+        $why = fn (string $what, string $setting, string $option) => "{$what} Only on a link with {$setting}, and on a server that allows it (php artisan wg:install --{$option}=true).";
+
+        $problems = [];
+        foreach (array_filter($networks, IpAllocator::isDefaultRoute(...)) as $network) {
+            if (! $allow_default_route || ! $server('allow_default_route')) {
+                $problems[] = $why("{$network} is a default route: the server's own traffic would go to the peer.", 'allow_default_route', 'allow-default-route');
+            }
+        }
+        foreach ($this->coveredOwnAddresses($networks) as $network => $address) {
+            if (! $allow_own_networks || ! $server('allow_own_networks')) {
+                $problems[] = $why("{$network} covers {$address}, an address this server uses itself (its own or its gateway's): routed to a peer, the server would lose its network.", 'allow_own_networks', 'allow-own-networks');
+            }
+        }
+
+        return $problems;
+    }
+
+    /**
+     * A link can only allow its peers what the server's policy allows (asked only when it matters).
+     */
+    protected function assertPolicyAllows(bool $default_route, bool $own_networks): void
+    {
+        if (! $default_route && ! $own_networks) {
+            return;
+        }
+        $policy = $this->os->routePolicy();
+        foreach (['allow_default_route' => $default_route, 'allow_own_networks' => $own_networks] as $setting => $asked) {
+            if ($asked && ! $policy[$setting]) {
+                throw new ConflictException("This server doesn't let links allow that ({$setting}): php artisan wg:install --".str_replace('_', '-', $setting).'=true sets its policy.');
+            }
+        }
+    }
+
+    /**
+     * Networks that cover an address the server needs itself: one of its interfaces', or its
+     * default gateway. Routed to a peer, that traffic would go into the tunnel instead, and the
+     * server would be cut off from its own network. (A link's own addresses are checked apart,
+     * and a default route, which covers everything, is a case of its own: routeProblems().)
+     *
+     * @param  list<string>  $networks
+     * @return array<string, string> network => an address of the server's own it covers
+     */
     protected function coveredOwnAddresses(array $networks): array
     {
+        $networks = array_filter($networks, fn (string $network) => ! IpAllocator::isDefaultRoute($network));
         if ($networks === []) {
             return [];
         }
@@ -1162,18 +1416,37 @@ class WireGuard
         // What a link has is refused as a clash, with the link's name
         $own = array_filter($own, fn (string $address) => ! array_any(array_filter($links), fn (string $cidr) => IpAllocator::overlaps($address, $cidr)));
 
-        $problems = [];
+        $covered = [];
         foreach ($networks as $network) {
             foreach ($own as $address) {
                 if (IpAllocator::overlaps($network, $address)) {
-                    $problems[] = "{$network} covers {$address}, an address this server uses itself (its own or its gateway's): routed to a peer, the server would lose its network.";
+                    $covered[$network] = $address;
 
                     break;
                 }
             }
         }
 
-        return $problems;
+        return $covered;
+    }
+
+    /**
+     * Before the app starts (or restarts) a link: the remote name of every enabled peer resolves
+     * now. wg-quick resolves them as it starts, retrying one that doesn't for minutes (past the
+     * app's timeout) and failing the whole link on one that can't. (At boot systemd starts links,
+     * and waits as long as it takes.)
+     */
+    protected function assertRemotesResolve(string $name): void
+    {
+        foreach ($this->confPeers($this->configBuilder->parseConfContent($this->os->readConfig($name) ?? '')['peers']) as $peer) {
+            if (! $peer['enabled'] || $peer['remote'] === null) {
+                continue;
+            }
+            $host = substr($peer['remote'], 0, (int) strrpos($peer['remote'], ':'));
+            if (! str_starts_with($host, '[') && filter_var($host, FILTER_VALIDATE_IP) === false && ! $this->os->resolves($host)) {
+                throw new ConflictException("{$host}, the remote of peer ".($peer['name'] ?? $peer['public_key'])." of link {$name}, doesn't resolve now: the link wouldn't start. Fix the name, or change or take out the peer's remote.");
+            }
+        }
     }
 
     /**
@@ -1194,6 +1467,7 @@ class WireGuard
     protected function restartOrRevert(string $name, string $conf): void
     {
         try {
+            $this->assertRemotesResolve($name);
             $this->restart($name);
         } catch (\Throwable $e) {
             throw $this->revert($name, $conf, true, $e);
@@ -1222,10 +1496,71 @@ class WireGuard
                 }
             }
         } catch (\Throwable) {
-            return new SystemException("The change to link {$name} could not be applied, and undoing it failed too (check the link with wg:link {$name}): {$e->getMessage()}", 0, $e);
+            return $this->failedChange($name, $e, undone: false);
         }
 
-        return new SystemException("The change to link {$name} could not be applied and was undone: {$e->getMessage()}", 0, $e);
+        return $this->failedChange($name, $e, undone: true);
+    }
+
+    /**
+     * Change peers on a running link's interface, after its config was rewritten to the new state
+     * (the config is rewritten from the live peers: a peer taken off the interface before that
+     * would lose its place, and what is saved with it). A step the host doesn't take (a remote
+     * that doesn't resolve, sudo failing) undoes the change: the config goes back to $conf, and
+     * the steps done so far are undone, last first. Else the next rewrite from the live peers
+     * would drop a peer that is off the interface, or keep half of the change.
+     *
+     * @param  list<array{0: Closure(): mixed, 1: (Closure(): mixed)|null}>  $steps  each with its undo
+     */
+    protected function applyLive(string $name, string $conf, array $steps): void
+    {
+        $done = [];
+        try {
+            foreach ($steps as [$step, $undo]) {
+                $step();
+                $done[] = $undo;
+            }
+        } catch (\Throwable $e) {
+            try {
+                $this->os->writeConfig($name, $conf);
+                foreach (array_reverse(array_filter($done)) as $undo) {
+                    $undo();
+                }
+            } catch (\Throwable) {
+                throw $this->failedChange($name, $e, undone: false);
+            }
+
+            throw $this->failedChange($name, $e, undone: true);
+        }
+    }
+
+    protected function failedChange(string $name, \Throwable $e, bool $undone): SystemException
+    {
+        return new SystemException($undone
+            ? "The change to link {$name} could not be applied and was undone: {$e->getMessage()}"
+            : "The change to link {$name} could not be applied, and undoing it failed too (check the link with wg:link {$name}): {$e->getMessage()}", 0, $e);
+    }
+
+    /**
+     * Delete the stored private key of a peer that didn't make it (a new one, or new keys), unless
+     * the link has it after all: in its config or on its interface (undoing the change failed).
+     * A peer is never left without its key; a key without a peer opens nothing, so this is best
+     * effort.
+     */
+    protected function forgetKey(string $link, string $pubkey): void
+    {
+        try {
+            // Asked anew: a restart that was undone gives a macOS link another utunN
+            $iface = $this->runtimeInterface($link);
+            $conf = $this->os->readConfig($link);
+            $kept = $conf === null
+                || in_array($pubkey, array_column($this->confPeers($this->configBuilder->parseConfContent($conf)['peers']), 'public_key'), true)
+                || ($iface !== null && in_array($pubkey, array_column($this->dumpPeers($iface), 'public_key'), true));
+            if (! $kept) {
+                $this->os->deleteClientConfig($link, KeyManager::pubkeyToSafe($pubkey));
+            }
+        } catch (\Throwable) {
+        }
     }
 
     /**
@@ -1315,7 +1650,8 @@ class WireGuard
                 throw new InvalidArgumentException("Peer {$ip} would get the link's IPv6 address {$link_ip6}. Move the peer first (its `ip`).");
             }
             foreach (array_filter(array_map('trim', explode(',', (string) $peer->networks))) as $network_behind) {
-                foreach (array_filter([$address, $address6]) as $own) {
+                // (A default route holds the link's addresses too, but less specifically: no clash)
+                foreach (IpAllocator::isDefaultRoute($network_behind) ? [] : array_filter([$address, $address6]) as $own) {
                     if (IpAllocator::overlaps($network_behind, $own)) {
                         throw new InvalidArgumentException("{$own} would overlap {$network_behind}, routed to peer {$ip}.");
                     }
@@ -1330,8 +1666,9 @@ class WireGuard
      * Regenerate a link's .conf from $content, its current contents (as managedConf() returned
      * them), plus metadata overrides.
      *
-     * Peers come from the live interface when $iface is given (the source of truth after
-     * `wg addconf` / `wg set`), otherwise from the file itself. $peers can transform that list.
+     * Peers come from the live interface when $iface is given (what `wg` has, merged with what
+     * only the config knows: see livePeers()), otherwise from the file itself. $peers transforms
+     * that list into the new one; the live change follows (applyLive()).
      *
      * @return list<array> the peers as they were written
      */
@@ -1339,10 +1676,6 @@ class WireGuard
     {
         $parsed = $this->configBuilder->parseConfContent($content);
         $saved = $this->confPeers($parsed['peers']);
-        // An older config: what its peers have of their own is still only in their client configs
-        if ((int) ($parsed['metadata']['format'] ?? 1) < ConfigBuilder::FORMAT) {
-            $saved = $this->adoptClientSettings($parsed['metadata'], $saved, fn (string $pubkey) => $this->os->readClientConfig($name, KeyManager::pubkeyToSafe($pubkey)));
-        }
         $current = $iface !== null ? $this->livePeers($this->dumpPeers($iface), $saved) : $saved;
         $written = $peers !== null ? $peers($current) : $current;
 
@@ -1371,6 +1704,10 @@ class WireGuard
             address6: $meta['address6'] ?? null,
             // An override (null: none any more), else what the config has
             mtu: array_key_exists('mtu', $meta) ? $meta['mtu'] : (isset($interface['MTU']) ? (int) $interface['MTU'] : null),
+            inbound: self::flag($meta, 'inbound'),
+            allow_default_route: self::flag($meta, 'allow_default_route'),
+            allow_own_networks: self::flag($meta, 'allow_own_networks'),
+            endpoint: $meta['endpoint'] ?? null,
         );
     }
 
@@ -1413,12 +1750,14 @@ class WireGuard
 
         $shown = implode(', ', array_slice($what, 0, 6)).(count($what) > 6 ? ', …' : '');
 
-        throw new ConflictException("Link {$name} has settings this app doesn't manage ({$shown}), and a change made here would drop them. Edit its config by hand, or take them out first.");
+        throw new ConflictException("Link {$name} has settings this app doesn't manage ({$shown}): a change made here would drop them, or break the link. Edit its config by hand.");
     }
 
     /**
      * What a config has that regenerating it would drop, named by key only (a line may hold a
-     * secret): e.g. ['MTU', 'Endpoint', 'comments']. Empty for a config the app can manage.
+     * secret): e.g. ['MTU', 'Endpoint', 'comments']. And what the app needs that it leaves out
+     * ('no ListenPort': wg-quick picks a port at each start, and the rewrite would be refused).
+     * Empty for a config the app can manage.
      *
      * @return list<string>
      */
@@ -1429,6 +1768,11 @@ class WireGuard
         $rebuilt = $this->buildConf($parsed['interface'], $parsed['metadata'] + ['ifout' => 'none'], $this->confPeers($parsed['peers']));
 
         $what = [];
+        foreach (['PrivateKey', 'Address', 'ListenPort'] as $key) {
+            if (! isset($parsed['interface'][$key])) {
+                $what[] = "no {$key}";
+            }
+        }
         foreach (ConfigBuilder::droppedLines($content, $rebuilt) as $line) {
             $what[] = match (true) {
                 (bool) preg_match('/^([A-Za-z0-9]+) = /', $line, $m) => $m[1],

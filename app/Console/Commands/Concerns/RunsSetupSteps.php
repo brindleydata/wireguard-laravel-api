@@ -2,6 +2,7 @@
 
 namespace App\Console\Commands\Concerns;
 
+use App\Console\Commands\WgInstall;
 use App\Setup\Context;
 use App\Setup\Installer;
 use App\Setup\Question;
@@ -30,7 +31,7 @@ trait RunsSetupSteps
                 if ($interactive) {
                     $value = $this->prompt($question, $ctx, $value);
                 } elseif ($value === null || ($error = $question->error($value, $ctx)) !== null) {
-                    $this->error(($error ?? "{$question->label}: no answer").' (pass --'.str_replace('web_', '', $question->key).'=…)');
+                    $this->error(($error ?? "{$question->label}: no answer").' '.$this->answerHint('--'.(WgInstall::OPTIONS[$question->key] ?? $question->key).'=…'));
 
                     return false;
                 }
@@ -45,6 +46,12 @@ trait RunsSetupSteps
         }
 
         return true;
+    }
+
+    /** Where a missing or wrong answer comes from: wg:install's $option. */
+    protected function answerHint(string $option): string
+    {
+        return "(pass {$option})";
     }
 
     protected function prompt(Question $question, Context $ctx, mixed $default): mixed
@@ -110,7 +117,7 @@ trait RunsSetupSteps
             }
         }
 
-        $remaining = $step->check($ctx);
+        $remaining = $step->recheck($ctx);
         if ($remaining === []) {
             $this->line("<info>✓</info> {$step->title()}");
 
@@ -125,19 +132,5 @@ trait RunsSetupSteps
         }
 
         return false;
-    }
-
-    protected function printStep(Step $step, Context $ctx): void
-    {
-        $plan = $step->plan($ctx);
-        if ($plan === []) {
-            return;
-        }
-
-        $this->line("\n# {$step->title()}");
-        foreach ($plan as $action) {
-            $this->line("# {$action->description}");
-            $this->line($action->command ?? "php artisan wg:install --step={$step->key()} --yes");
-        }
     }
 }

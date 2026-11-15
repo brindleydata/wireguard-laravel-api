@@ -38,6 +38,17 @@ abstract class Step
     /** @return list<Action> what fixes it; empty when it can only be fixed by hand */
     abstract public function plan(Context $ctx): array;
 
+    /**
+     * check() again, right after the fix ran. A step whose fix takes effect a moment later (a
+     * service that starts) waits for it here, not in check(), which would make every run wait.
+     *
+     * @return list<string>
+     */
+    public function recheck(Context $ctx): array
+    {
+        return $this->check($ctx);
+    }
+
     /** Instructions shown when plan() is empty. */
     public function manual(Context $ctx): string
     {

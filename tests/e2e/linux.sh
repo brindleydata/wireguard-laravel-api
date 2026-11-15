@@ -15,13 +15,25 @@ set -u
 [ "$(id -u)" -eq 0 ] || { echo "Run as root (sudo): it creates network namespaces." >&2; exit 2; }
 
 APP=$(cd "${1:-/srv/wgla}" && pwd)
-env_get() { sed -n "s/^$1=//p" "$APP/.env" | tail -n 1 | tr -d '"'; }
+# A value from .env as dotenv reads the common cases: quoted, or unquoted up to a " #" comment
+env_get() {
+    local value
+    value=$(sed -n "s/^$1=//p" "$APP/.env" | tail -n 1)
+    case "$value" in
+        \"*) value=${value#\"}; value=${value%%\"*} ;;
+        \'*) value=${value#\'}; value=${value%%\'*} ;;
+        *) value=${value%% #*}; value=${value%"${value##*[![:space:]]}"} ;;
+    esac
+    printf '%s' "$value"
+}
 WEB=$(env_get WGLA_WEB_USER)
 HELPER=$(env_get WIREGUARD_HELPER); HELPER=${HELPER:-/usr/local/sbin/wgla-helper}
 API_KEY=$(env_get API_KEY)
 PORT=$(env_get WGLA_SERVER_PORT)
+BIND=$(env_get WGLA_SERVER_BIND)
+case "$BIND" in *:*) BIND_URL="[$BIND]" ;; *) BIND_URL=$BIND ;; esac
 case "$(env_get WGLA_SERVER_TLS)" in
-    http) URL="http://$(env_get WGLA_SERVER_BIND):$PORT"; CURL_OPTS=() ;;
+    http) URL="http://$BIND_URL:$PORT"; CURL_OPTS=() ;;
     cert) URL="https://127.0.0.1:$PORT"; CURL_OPTS=(-k) ;;
     *) echo "Needs a server set up with --tls=http or --tls=cert" >&2; exit 2 ;;
 esac
@@ -73,6 +85,15 @@ check "a config that isn't there is exit status 3 through sudo" "as_web sudo -n 
 check "the API reports the helper ok" "[ \"\$(api $URL/status)\" = 200 ] && grep -q '\"state\":\"ok\"' /tmp/wgla-e2e-body"
 check "/health is public and ok" "[ \"\$(curl -s ${CURL_OPTS[*]} -o /dev/null -w '%{http_code}' $URL/health)\" = 200 ]"
 check "/status needs the API key" "[ \"\$(curl -s ${CURL_OPTS[*]} -o /dev/null -w '%{http_code}' $URL/status)\" = 403 ]"
+if [ "$(env_get WGLA_SERVER_TLS)" = http ]; then
+    # Behind a proxy: whatever Host header it passes on, and on the bind address only. (An IP in
+    # Caddy's site address would only match the Host header, and it would listen everywhere.)
+    check "the API answers any Host header a proxy passes on" "[ \"\$(curl -s -o /dev/null -w '%{http_code}' -H 'Host: api.example.com' $URL/health)\" = 200 ]"
+    OTHER=$(ip -4 route get 1.1.1.1 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p')
+    if [ -n "$OTHER" ] && [ "$OTHER" != "$BIND" ]; then
+        check "... and listens on $BIND only, not on $OTHER" "! curl -s --max-time 3 -o /dev/null http://$OTHER:$PORT/health"
+    fi
+fi
 
 step "A dual-stack link with forward + NAT, out to a third network"
 ip netns add e2e-far
@@ -85,6 +106,7 @@ check "running as a systemd unit" "wg show interfaces | grep -qw e2e0 && systemc
 check "config is 0600 root" "[ \"\$(stat -c %a:%U /etc/wireguard/e2e0.conf)\" = 600:root ]"
 check "hooks call the helper" "grep -qx 'PostUp = $HELPER firewall-up %i %i' /etc/wireguard/e2e0.conf"
 check "nftables: forward rules" "nft list table inet wg_e2e0 | grep -q 'iifname \"e2e0\" accept'"
+check "nftables: into the tunnel only replies, the rest dropped" "nft list table inet wg_e2e0 | grep -q 'oifname \"e2e0\" ct state established,related accept' && nft list table inet wg_e2e0 | grep -q 'oifname \"e2e0\" drop'"
 check "nftables: NAT only for the VPN subnet" "nft list table inet wg_e2e0 | grep -q 'ip saddr 10.80.0.0/24 oifname \"e2e-fh\" masquerade'"
 check "nftables: NAT66 only for the VPN prefix" "nft list table inet wg_e2e0 | grep -q 'ip6 saddr fd80::/64 oifname \"e2e-fh\" masquerade'"
 check "IPv6 forwarding is on (wg:install)" "[ \"\$(sysctl -n net.ipv6.conf.all.forwarding)\" = 1 ]"
@@ -128,6 +150,13 @@ check "and the far network (forward + NAT)" "ip netns exec e2e-client ping -c1 -
 check "over IPv6 too" "ip netns exec e2e-client ping -6 -c1 -W3 fd80::1"
 check "and the far network over IPv6 (forward + NAT66)" "ip netns exec e2e-client ping -6 -c1 -W3 fd98::2"
 check "the API shows the peer connected, from its endpoint, with traffic" "[ \"\$(api $URL/link/e2e0/peers)\" = 200 ] && grep -q '\"connected\":true' /tmp/wgla-e2e-body && grep -q '\"endpoint\":\"10.99.0.2:' /tmp/wgla-e2e-body && grep -q '\"transfer_rx\":[1-9]' /tmp/wgla-e2e-body"
+# The far network starts a connection to the client: dropped, unless the link takes connections in
+ip netns exec e2e-far ip route add 10.80.0.0/24 via 10.98.0.1
+check "a connection from outside doesn't reach the peer (replies only)" "! ip netns exec e2e-far ping -c1 -W2 10.80.0.2"
+cli wg:link:update e2e0 --inbound=true > /dev/null
+check "... with --inbound=true it does" "ip netns exec e2e-far ping -c1 -W3 10.80.0.2 && nft list table inet wg_e2e0 | grep -q 'oifname \"e2e0\" accept'"
+cli wg:link:update e2e0 --inbound=false > /dev/null
+check "... and not again with --inbound=false" "! ip netns exec e2e-far ping -c1 -W2 10.80.0.2"
 
 step "A FORWARD DROP policy like Docker or ufw set"
 # Docker and ufw bring iptables; a host without it has nothing that drops forwarded traffic
@@ -169,6 +198,36 @@ cli wg:peer:update e2e0 "$PEER" --networks= > /dev/null
 check "removing it removes the route" "[ -z \"\$(ip route show 192.168.77.0/24)\" ]"
 check "the client config as a QR code in the terminal" "cli wg:peer e2e0 \"$PEER\" --qr | grep -q '▀'"
 check "... and from the API as SVG" "[ \"\$(curl -s ${CURL_OPTS[*]} -o /tmp/wgla-e2e-qr -w '%{content_type}' -H \"api-key: $API_KEY\" $URL/link/e2e0/peer/\$(safe \"$PEER\")/qr)\" = image/svg+xml ] && grep -q '<svg' /tmp/wgla-e2e-qr"
+
+step "Where clients connect, a link's new keys, a peer with a key of its own"
+# The client namespace's interface on a client config (Address, DNS and MTU are wg-quick's, not wg's)
+use_conf() { grep -vE '^(Address|DNS|MTU) =' "$1" | sed 's/^Endpoint = .*/Endpoint = 10.99.0.1:51880/' | ip netns exec e2e-client wg setconf e2ec0 /dev/stdin; }
+cli wg:link:update e2e0 --endpoint=vpn.e2e.test:443 > /dev/null
+check "a link's endpoint is in its clients' configs" "cli wg:peer e2e0 \"$PEER\" | grep -qx 'Endpoint = vpn.e2e.test:443'"
+check "a remote whose name doesn't resolve is refused when it's set" "! \"\${ART[@]}\" wg:peer:create e2e0 --remote=nowhere.invalid:51820"
+OLDKEY=$(wg show e2e0 public-key)
+cli wg:link:rekey e2e0 > /dev/null
+check "new keys for the link, live: the interface runs on with them" "[ \"\$(wg show e2e0 public-key)\" != \"$OLDKEY\" ] && grep -qF \"PrivateKey = \$(wg show e2e0 private-key)\" /etc/wireguard/e2e0.conf && systemctl is-active -q wg-quick@e2e0"
+check "... a client with its old config can't connect any more" "! ip netns exec e2e-client ping -c1 -W2 10.80.0.1"
+cli wg:peer e2e0 "$PEER" | sed -n '/^\[Interface\]/,$p' > "$CLIENT"
+use_conf "$CLIENT"
+check "... with its new one it does" "for i in \$(seq 25); do ip netns exec e2e-client ping -c1 -W1 10.80.0.1 && break; done"
+# A device that makes its own keys: only its public key goes to the server
+OWNKEY=$(wg genkey)
+OWN=$(cli wg:peer:create e2e0 --public-key="$(echo "$OWNKEY" | wg pubkey)" --ip=10.80.0.9 | peer_key)
+cli wg:peer e2e0 "$OWN" | sed -n '/^\[Interface\]/,$p' > /tmp/wgla-e2e-own.conf
+check "a peer with a key of its own gets its config without the PrivateKey line, and none is kept" "[ -n \"$OWN\" ] && grep -q '^\[Peer\]' /tmp/wgla-e2e-own.conf && ! grep -q '^PrivateKey' /tmp/wgla-e2e-own.conf && [ ! -e \"/etc/wireguard/clients/e2e0/\$(safe \"$OWN\").conf\" ]"
+sed -i "s|^\[Interface\]|[Interface]\nPrivateKey = $OWNKEY|" /tmp/wgla-e2e-own.conf
+use_conf /tmp/wgla-e2e-own.conf
+# The new address before the old one goes: without any IPv4 address the kernel drops the
+# interface's routes (10.80.0.0/24 and the others, set up above)
+ip netns exec e2e-client sh -c 'ip addr add 10.80.0.9/32 dev e2ec0; ip addr del 10.80.0.2/32 dev e2ec0'
+check "... and connects with it" "for i in \$(seq 25); do ip netns exec e2e-client ping -c1 -W1 10.80.0.1 && break; done"
+# Back to the first peer, for what follows
+cli wg:peer:delete e2e0 "$OWN" > /dev/null
+use_conf "$CLIENT"
+ip netns exec e2e-client sh -c 'ip addr add 10.80.0.2/32 dev e2ec0; ip addr del 10.80.0.9/32 dev e2ec0'
+check "... and the first peer connects again" "for i in \$(seq 25); do ip netns exec e2e-client ping -c1 -W1 10.80.0.1 && break; done && ip netns exec e2e-client ping -c1 -W2 fd80::1"
 
 step "Clashes"
 check "the same port is refused" "! \"\${ART[@]}\" wg:link:create e2e1 10.81.0.1/24 --port=51880"

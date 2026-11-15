@@ -40,6 +40,17 @@ class IpAllocator
         return self::masked($a_bytes, $mask) === self::masked($b_bytes, $mask);
     }
 
+    /** A default route: 0.0.0.0/0 or ::/0 (any address with /0). */
+    public static function isDefaultRoute(string $cidr): bool
+    {
+        return str_ends_with(trim($cidr), '/0');
+    }
+
+    public static function sameFamily(string $a, string $b): bool
+    {
+        return str_contains($a, ':') === str_contains($b, ':');
+    }
+
     /**
      * Host number of an address inside a CIDR's network (10.0.0.5 in 10.0.0.0/24 → 5), or null
      * when it's outside the network or the number doesn't fit an int.

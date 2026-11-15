@@ -18,6 +18,7 @@ class WgRestore extends WgCommand
         {file : The backup file; - for stdin}
         {--passphrase-file= : Read the passphrase from this file (else WGLA_BACKUP_PASSPHRASE, else asked)}
         {--existing= : For links that already exist here: skip or replace (asked when interactive)}
+        {--endpoint= : Where the restored links\' clients connect now (host, or host:port), when not where they did}
         {--yes : Restore without asking for confirmation}';
 
     protected $description = 'Restore links from a backup';
@@ -114,7 +115,7 @@ class WgRestore extends WgCommand
         }
 
         try {
-            $report = $backup->restore($payload, $choices);
+            $report = $backup->restore($payload, $choices, $this->option('endpoint'));
         } catch (\Throwable $e) {
             $this->error('Restore stopped: '.$e->getMessage());
 
@@ -125,11 +126,15 @@ class WgRestore extends WgCommand
         if ($report['skipped'] !== []) {
             $this->line('Skipped: '.implode(', ', $report['skipped']));
         }
+        foreach ($report['failed'] as $name => $error) {
+            $this->error("{$name} could not be restored: {$error}");
+        }
         foreach ($report['ifout'] as $name => [$from, $to]) {
             $this->warn("{$name}: outbound interface ".($from ?? '(none)')." doesn't exist here, using {$to}.");
         }
-        if ($report['hostname_changed']) {
-            $this->warn('Client configs now point at '.($report['hostname'] ?? 'this server').': peers need their new config (wg:peer, or GET /link/{link}/peer/{pubkey}/config).');
+        // Each keeps where its clients connected unless told: on another server, that may be the old one
+        foreach ($report['endpoints'] as $name => $endpoint) {
+            $this->line("{$name}: clients connect to ".($endpoint ?? 'this server (detected)').($this->option('endpoint') === null ? ' as before (--endpoint= points restored links elsewhere)' : ': peers need their new config'));
         }
         // Restored, with its keys and client configs, but down
         foreach ($report['not_started'] as $name => $error) {
@@ -137,6 +142,6 @@ class WgRestore extends WgCommand
             $this->line("  Once that is fixed, start it: wgla link:update {$name} --up=true");
         }
 
-        return $report['not_started'] === [] ? Command::SUCCESS : Command::FAILURE;
+        return $report['not_started'] === [] && $report['failed'] === [] ? Command::SUCCESS : Command::FAILURE;
     }
 }

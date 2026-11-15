@@ -8,6 +8,7 @@ use App\Setup\Context;
 use App\Setup\EnvFile;
 use App\Setup\Question;
 use App\Setup\Step;
+use Illuminate\Support\Sleep;
 use Laravel\Octane\Commands\StartFrankenPhpCommand;
 use ReflectionClass;
 
@@ -21,6 +22,17 @@ class Server extends Step
 
     /** FrankenPHP's admin API, which Octane reloads workers through. Caddy's default too. */
     public const ADMIN_PORT = 2019;
+
+    /** How often the API is asked, a second apart, for the code on disk after its fix (recheck()). */
+    public const SETTLE_ATTEMPTS = 20;
+
+    /**
+     * The service's PATH after the app directory, which comes first. Octane runs the first
+     * `frankenphp` on the PATH and only then looks in the app (FindsFrankenPhpBinary): one that
+     * FrankenPHP's own installer put in /usr/local/bin would run instead of the one this step
+     * downloads, checks and restarts with. (The app calls sudo with a PATH of its own: Shell.)
+     */
+    public const SERVICE_PATH = '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin';
 
     /**
      * Where FrankenPHP's releases are downloaded from. Not through api.github.com, as Octane's own
@@ -63,10 +75,11 @@ class Server extends Step
             new Question(
                 key: 'domain',
                 label: 'Domain name for the certificate',
-                default: fn (Context $ctx) => $ctx->answer('domain') ?? (filter_var($ctx->answer('hostname'), FILTER_VALIDATE_IP) ? null : $ctx->answer('hostname')),
+                // The machine's name, when it is one
+                default: fn (Context $ctx) => $ctx->answer('domain') ?? (self::isDomainName($this->hostname()) ? $this->hostname() : null),
                 when: $tls('letsencrypt'),
-                validate: fn ($value) => filter_var($value, FILTER_VALIDATE_IP) || ! preg_match('/^([a-z0-9-]+\.)+[a-z]{2,}$/i', (string) $value)
-                    ? "Let's Encrypt needs a domain name that points to this server, not an IP address." : null,
+                validate: fn ($value) => self::isDomainName((string) $value)
+                    ? null : "Let's Encrypt needs a domain name that points to this server, not an IP address.",
                 hint: "It must point to this server, and port 443 (or 80) must be reachable from the internet for Let's Encrypt.",
             ),
             // Checked as root: certificate directories are often closed to the installer user
@@ -111,13 +124,13 @@ class Server extends Step
         }
 
         if (! $this->unitCurrent($ctx)) {
-            $problems[] = 'The wgla service is not installed, or its settings changed';
+            $problems[] = $this->onlyCaddyfileChanged($ctx)
+                ? 'deploy/Caddyfile changed: the API only reads it when it starts'
+                : 'The wgla service is not installed, or its settings changed';
         } elseif (! $this->running()) {
             $problems[] = 'The wgla service is not enabled and running';
-        } elseif (($stale = $this->staleness($ctx)) === 'code') {
-            $problems[] = 'The API still runs the code from before the last deploy';
-        } elseif ($stale === 'key') {
-            $problems[] = "The API doesn't take the API key in .env: it still runs with its old settings";
+        } elseif (($stale = $this->staleness($ctx)) !== null) {
+            $problems[] = $stale[1];
         }
 
         if ($ctx->answer('tls') === 'cert' && $ctx->separateWebUser()) {
@@ -155,32 +168,59 @@ class Server extends Step
             ];
         }
 
-        return match ($this->staleness($ctx)) {
+        return match ($this->staleness($ctx)[0] ?? null) {
             // Octane reloads its workers without dropping connections
             'code' => [...$actions, Action::command('Reload the API with the code on disk', 'sudo systemctl reload wgla')],
             // A restart picks up new settings even on a server started before .env stayed out of
             // the process environment (bootstrap/app.php), where a reload would keep the old ones
             'key' => [...$actions, Action::command('Restart the API with the settings on disk', 'sudo systemctl restart wgla')],
+            // Hanging, failing or not up: whatever it runs, a restart runs what's on disk
+            'down', 'unknown' => [...$actions, Action::command('Restart the API with the code on disk', 'sudo systemctl restart wgla')],
             default => $actions,
         };
     }
 
+    /**
+     * After the fix, the API may not serve the code on disk yet: a restarted one takes a moment
+     * to start, and `systemctl reload` (octane:reload) returns before the workers have restarted.
+     * So it is asked again for a while (bounded) before it counts as a problem that remains.
+     */
+    public function recheck(Context $ctx): array
+    {
+        for ($attempt = 1; $attempt < self::SETTLE_ATTEMPTS && $this->settling($ctx); $attempt++) {
+            Sleep::for(1)->second();
+        }
+
+        return $this->check($ctx);
+    }
+
+    /** Whether the service is installed as it should be, but doesn't serve the code on disk (yet). */
+    protected function settling(Context $ctx): bool
+    {
+        return $this->unitCurrent($ctx) && (! $this->running() || in_array($this->staleness($ctx)[0] ?? null, ['code', 'down', 'unknown'], true));
+    }
+
     public function manual(Context $ctx): string
     {
-        return "Make the certificate and key readable by {$ctx->webUser()} (e.g. a group it belongs to), or copy them somewhere it can read.";
+        return implode(' ', array_filter([
+            (new EnvFile($ctx->app('.env')))->get('API_KEY') ? null : 'Set API_KEY in .env (php artisan wg:install --step=environment does).',
+            $ctx->answer('tls') === 'cert' ? "Make the certificate and key readable by {$ctx->webUser()} (e.g. a group it belongs to), or copy them somewhere it can read." : null,
+        ]));
     }
 
     /**
      * Download the current FrankenPHP release into the app, in place of an installed one. The new
      * binary only takes its place once it is complete and runs, so a failed download leaves
-     * things as they were.
+     * things as they were. The one it replaces stays as frankenphp.previous (a hard link, no
+     * copy): the way back from a failed update puts it back (Updater::restoreFrankenPhp()).
      */
     public function downloadFrankenPhp(Context $ctx): string
     {
         $url = self::q(self::RELEASES.'/latest/download/'.$this->frankenPhpAsset($ctx));
 
         return '(cd '.self::q($ctx->app())." && curl -fsSL --retry 3 --retry-delay 2 -o frankenphp.new {$url}"
-            .' && chmod 755 frankenphp.new && ./frankenphp.new version > /dev/null && mv -f frankenphp.new frankenphp'
+            .' && chmod 755 frankenphp.new && ./frankenphp.new version > /dev/null'
+            .' && { [ ! -e frankenphp ] || ln -f frankenphp frankenphp.previous; } && mv -f frankenphp.new frankenphp'
             .' || { rm -f frankenphp.new; exit 1; })';
     }
 
@@ -272,22 +312,35 @@ class Server extends Step
         return is_file($unit) && file_get_contents($unit) === $this->unit($ctx);
     }
 
+    /** Whether the installed unit is the current one but for the Caddyfile it names. */
+    protected function onlyCaddyfileChanged(Context $ctx): bool
+    {
+        $unit = $ctx->system(self::UNIT);
+        $other = fn (string $unit) => preg_replace('/^# Caddyfile .*$/m', '', $unit);
+
+        return is_file($unit) && $other((string) file_get_contents($unit)) === $other($this->unit($ctx));
+    }
+
     protected function running(): bool
     {
         return $this->shell->tryRun('systemctl is-enabled wgla') === 'enabled' && $this->shell->tryRun('systemctl is-active wgla') === 'active';
     }
 
     /**
-     * Whether the API serves something other than what's on disk: 'code' when /status reports
-     * another fingerprint than the code's (it reports the one it booted with), 'key' when it
-     * rejects the API key in .env (it started with another one). Null when it's current, or
-     * unknown (API not answering, no key).
+     * How the running API differs from what's on disk, as [kind, problem], asked through /status
+     * (which reports the code fingerprint it booted with). Kinds: 'code' (other code), 'key' (it
+     * refuses the API key in .env: it started with another one), 'down' (no answer), 'unknown'
+     * (an answer that doesn't say which code: an error, or not the API), 'nokey' (no API_KEY in
+     * .env to ask with). Null only when it says it runs the code on disk: an API that can't be
+     * asked is not taken for current.
+     *
+     * @return array{0: string, 1: string}|null
      */
-    protected function staleness(Context $ctx): ?string
+    protected function staleness(Context $ctx): ?array
     {
         $key = (new EnvFile($ctx->app('.env')))->get('API_KEY');
         if (! $key) {
-            return null;
+            return ['nokey', 'There is no API_KEY in .env to ask the API which code it runs'];
         }
 
         [$url, $options] = $this->localUrl($ctx);
@@ -295,17 +348,21 @@ class Server extends Step
         // -w: the status code on a line of its own after the body (curl expands the \n)
         $output = $this->shell->tryRun(trim("curl -s --max-time 3 {$options}").' -w \'\n%{http_code}\' -H @- :url', ['url' => "{$url}/status"], "api-key: {$key}\n");
         if ($output === null) {
-            return null;
+            return ['down', "The API doesn't answer at {$url}/status, so it can't be told which code it runs"];
         }
 
         $lines = explode("\n", $output);
         $status = array_pop($lines);
         if ($status === '403') {
-            return 'key';
+            return ['key', "The API doesn't take the API key in .env: it still runs with its old settings"];
         }
         $running = json_decode(implode("\n", $lines), true)['app']['code'] ?? null;
 
-        return $running !== null && $running !== ServerService::codeFingerprint($ctx->app()) ? 'code' : null;
+        return match (true) {
+            ! is_string($running) || $status !== '200' => ['unknown', "The API doesn't say which code it runs ({$url}/status answers {$status})"],
+            $running !== ServerService::codeFingerprint($ctx->app()) => ['code', 'The API still runs the code from before the last deploy'],
+            default => null,
+        };
     }
 
     /** The systemd unit for the current answers. */
@@ -316,12 +373,20 @@ class Server extends Step
         $admin = (string) $ctx->answer('admin_port', self::ADMIN_PORT);
         $tls = $ctx->answer('tls');
 
-        [$site, $directive, $host] = match ($tls) {
-            'letsencrypt' => ['https://'.$ctx->answer('domain').($port === '443' ? '' : ":{$port}"), '', '0.0.0.0'],
-            'cert' => [":{$port}", 'tls '.$ctx->answer('cert').' '.$ctx->answer('key'), '0.0.0.0'],
-            default => ['http://'.$ctx->answer('bind', '127.0.0.1').":{$port}", '', (string) $ctx->answer('bind', '127.0.0.1')],
+        // Behind a proxy: listening on the bind address only (`bind`), for any Host header. In a
+        // site address an IP is only a Host matcher, and Caddy listens on every interface: the
+        // API would be open to all, over plain HTTP, and a proxy that passes on the client's
+        // Host header would get nothing
+        [$site, $directive, $bind, $host] = match ($tls) {
+            'letsencrypt' => ['https://'.$ctx->answer('domain').($port === '443' ? '' : ":{$port}"), '', '', '0.0.0.0'],
+            'cert' => [":{$port}", 'tls '.$ctx->answer('cert').' '.$ctx->answer('key'), '', '0.0.0.0'],
+            default => ["http://:{$port}", '', 'bind '.$this->bindHost($ctx), (string) $ctx->answer('bind', '127.0.0.1')],
         };
         $https = $tls === 'http' ? '' : ' --https';
+        $path = self::SERVICE_PATH;
+        // A new Caddyfile is a new unit, which the service is restarted with (plan())
+        $caddyfile = "{$app}/deploy/Caddyfile";
+        $caddyfileHash = is_file($caddyfile) ? 'sha256:'.hash_file('sha256', $caddyfile) : 'missing';
 
         return <<<UNIT
             [Unit]
@@ -332,11 +397,16 @@ class Server extends Step
             User={$ctx->webUser()}
             Group={$ctx->webGroup()}
             WorkingDirectory={$app}
+            # The app's own frankenphp, not another one on the PATH
+            Environment="PATH={$app}:{$path}"
             Environment=XDG_DATA_HOME={$app}/storage/framework/caddy XDG_CONFIG_HOME={$app}/storage/framework/caddy
             Environment="WGLA_SITE_ADDRESS={$site}"
             Environment="WGLA_TLS_DIRECTIVE={$directive}"
-            ExecStart={$ctx->php} {$app}/artisan octane:start --server=frankenphp --host={$host} --port={$port} --admin-port={$admin}{$https} --caddyfile={$app}/deploy/Caddyfile
+            Environment="WGLA_BIND_DIRECTIVE={$bind}"
+            ExecStart={$ctx->php} {$app}/artisan octane:start --server=frankenphp --host={$host} --port={$port} --admin-port={$admin}{$https} --caddyfile={$caddyfile}
             ExecReload={$ctx->php} {$app}/artisan octane:reload --server=frankenphp
+            # A reload doesn't read the Caddyfile again, a restart does: a new one changes this line
+            # Caddyfile {$caddyfileHash}
             Restart=on-failure
             # Bind ports below 1024 without root. Never add NoNewPrivileges: it would break sudo to the root helper.
             AmbientCapabilities=CAP_NET_BIND_SERVICE
@@ -354,9 +424,21 @@ class Server extends Step
 
         return match ($ctx->answer('tls')) {
             'letsencrypt' => 'https://'.$ctx->answer('domain').($port === '443' ? '' : ":{$port}"),
-            'cert' => 'https://'.$ctx->answer('hostname').($port === '443' ? '' : ":{$port}"),
-            default => 'http://'.$ctx->answer('bind', '127.0.0.1').":{$port} (behind your proxy)",
+            'cert' => 'https://'.$this->hostname().($port === '443' ? '' : ":{$port}"),
+            default => 'http://'.$this->bindHost($ctx).":{$port} (behind your proxy)",
         };
+    }
+
+    /** The machine's name. */
+    protected function hostname(): string
+    {
+        return (string) gethostname();
+    }
+
+    /** A name in DNS (a.example, also an IDN's xn--… labels), not an IP address. */
+    protected static function isDomainName(string $name): bool
+    {
+        return ! filter_var($name, FILTER_VALIDATE_IP) && preg_match('/^([a-z0-9-]+\.)+[a-z0-9-]*[a-z][a-z0-9-]*$/i', $name) === 1;
     }
 
     /**
@@ -371,8 +453,16 @@ class Server extends Step
         return match ($ctx->answer('tls')) {
             'letsencrypt' => ['https://'.$ctx->answer('domain').":{$port}", '--resolve '.self::q($ctx->answer('domain').":{$port}:127.0.0.1")],
             'cert' => ["https://127.0.0.1:{$port}", '-k'],
-            default => ['http://'.$ctx->answer('bind', '127.0.0.1').":{$port}", ''],
+            default => ['http://'.$this->bindHost($ctx).":{$port}", ''],
         };
+    }
+
+    /** The address the API listens on (behind a proxy), as a URL has it: IPv6 in brackets. */
+    protected function bindHost(Context $ctx): string
+    {
+        $bind = (string) $ctx->answer('bind', '127.0.0.1');
+
+        return str_contains($bind, ':') ? "[{$bind}]" : $bind;
     }
 
     protected function fileExists(string $path): bool

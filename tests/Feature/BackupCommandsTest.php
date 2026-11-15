@@ -41,6 +41,22 @@ it('writes a private backup file and refuses to overwrite one', function () {
         ->assertFailed();
 });
 
+it('restores what it can and names the link the host refused', function () {
+    $file = "{$this->dir}/server.backup";
+    $this->wg->createLink('wg1', '10.1.0.1/24', 51821);
+    $this->artisan('wg:backup', ['file' => $file, '--passphrase-file' => "{$this->dir}/pass"])->assertSuccessful();
+    $this->wg->deleteLink('wg0');
+    $this->wg->deleteLink('wg1');
+    $this->host->shell->failOnce('sudo -n :helper conf-write :name', fn (array $b) => $b['name'] === 'wg0', 'wgla-helper: No space left on device');
+
+    $this->artisan('wg:restore', ['file' => $file, '--passphrase-file' => "{$this->dir}/pass", '--yes' => true, '--no-interaction' => true])
+        ->expectsOutputToContain('Restored wg1')
+        ->expectsOutputToContain('wg0 could not be restored: wgla-helper: No space left on device')
+        ->assertFailed();
+
+    expect($this->wg->listLinks())->toBe(['wg1']);
+});
+
 it('needs a passphrase when there is no terminal to ask in', function () {
     $this->artisan('wg:backup', ['file' => "{$this->dir}/x.backup", '--no-interaction' => true])
         ->expectsOutputToContain('No passphrase')
@@ -156,7 +172,7 @@ it('restores nothing when a link cannot be restored and nobody said to skip it',
     $this->wg->deleteLink('wg2');
 
     $this->artisan('wg:restore', ['file' => $file, '--passphrase-file' => "{$this->dir}/pass", '--yes' => true, '--no-interaction' => true])
-        ->expectsOutputToContain('or take them out first. Nothing was restored.')
+        ->expectsOutputToContain('or break the link. Edit its config by hand. Nothing was restored.')
         ->assertFailed();
 
     expect($this->wg->listLinks())->toBe([]);

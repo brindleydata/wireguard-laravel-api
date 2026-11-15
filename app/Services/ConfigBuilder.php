@@ -23,8 +23,8 @@ class ConfigBuilder
     public const DEFAULT_ALLOWED_IPS = '0.0.0.0/0';
 
     /**
-     * Version of the link config format, written as `# format = …`. Since 2 a peer's own client
-     * settings are stored in its section; before, they only showed in its client config.
+     * Version of the link config format, written as `# format = …`. A config of another version
+     * counts as one the app doesn't manage (its line would be dropped), so a newer one is refused.
      */
     public const FORMAT = 2;
 
@@ -37,15 +37,21 @@ class ConfigBuilder
     /** What a peer's section holds as comments (peer field => comment key): its label and client settings. */
     public const PEER_SETTINGS = ['name' => 'name', 'dns' => 'dns', 'keepalive' => 'keepalive', 'client_allowed_ips' => 'allowed_ips'];
 
-    /** This server's public address, once it had to be asked for (no WIREGUARD_HOSTNAME, no FQDN). */
-    protected ?string $publicHost = null;
+    /** Where this server is reached, once it was detected (detectedHost()). */
+    protected ?string $detected = null;
 
     public function __construct(
         protected array $config,
         protected OsDriver $os,
     ) {}
 
-    public function buildConfFile(string $address, string $privkey, int $port, string $ifout, array $peers = [], ?string $dns = null, ?int $keepalive = null, ?string $allowed_ips = null, bool $forward = false, bool $nat = false, ?string $address6 = null, ?int $mtu = null): string
+    /**
+     * @param  bool  $inbound  forwarding into the tunnel takes connections that start outside too, not only replies
+     * @param  bool  $allow_default_route  peers may route a default route, as far as the server's policy lets them
+     * @param  bool  $allow_own_networks  peers may route networks that hold the server's own addresses, likewise
+     * @param  string|null  $endpoint  where clients connect: a host, or host:port (WireGuardValidator::endpoint())
+     */
+    public function buildConfFile(string $address, string $privkey, int $port, string $ifout, array $peers = [], ?string $dns = null, ?int $keepalive = null, ?string $allowed_ips = null, bool $forward = false, bool $nat = false, ?string $address6 = null, ?int $mtu = null, bool $inbound = false, bool $allow_default_route = false, bool $allow_own_networks = false, ?string $endpoint = null): string
     {
         // Metadata comments (address and ifout always written)
         $lines = [];
@@ -54,8 +60,19 @@ class ConfigBuilder
             $lines[] = "# address6 = {$address6}";
         }
         $lines[] = "# ifout = {$ifout}";
+        if ($endpoint !== null) {
+            $lines[] = "# endpoint = {$endpoint}";
+        }
         $lines[] = '# forward = '.($forward ? 'true' : 'false');
         $lines[] = '# nat = '.($nat ? 'true' : 'false');
+        $lines[] = '# inbound = '.($inbound ? 'true' : 'false');
+        // Only when on: the root helper checks peers' AllowedIPs against these (and the server's policy)
+        if ($allow_default_route) {
+            $lines[] = '# allow_default_route = true';
+        }
+        if ($allow_own_networks) {
+            $lines[] = '# allow_own_networks = true';
+        }
         $lines[] = '# format = '.self::FORMAT;
         if ($dns !== null) {
             $lines[] = "# dns = {$dns}";
@@ -131,9 +148,10 @@ class ConfigBuilder
      * defaults. Null for a peer without an IPv4 tunnel address (not one of this app's).
      *
      * A template line whose value doesn't exist is left out (no MTU of the link's own, a peer
-     * without a preshared key).
+     * without a preshared key). So is the PrivateKey line of a peer whose key isn't stored here
+     * (it brought its own, or its config was written by hand): the device adds its own.
      */
-    public function buildClientConfig(InterfaceInfo $link, PeerInfo $peer, string $privkey): ?string
+    public function buildClientConfig(InterfaceInfo $link, PeerInfo $peer, ?string $privkey): ?string
     {
         $ip = IpAllocator::tunnelIp($peer->allowed_ips);
         if ($ip === null) {
@@ -165,22 +183,37 @@ class ConfigBuilder
     }
 
     /**
-     * Where clients reach this link: WIREGUARD_HOSTNAME, else the machine's name when that looks
-     * reachable (an FQDN or IP), else its public IPv4.
+     * Where clients reach a link: its own endpoint (host or host:port; a host takes the link's
+     * port), detected when it has none (a link written before endpoints were stored with it).
      */
-    protected function endpoint(InterfaceInfo $link): string
+    public function endpoint(InterfaceInfo $link): string
     {
-        $host = $this->config['hostname'] ?? null;
-        if ($host === null || $host === '') {
-            $hostname = gethostname();
-            // Looked up once per process: client configs are built on every read
-            $host = filter_var($hostname, FILTER_VALIDATE_IP) || str_contains($hostname, '.')
-                ? $hostname
-                : ($this->publicHost ??= $this->os->publicIpv4($this->config['ip_service'] ?? 'http://ifconfig.me/ip') ?? $hostname);
+        $endpoint = $link->endpoint ?? $this->detectedHost();
+        if (preg_match('/^(\[[^]]+\]|[^:]+):\d+$/', $endpoint)) {
+            return $endpoint;
         }
 
         // An IPv6 literal needs brackets before the port
-        return filter_var($host, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6) ? "[{$host}]:{$link->listen_port}" : "{$host}:{$link->listen_port}";
+        return (filter_var($endpoint, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6) ? "[{$endpoint}]" : $endpoint).":{$link->listen_port}";
+    }
+
+    /**
+     * Where this server can be reached, as best it can tell: its name when that looks reachable
+     * (an FQDN or an IP), else its public IPv4 (IP_SERVICE), else its name all the same. What a
+     * new link stores as its endpoint unless told otherwise. Kept for this instance unless $fresh
+     * (asked for), as a link without one of its own asks on every client config.
+     */
+    public function detectedHost(bool $fresh = false): string
+    {
+        if ($this->detected !== null && ! $fresh) {
+            return $this->detected;
+        }
+
+        $hostname = $this->os->hostname();
+
+        return $this->detected = filter_var($hostname, FILTER_VALIDATE_IP) || str_contains($hostname, '.')
+            ? $hostname
+            : ($this->os->publicIpv4($this->config['ip_service'] ?? 'https://ifconfig.me/ip') ?? $hostname);
     }
 
     /**
@@ -192,10 +225,7 @@ class ConfigBuilder
         return "# This peer's private key. Its client config is built from it and the link's settings.\nPrivateKey = {$privkey}";
     }
 
-    /**
-     * The private key in a peer's stored file: a key file, or a whole client config as stored
-     * before client configs were built on demand.
-     */
+    /** The private key in a peer's stored key file (clientKeyFile()). */
     public static function clientPrivateKey(?string $content): ?string
     {
         return preg_match('/^\s*PrivateKey\s*=\s*(\S+)\s*$/m', (string) $content, $m) && KeyManager::isKey($m[1]) ? $m[1] : null;
@@ -279,9 +309,7 @@ class ConfigBuilder
      * Lines of $content that $rebuilt, the same config regenerated by the app, no longer has:
      * settings and comments the app doesn't write (MTU, Table, other hooks, a peer's Endpoint, …),
      * which a rewrite would drop. Spacing around `=` doesn't count, and neither do the helper's
-     * own hooks: those are written anew for this server. Nor does a `# up = …` line, which the
-     * app wrote until 1.0 and never read (whether a link runs is the host's to say): the next
-     * rewrite simply leaves it out. The helper still takes it, for a config that is put back.
+     * own hooks: those are written anew for this server.
      *
      * @return list<string>
      */
@@ -289,7 +317,7 @@ class ConfigBuilder
     {
         $lines = fn (string $text): array => array_filter(
             array_map(fn (string $line) => preg_replace('/^([A-Za-z0-9]+)\s*=\s*/', '$1 = ', trim($line)), explode("\n", $text)),
-            fn (string $line) => $line !== '' && ! preg_match('#^Post(Up|Down) = \S*wgla-helper firewall-(up|down)( %[iI])+$|^\# up = (true|false)$#', $line),
+            fn (string $line) => $line !== '' && ! preg_match('#^Post(Up|Down) = \S*wgla-helper firewall-(up|down)( %[iI])+$#', $line),
         );
 
         $kept = array_count_values($lines($rebuilt));
@@ -303,57 +331,5 @@ class ConfigBuilder
         }
 
         return $dropped;
-    }
-
-    public static function parseMetadata(string $content): array
-    {
-        $metadata = [];
-        foreach (explode("\n", $content) as $line) {
-            $line = trim($line);
-            if ($line === '' || $line[0] !== '#') {
-                break;
-            }
-            if (preg_match('/^#\s*(\w+)\s*=\s*(.+)$/', $line, $matches)) {
-                $metadata[trim($matches[1])] = trim($matches[2]);
-            }
-        }
-
-        return $metadata;
-    }
-
-    public function parseClientConfig(string $content): array
-    {
-        $result = [];
-        $section = null;
-
-        foreach (explode("\n", $content) as $line) {
-            $line = trim($line);
-            if ($line === '[Interface]') {
-                $section = 'interface';
-
-                continue;
-            }
-            if ($line === '[Peer]') {
-                $section = 'peer';
-
-                continue;
-            }
-            if (preg_match('/^(\S+)\s*=\s*(.+)$/', $line, $m)) {
-                $key = $m[1];
-                $value = trim($m[2]);
-                if ($section === 'interface' && in_array($key, ['PrivateKey', 'DNS'], true)) {
-                    $result[$key] = $value;
-                }
-                if ($section === 'interface' && $key === 'Address') {
-                    // The IPv4 tunnel address; the IPv6 one is derived from it
-                    $result['Address'] = IpAllocator::tunnelIp($value) ?? explode('/', $value, 2)[0];
-                }
-                if ($section === 'peer' && in_array($key, ['PresharedKey', 'AllowedIPs', 'PersistentKeepalive'], true)) {
-                    $result[$key] = $value;
-                }
-            }
-        }
-
-        return $result;
     }
 }

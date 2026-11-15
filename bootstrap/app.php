@@ -26,6 +26,9 @@ return Application::configure(basePath: dirname(__DIR__))
         $middleware->api(prepend: [
             ForceJsonResponse::class,
         ]);
+        // A proxy on this host (--tls=http) passes the client's address on (X-Forwarded-For), so
+        // the rate limit on wrong API keys counts per client, not all of them as the proxy
+        $middleware->trustProxies(at: ['127.0.0.1', '::1']);
     })
     ->withExceptions(function (Exceptions $exceptions): void {
         $exceptions->render(function (NotFoundHttpException $e) {
