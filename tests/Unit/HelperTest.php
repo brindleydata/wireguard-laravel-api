@@ -5,6 +5,7 @@ use App\Services\KeyManager;
 use App\Services\Os\LinuxDriver;
 use App\Services\Os\MacDriver;
 use App\Validation\WireGuardValidator;
+use Symfony\Component\Process\Process;
 use Tests\Fakes\FakeShell;
 use Tests\Support\HelperSandbox;
 
@@ -33,7 +34,7 @@ dataset('helper os', ['Linux' => 'Linux', 'macOS' => 'Darwin']);
 /**
  * A link config exactly as the app writes it (hooks naming the helper under test).
  */
-function appConf(string $os, bool $forward = true, bool $nat = true, ?string $address6 = null, ?int $mtu = 1380, bool $inbound = false, array $routes = [], bool $allow_default_route = false, bool $allow_own_networks = false): string
+function appConf(string $os, bool $forward = true, bool $nat = true, ?string $address6 = null, ?int $mtu = 1380, bool $inbound = false, array $routes = [], bool $allow_default_route = false, bool $allow_own_networks = false, ?string $destinations = null, string $address = '10.0.0.1/24'): string
 {
     $driver = $os === 'Darwin'
         ? new MacDriver(new FakeShell, HelperSandbox::path())
@@ -41,7 +42,7 @@ function appConf(string $os, bool $forward = true, bool $nat = true, ?string $ad
     $keys = new KeyManager;
 
     return (new ConfigBuilder([], $driver))->buildConfFile(
-        '10.0.0.1/24', $keys->genkey(), 51820, $os === 'Darwin' ? 'en0' : 'eth0',
+        $address, $keys->genkey(), 51820, $os === 'Darwin' ? 'en0' : 'eth0',
         [
             ['public_key' => $keys->pubkey($keys->genkey()), 'preshared_key' => $keys->genpsk(), 'allowed_ips' => '10.0.0.2/32', 'name' => "Ана's phone (#2)",
                 'dns' => '10.0.0.1, corp.example.com', 'keepalive' => '0', 'client_allowed_ips' => '10.0.0.0/24, fd00::/64'],
@@ -53,8 +54,28 @@ function appConf(string $os, bool $forward = true, bool $nat = true, ?string $ad
             ...($routes === [] ? [] : [['public_key' => $keys->pubkey($keys->genkey()), 'allowed_ips' => implode(', ', ['10.0.0.5/32', ...$routes]), 'enabled' => false]]),
         ],
         '1.1.1.1, 8.8.8.8', 25, '0.0.0.0/0, ::/0', $forward, $nat, address6: $address6, mtu: $mtu,
-        inbound: $inbound, allow_default_route: $allow_default_route, allow_own_networks: $allow_own_networks,
+        inbound: $inbound, allow_default_route: $allow_default_route, allow_own_networks: $allow_own_networks, destinations: $destinations,
     )."\n";
+}
+
+/**
+ * What the real nft makes of a ruleset the helper writes: its listing of the table, or null where
+ * that can't be asked (no nft, or no network namespace of our own to load it into without root).
+ */
+function listedByNft(string $ruleset, string $table): ?string
+{
+    if (! is_executable('/usr/bin/nft') && ! is_executable('/usr/sbin/nft')) {
+        return null;
+    }
+    $process = new Process(['unshare', '-rn', 'sh', '-c', 'PATH=/usr/sbin:/usr/bin:/sbin:/bin; nft -f - && nft list table inet "$0"', $table], input: $ruleset);
+    $process->run();
+    // No namespace of our own (unshare refused): nothing was asked of nft
+    if ($process->getExitCode() !== 0 && ! str_contains($process->getErrorOutput(), 'Error:')) {
+        return null;
+    }
+    expect($process->getExitCode())->toBe(0, "nft rejected:\n{$ruleset}\n".$process->getErrorOutput());
+
+    return rtrim($process->getOutput());
 }
 
 // ─── Arguments ──────────────────────────────────────────────────────
@@ -742,4 +763,386 @@ it('repairs the link behind each utun on macOS', function () {
         ->and($run['stdout'])->toContain('link wg0 had lost its firewall rules')
         ->and($box->calls())->toContain(['pfctl', '-a', 'wg/wg0', '-f', '-'])
         ->and($box->stdin()[0])->toContain('pass in on utun5 all')->toBeAcceptedByPf();
+});
+
+// ─── A link's destinations ──────────────────────────────────────────
+
+/** Destinations of both families, as the app writes them */
+const HELPER_DESTINATIONS = '10.20.0.0/16, 192.0.2.50/32, 2001:db8:a::/48';
+
+/** The table firewall-up installs for appConf('Linux', destinations: HELPER_DESTINATIONS) on a dual-stack link, as `nft list` prints it: each network its own way */
+const NFT_LISTED_SCOPED = "table inet wg_wg0 {\n\tchain forward {\n\t\ttype filter hook forward priority filter; policy accept;\n\t\tiifname \"wg0\" ct state established,related accept\n"
+    ."\t\tiifname \"wg0\" ip daddr 10.20.0.0/16 accept\n\t\tiifname \"wg0\" ip daddr 192.0.2.50 accept\n\t\tiifname \"wg0\" ip6 daddr 2001:db8:a::/48 accept\n\t\tiifname \"wg0\" drop\n"
+    ."\t\toifname \"wg0\" ct state established,related accept\n\t\toifname \"wg0\" drop\n\t}\n\n"
+    ."\tchain postrouting {\n\t\ttype nat hook postrouting priority srcnat; policy accept;\n\t\tip saddr 10.0.0.0/24 ip daddr 10.20.0.0/16 oifname \"eth0\" masquerade\n"
+    ."\t\tip saddr 10.0.0.0/24 ip daddr 192.0.2.50 oifname \"eth0\" masquerade\n\t\tip6 saddr fd12:3456:789a::/64 ip6 daddr 2001:db8:a::/48 oifname \"eth0\" masquerade\n\t}\n}";
+
+it('takes a link\'s destinations, and nothing else in that line', function (string $destinations, bool $taken) {
+    $box = new HelperSandbox;
+
+    $run = $box->run(['conf-write', 'wg0'], str_replace('# format = ', "# destinations = {$destinations}\n# format = ", appConf('Linux')));
+
+    expect($run['exit'])->toBe($taken ? 0 : 1, $run['stderr']);
+    if (! $taken) {
+        expect($run['stderr'])->toContain('metadata not allowed: # destinations');
+    }
+})->with([
+    'networks of both families' => [HELPER_DESTINATIONS.', fd00::7/128', true],
+    'one' => ['10.20.0.0/16', true],
+    'half of everything' => ['0.0.0.0/1, 128.0.0.0/1', true],
+    // What a link without destinations has: the app never writes it
+    'everything' => ['0.0.0.0/0', false],
+    'everything, in IPv6' => ['10.20.0.0/16, ::/0', false],
+    'everything, written long' => ['::/00', false],
+    'a mask with a leading zero' => ['10.20.0.0/016', false],
+    'an address without its mask' => ['10.20.0.1', false],
+    'a name' => ['pbx.example.com', false],
+    'shell syntax' => ['10.20.0.0/16;id', false],
+    'more of a rule' => ['10.20.0.0/16 accept', false],
+    'an IPv6 address that is none' => ['12345::/64', false],
+    'an IPv6 address with too many groups' => ['1:2:3:4:5:6:7:8:9/64', false],
+    'spaces around a comma' => ['10.20.0.0/16 , 10.30.0.0/16', false],
+]);
+
+it('forwards out of the tunnel and masquerades only to the link\'s destinations', function () {
+    $box = new HelperSandbox('Linux');
+    $box->writeConf('wg0', appConf('Linux', address6: 'fd12:3456:789a::1/64', destinations: HELPER_DESTINATIONS));
+    $box->respond('iptables -S FORWARD', '-P FORWARD ACCEPT');
+
+    $run = $box->run(['firewall-up', 'wg0', 'wg0']);
+
+    // A rule per destination, and the rest out of the tunnel dropped (but replies to what came in
+    // for its peers): a drop in this table is final, whatever another one accepts
+    expect($run['exit'])->toBe(0, $run['stderr'])
+        ->and($box->stdin())->toBe([<<<'NFT'
+            table inet wg_wg0
+            delete table inet wg_wg0
+            table inet wg_wg0 {
+                chain forward { type filter hook forward priority 0; iifname "wg0" ct state established,related accept; iifname "wg0" ip daddr 10.20.0.0/16 accept; iifname "wg0" ip daddr 192.0.2.50/32 accept; iifname "wg0" ip6 daddr 2001:db8:a::/48 accept; iifname "wg0" drop; oifname "wg0" ct state established,related accept; oifname "wg0" drop; }
+                chain postrouting { type nat hook postrouting priority 100; ip saddr 10.0.0.0/24 ip daddr 10.20.0.0/16 oifname "eth0" masquerade; ip saddr 10.0.0.0/24 ip daddr 192.0.2.50/32 oifname "eth0" masquerade; ip6 saddr fd12:3456:789a::1/64 ip6 daddr 2001:db8:a::/48 oifname "eth0" masquerade; }
+            }
+
+            NFT]);
+});
+
+it('holds a link to its destinations with or without forward and NAT', function (bool $forward, bool $nat, bool $inbound, string $chains) {
+    $box = new HelperSandbox('Linux');
+    // Only IPv4 destinations: nothing of IPv6 gets out of the tunnel then
+    $box->writeConf('wg0', appConf('Linux', $forward, $nat, address6: 'fd12:3456:789a::1/64', inbound: $inbound, destinations: '10.20.0.0/16'));
+    $box->respond('iptables -S FORWARD', "-P FORWARD DROP\n-A FORWARD -j DOCKER-USER");
+
+    $run = $box->run(['firewall-up', 'wg0', 'wg0']);
+
+    expect($run['exit'])->toBe(0, $run['stderr'])
+        ->and($box->stdin()[0])->toBe("table inet wg_wg0\ndelete table inet wg_wg0\ntable inet wg_wg0 {\n{$chains}}\n")
+        // Opening iptables' own FORWARD chain is still only forward's to ask for
+        ->and(array_filter($box->calls(), fn (array $call) => in_array('-I', $call, true)) !== [])->toBe($forward);
+})->with([
+    'neither: only what leaves the tunnel is held' => [false, false, false,
+        "    chain forward { type filter hook forward priority 0; iifname \"wg0\" ct state established,related accept; iifname \"wg0\" ip daddr 10.20.0.0/16 accept; iifname \"wg0\" drop; }\n"],
+    'forward, connections in too' => [true, false, true,
+        "    chain forward { type filter hook forward priority 0; iifname \"wg0\" ct state established,related accept; iifname \"wg0\" ip daddr 10.20.0.0/16 accept; iifname \"wg0\" drop; oifname \"wg0\" accept; }\n"],
+    'NAT only: no IPv6 destination, so none is masqueraded' => [false, true, false,
+        "    chain forward { type filter hook forward priority 0; iifname \"wg0\" ct state established,related accept; iifname \"wg0\" ip daddr 10.20.0.0/16 accept; iifname \"wg0\" drop; }\n"
+        ."    chain postrouting { type nat hook postrouting priority 100; ip saddr 10.0.0.0/24 ip daddr 10.20.0.0/16 oifname \"eth0\" masquerade; }\n"],
+]);
+
+it('writes rules the real nft takes, and finds them again in what it lists', function (?string $address6, bool $forward, bool $nat, string $destinations) {
+    $box = new HelperSandbox('Linux');
+    $box->writeConf('wg0', appConf('Linux', $forward, $nat, address6: $address6, destinations: $destinations));
+    $box->respond('iptables -S FORWARD', '-P FORWARD ACCEPT');
+    expect($box->run(['firewall-up', 'wg0', 'wg0'])['exit'])->toBe(0);
+
+    $listed = listedByNft($box->stdin()[0], 'wg_wg0');
+    if ($listed === null) {
+        $this->markTestSkipped('No nft, or no network namespace to load rules into without root');
+    }
+    $box->respond('nft list table inet wg_wg0', $listed);
+
+    // However this nft spells a network (host bits masked, a host without its mask, IPv6 shortened)
+    expect($box->run(['firewall-check', 'wg0', 'wg0'])['stdout'])->toBe("ok\n", $listed);
+
+    // And not when the config asks for other destinations than are installed
+    $box->writeConf('wg0', appConf('Linux', $forward, $nat, address6: $address6, destinations: "{$destinations}, 198.51.100.0/24"));
+    expect($box->run(['firewall-check', 'wg0', 'wg0'])['stdout'])->toBe("missing\n");
+})->with([
+    'both families, forward and NAT' => ['fd12:3456:789a::1/64', true, true, HELPER_DESTINATIONS.', fd00:0:0:1::7/128, 10.20.30.0/24'],
+    'destinations alone' => [null, false, false, '10.20.0.0/16, 2001:db8::/32'],
+    'NAT alone' => ['fd12:3456:789a::1/64', false, true, '192.0.2.50/32, fd00::/8'],
+    'many' => [null, true, true, implode(', ', array_map(fn (int $n) => "10.{$n}.0.0/16", range(1, 120)))],
+    'none' => ['fd12:3456:789a::1/64', true, true, '203.0.113.0/24'],
+]);
+
+it('finds the NAT rules of a link whose subnet is one address, which the tools list without its mask', function (?string $destinations) {
+    $box = new HelperSandbox('Linux');
+    $box->writeConf('wg0', appConf('Linux', destinations: $destinations, address: '10.0.0.1/32'));
+    $box->respond('iptables -S FORWARD', '-P FORWARD ACCEPT');
+    expect($box->run(['firewall-up', 'wg0', 'wg0'])['exit'])->toBe(0);
+
+    // As nft prints `ip saddr 10.0.0.1/32`: it was looked for with the mask, and missed every minute
+    $scope = $destinations === null ? '' : ' ip daddr 10.20.0.0/16';
+    $listed = "table inet wg_wg0 {\n\tchain forward {\n\t\ttype filter hook forward priority filter; policy accept;\n"
+        .($destinations === null ? "\t\tiifname \"wg0\" accept\n" : "\t\tiifname \"wg0\" ct state established,related accept\n\t\tiifname \"wg0\" ip daddr 10.20.0.0/16 accept\n\t\tiifname \"wg0\" drop\n")
+        ."\t\toifname \"wg0\" ct state established,related accept\n\t\toifname \"wg0\" drop\n\t}\n\n"
+        ."\tchain postrouting {\n\t\ttype nat hook postrouting priority srcnat; policy accept;\n\t\tip saddr 10.0.0.1{$scope} oifname \"eth0\" masquerade\n\t}\n}";
+    $box->respond('nft list table inet wg_wg0', listedByNft($box->stdin()[0], 'wg_wg0') ?? $listed);
+
+    expect($box->run(['firewall-check', 'wg0', 'wg0'])['stdout'])->toBe("ok\n");
+    $box->respond('nft list table inet wg_wg0', $listed);
+    expect($box->run(['firewall-check', 'wg0', 'wg0'])['stdout'])->toBe("ok\n");
+})->with(['to anywhere' => [null], 'to its destinations' => ['10.20.0.0/16']]);
+
+it('says whether a link with destinations has exactly the rules for them', function (string $listed, string $answer, ?string $destinations = HELPER_DESTINATIONS) {
+    $box = new HelperSandbox('Linux');
+    $box->writeConf('wg0', appConf('Linux', address6: 'fd12:3456:789a::1/64', destinations: $destinations));
+    $box->respond('iptables -S FORWARD', '-P FORWARD ACCEPT');
+    $box->respond('nft list table inet wg_wg0', $listed);
+
+    expect($box->run(['firewall-check', 'wg0', 'wg0'])['stdout'])->toBe("{$answer}\n");
+})->with([
+    'all there, as nft prints them' => [NFT_LISTED_SCOPED, 'ok'],
+    'the same networks spelled otherwise' => [str_replace(['10.20.0.0/16', '2001:db8:a::/48'], ['10.20.0.0/16', '2001:0db8:000A:0::/48'], NFT_LISTED_SCOPED), 'ok'],
+    'a destination not forwarded to' => [str_replace("\t\tiifname \"wg0\" ip daddr 192.0.2.50 accept\n", '', NFT_LISTED_SCOPED), 'missing'],
+    'one more than the config has' => [str_replace("\t\tiifname \"wg0\" drop\n", "\t\tiifname \"wg0\" ip daddr 198.51.100.0/24 accept\n\t\tiifname \"wg0\" drop\n", NFT_LISTED_SCOPED), 'missing'],
+    'another network of the same size' => [str_replace('ip daddr 10.20.0.0/16 accept', 'ip daddr 10.21.0.0/16 accept', NFT_LISTED_SCOPED), 'missing'],
+    'the same network, wider' => [str_replace('ip daddr 10.20.0.0/16 accept', 'ip daddr 10.20.0.0/15 accept', NFT_LISTED_SCOPED), 'missing'],
+    'nothing dropped' => [str_replace("\t\tiifname \"wg0\" drop\n", '', NFT_LISTED_SCOPED), 'missing'],
+    'everything accepted, from before it had destinations' => [str_replace("\t\tiifname \"wg0\" drop\n", "\t\tiifname \"wg0\" accept\n", NFT_LISTED_SCOPED), 'missing'],
+    'replies to what came in not let out' => [str_replace("\t\tiifname \"wg0\" ct state established,related accept\n", '', NFT_LISTED_SCOPED), 'missing'],
+    'a destination not masqueraded' => [str_replace("\t\tip saddr 10.0.0.0/24 ip daddr 192.0.2.50 oifname \"eth0\" masquerade\n", '', NFT_LISTED_SCOPED), 'missing'],
+    'the IPv6 destination not masqueraded' => [str_replace("\t\tip6 saddr fd12:3456:789a::/64 ip6 daddr 2001:db8:a::/48 oifname \"eth0\" masquerade\n", '', NFT_LISTED_SCOPED), 'missing'],
+    'everything masqueraded, from before it had destinations' => [str_replace("\t\tip saddr 10.0.0.0/24 ip daddr 192.0.2.50 oifname \"eth0\" masquerade\n", "\t\tip saddr 10.0.0.0/24 oifname \"eth0\" masquerade\n", NFT_LISTED_SCOPED), 'missing'],
+    'masqueraded out of another interface' => [str_replace('oifname "eth0" masquerade', 'oifname "eth1" masquerade', NFT_LISTED_SCOPED), 'missing'],
+    // The other way round: a link that has no destinations (any more) with the rules of one that has
+    'rules for destinations the config no longer has' => [NFT_LISTED_SCOPED, 'missing', null],
+    'the table gone' => ['', 'missing'],
+]);
+
+it('puts the rules of a link with destinations back when they are gone, and leaves them when they are there', function () {
+    $box = new HelperSandbox('Linux');
+    $box->writeConf('wg0', appConf('Linux', forward: false, nat: false, destinations: '10.20.0.0/16'));
+    $box->writeConf('wg1', appConf('Linux', forward: false, nat: false, destinations: '10.20.0.0/16'));
+    $box->respond('wg show interfaces', 'wg0 wg1');
+    $box->respond('nft list table inet wg_wg0', '', 1);
+    $box->respond('nft list table inet wg_wg1', "table inet wg_wg1 {\n\tchain forward {\n\t\ttype filter hook forward priority filter; policy accept;\n\t\tiifname \"wg1\" ct state established,related accept\n\t\tiifname \"wg1\" ip daddr 10.20.0.0/16 accept\n\t\tiifname \"wg1\" drop\n\t}\n}");
+
+    $run = $box->run(['firewall-repair']);
+
+    // The timer: a link with neither forward nor NAT has rules to lose too
+    expect($run['stdout'])->toBe("<4>wgla-helper: link wg0 had lost its firewall rules; they are back\n")
+        ->and($box->stdin())->toHaveCount(1)
+        ->and($box->stdin()[0])->toContain('iifname "wg0" ip daddr 10.20.0.0/16 accept; iifname "wg0" drop;');
+});
+
+it('holds a link to its destinations on macOS, in what pf lets out and translates', function (bool $forward, bool $nat, string $rules) {
+    $box = new HelperSandbox('Darwin');
+    $box->writeConf('wg0', appConf('Darwin', $forward, $nat, address6: 'fd12:3456:789a::1/64', destinations: HELPER_DESTINATIONS));
+    file_put_contents("{$box->runDir}/wg0.name", "utun5\n");
+
+    $run = $box->run(['firewall-up', 'wg0', 'utun5']);
+
+    expect($run['exit'])->toBe(0, $run['stderr'])
+        ->and($box->stdin()[0])->toBe($rules)->toBeAcceptedByPf();
+})->with([
+    // What comes in from the tunnel is tagged, and dropped where it would leave again: unless it
+    // goes to a destination, which gives it another tag
+    // (a tag per destination: rules that only differ in an address are what pfctl's optimizer folds into one)
+    'forward and NAT' => [true, true,
+        "nat on en0 from 10.0.0.0/24 to 10.20.0.0/16 -> (en0)\nnat on en0 from 10.0.0.0/24 to 192.0.2.50/32 -> (en0)\nnat on en0 inet6 from fd12:3456:789a::1/64 to 2001:db8:a::/48 -> (en0)\n"
+        ."pass in on utun5 all no state tag wgla_no_wg0\npass in on utun5 inet from any to 10.20.0.0/16 tag wgla_to_wg0_1\npass in on utun5 inet from any to 192.0.2.50/32 tag wgla_to_wg0_2\n"
+        ."pass in on utun5 inet6 from any to 2001:db8:a::/48 tag wgla_to_wg0_3\nblock drop out quick all tagged wgla_no_wg0\n"
+        ."pass in on ! utun5 inet from any to 10.0.0.0/24 no state tag wgla_in_wg0\npass in on ! utun5 inet6 from any to fd12:3456:789a::1/64 no state tag wgla_in_wg0\nblock drop out on utun5 all tagged wgla_in_wg0\n"],
+    'neither' => [false, false,
+        "pass in on utun5 all no state tag wgla_no_wg0\npass in on utun5 inet from any to 10.20.0.0/16 tag wgla_to_wg0_1\npass in on utun5 inet from any to 192.0.2.50/32 tag wgla_to_wg0_2\n"
+        ."pass in on utun5 inet6 from any to 2001:db8:a::/48 tag wgla_to_wg0_3\nblock drop out quick all tagged wgla_no_wg0\n"],
+]);
+
+it('drops what is not for a destination for good on macOS, whatever a link that takes connections in passes out', function () {
+    $box = new HelperSandbox('Darwin');
+    $box->writeConf('wg0', appConf('Darwin', nat: false, inbound: true, destinations: '10.20.0.0/16'));
+    file_put_contents("{$box->runDir}/wg0.name", "utun5\n");
+
+    $box->run(['firewall-up', 'wg0', 'utun5']);
+
+    // pf goes by the last rule that matches: without `quick`, what one peer sends another (out of
+    // the same utun) would match the drop and then this link's own `pass out`, and get through
+    expect($box->stdin()[0])
+        ->toBe("pass in on utun5 all no state tag wgla_no_wg0\npass in on utun5 inet from any to 10.20.0.0/16 tag wgla_to_wg0_1\nblock drop out quick all tagged wgla_no_wg0\npass out on utun5 all\n")
+        ->toBeAcceptedByPf();
+});
+
+it('finds the rules for a link\'s destinations as pfctl prints them, and misses them when they are others', function (string $nat, string $rules, string $answer, ?string $destinations = HELPER_DESTINATIONS) {
+    $box = new HelperSandbox('Darwin');
+    $box->writeConf('wg0', appConf('Darwin', address6: 'fd12:3456:789a::1/64', destinations: $destinations));
+    file_put_contents("{$box->runDir}/wg0.name", "utun5\n");
+    $box->respond('pfctl -a wg/wg0 -s nat', $nat);
+    $box->respond('pfctl -a wg/wg0 -s rules', $rules);
+
+    expect($box->run(['firewall-check', 'wg0', 'utun5'])['stdout'])->toBe("{$answer}\n");
+})->with(function () {
+    // As pfctl prints them: a host without its mask, the prefix masked, state and flags spelled out
+    $nat = "nat on en0 inet from 10.0.0.0/24 to 10.20.0.0/16 -> (en0) round-robin\nnat on en0 inet from 10.0.0.0/24 to 192.0.2.50 -> (en0) round-robin\nnat on en0 inet6 from fd12:3456:789a::/64 to 2001:db8:a::/48 -> (en0) round-robin";
+    $rules = "pass in on utun5 all no state tag wgla_no_wg0\npass in on utun5 inet from any to 10.20.0.0/16 flags S/SA keep state tag wgla_to_wg0_1\npass in on utun5 inet from any to 192.0.2.50 flags S/SA keep state tag wgla_to_wg0_2\n"
+        ."pass in on utun5 inet6 from any to 2001:db8:a::/48 flags S/SA keep state tag wgla_to_wg0_3\nblock drop out quick all tagged wgla_no_wg0\n"
+        ."pass in on ! utun5 inet from any to 10.0.0.0/24 no state tag wgla_in_wg0\npass in on ! utun5 inet6 from any to fd12:3456:789a::/64 no state tag wgla_in_wg0\nblock drop out on utun5 all tagged wgla_in_wg0";
+    $open = "pass in on utun5 all flags S/SA keep state\npass in on ! utun5 inet from any to 10.0.0.0/24 no state tag wgla_in_wg0\npass in on ! utun5 inet6 from any to fd12:3456:789a::/64 no state tag wgla_in_wg0\nblock drop out on utun5 all tagged wgla_in_wg0";
+
+    return [
+        'all there' => [$nat, $rules, 'ok'],
+        'a destination not let out' => [$nat, str_replace("pass in on utun5 inet from any to 192.0.2.50 flags S/SA keep state tag wgla_to_wg0_2\n", '', $rules), 'missing'],
+        'one more let out' => [$nat, str_replace('block drop out quick all', "pass in on utun5 inet from any to 198.51.100.0/24 flags S/SA keep state tag wgla_to_wg0_4\nblock drop out quick all", $rules), 'missing'],
+        'nothing dropped on its way out' => [$nat, str_replace("block drop out quick all tagged wgla_no_wg0\n", '', $rules), 'missing'],
+        // From before the drop was final: it could be passed out again further down
+        'a drop that is not final' => [$nat, str_replace('block drop out quick all', 'block drop out all', $rules), 'missing'],
+        'everything let in, from before it had destinations' => [$nat, "pass in on utun5 all flags S/SA keep state\n{$rules}", 'missing'],
+        'a destination not translated' => [str_replace("nat on en0 inet from 10.0.0.0/24 to 192.0.2.50 -> (en0) round-robin\n", '', $nat), $rules, 'missing'],
+        'everything translated' => ["nat on en0 inet from 10.0.0.0/24 to any -> (en0) round-robin\n{$nat}", $rules, 'missing'],
+        'rules for destinations the config no longer has' => ["nat on en0 inet from 10.0.0.0/24 to any -> (en0) round-robin\nnat on en0 inet6 from fd12:3456:789a::/64 to any -> (en0) round-robin", $rules, 'missing', null],
+        'no destinations, and none in the rules' => ["nat on en0 inet from 10.0.0.0/24 to any -> (en0) round-robin\nnat on en0 inet6 from fd12:3456:789a::/64 to any -> (en0) round-robin", $open, 'ok', null],
+    ];
+});
+
+// ─── Adoption ───────────────────────────────────────────────────────
+
+/** A config as the API before this one wrote it: hooks of its own, which the helper never takes from the app */
+function foreignConf(): string
+{
+    return "[Interface]\nAddress = 10.0.42.1/24\nListenPort = 62990\nPrivateKey = ".HELPER_TEST_KEY."\n"
+        ."PostUp = iptables -A FORWARD -i %i -j ACCEPT; iptables -t nat -A POSTROUTING -d 10.20.0.0/16 -o eth0 -j MASQUERADE;\n"
+        ."PostDown = iptables -D FORWARD -i %i -j ACCEPT; iptables -t nat -D POSTROUTING -d 10.20.0.0/16 -o eth0 -j MASQUERADE;\n\n"
+        ."[Peer]\nPublicKey = ".HELPER_TEST_KEY."\nAllowedIPs = 10.0.42.2/32\n";
+}
+
+it('says whether it would take a config, without writing it', function () {
+    $box = new HelperSandbox;
+    $box->writeConf('wg0', foreignConf());
+
+    expect($box->run(['conf-check', 'wg0'], appConf('Linux'))['exit'])->toBe(0)
+        ->and($box->run(['conf-check', 'wg1'], appConf('Linux'))['exit'])->toBe(0)
+        ->and($box->run(['conf-check', 'wg0'], foreignConf())['stderr'])->toContain('PostUp must be exactly')
+        ->and($box->run(['conf-check', '../etc'], appConf('Linux'))['stderr'])->toContain('invalid link name')
+        ->and(file_get_contents("{$box->confDir}/wg0.conf"))->toBe(foreignConf())
+        ->and(array_values(array_diff(scandir($box->confDir), ['.', '..'])))->toBe(['wg0.conf'])
+        ->and(glob("{$box->dir}/wgla.*"))->toBe([], 'No temp file is left behind')
+        ->and($box->calls())->toBe([]);
+});
+
+it('replaces a config the app did not write with the app\'s, and keeps it until told the outcome', function (string $os) {
+    $box = new HelperSandbox($os);
+    $box->writeConf('wg0', $legacy = foreignConf());
+    chmod("{$box->confDir}/wg0.conf", 0640);
+    $kept = "{$box->confDir}/.wg0.conf.before-adopt";
+
+    $run = $box->run(['conf-adopt', 'wg0'], $new = appConf($os));
+
+    expect($run['exit'])->toBe(0, $run['stderr'])
+        ->and(file_get_contents("{$box->confDir}/wg0.conf"))->toBe($new)
+        ->and(sprintf('%o', fileperms("{$box->confDir}/wg0.conf") & 0777))->toBe('600')
+        ->and(file_get_contents($kept))->toBe($legacy)
+        ->and(sprintf('%o', fileperms($kept) & 0777))->toBe('600')
+        // The kept one is no link: not listed, not readable as one
+        ->and($box->run(['conf-list'])['stdout'])->toBe("wg0\n");
+
+    // The link didn't start: back to what was there, byte for byte
+    expect($box->run(['conf-adopt-undo', 'wg0'])['exit'])->toBe(0)
+        ->and(file_get_contents("{$box->confDir}/wg0.conf"))->toBe($legacy)
+        ->and(file_exists($kept))->toBeFalse()
+        ->and($box->run(['conf-adopt-undo', 'wg0'])['stderr'])->toContain('nothing to put back');
+
+    // It did: nothing is kept
+    $box->run(['conf-adopt', 'wg0'], $new);
+    expect($box->run(['conf-adopt-done', 'wg0'])['exit'])->toBe(0)
+        ->and(file_exists($kept))->toBeFalse()
+        ->and(file_get_contents("{$box->confDir}/wg0.conf"))->toBe($new)
+        ->and($box->run(['conf-adopt-done', 'wg0'])['exit'])->toBe(0, 'Nothing kept is nothing to do')
+        ->and($box->calls())->toBe([]);
+})->with('helper os');
+
+it('only ever puts back what was there: it takes no config with hooks of its own, in an adoption either', function () {
+    $box = new HelperSandbox;
+    $box->writeConf('wg0', $legacy = foreignConf());
+
+    // What it replaces a config with is checked like any config the app writes
+    $run = $box->run(['conf-adopt', 'wg0'], str_replace('PostUp = ', 'PostUp = touch /tmp/pwned; ', appConf('Linux')));
+    expect($run['exit'])->toBe(1)
+        ->and($run['stderr'])->toContain('PostUp must be exactly')
+        ->and(file_get_contents("{$box->confDir}/wg0.conf"))->toBe($legacy)
+        ->and(array_values(array_diff(scandir($box->confDir), ['.', '..'])))->toBe(['wg0.conf'], 'Nothing kept, no temp file');
+
+    // There is nothing to adopt where there is no config, and nothing to put back without an adoption
+    expect($box->run(['conf-adopt', 'wg1'], appConf('Linux'))['exit'])->toBe(3)
+        ->and($box->run(['conf-adopt-undo', 'wg0'])['exit'])->toBe(1)
+        ->and($box->run(['conf-adopt', '../wg0'], appConf('Linux'))['stderr'])->toContain('invalid link name')
+        ->and($box->run(['conf-adopt-undo', '.wg0'])['stderr'])->toContain('invalid link name')
+        ->and(file_get_contents("{$box->confDir}/wg0.conf"))->toBe($legacy);
+
+    // What is kept of a link goes with the link
+    $box->run(['conf-adopt', 'wg0'], appConf('Linux'));
+    $box->run(['conf-delete', 'wg0']);
+    expect(array_values(array_diff(scandir($box->confDir), ['.', '..'])))->toBe([]);
+});
+
+it('tells whose private keys a link\'s client directory holds, by public key only', function () {
+    $box = new HelperSandbox;
+    $box->withPubkeys();
+    $keys = new KeyManager;
+    [$stored, $legacy, $indented, $loose] = [$keys->genkey(), $keys->genkey(), $keys->genkey(), $keys->genkey()];
+    $box->run(['client-write', 'wg0', KeyManager::pubkeyToSafe($keys->pubkey($stored))], ConfigBuilder::clientKeyFile($stored)."\n");
+    // As the API before this one kept them: a whole client config, named by the peer's address
+    $box->writeClient('wg0', '10.0.42.2', "[Interface]\nPrivateKey = {$legacy}\nAddress    = 10.0.42.2/32\nDNS        = 8.8.8.8\n\n[Peer]\nPublicKey    = ".HELPER_TEST_KEY."\nAllowedIPs   = 10.20.0.0/16\n");
+    $box->writeClient('wg0', '10.0.42.3', "[Interface]\n  PrivateKey=  {$indented}  \nAddress = 10.0.42.3/32\n");
+    // As wg-quick itself would read one: the key name in any case, a comment after the key, CRLF
+    $box->writeClient('wg0', '10.0.42.4', "[interface]\r\nprivatekey = {$loose} # the phone's\r\naddress = 10.0.42.4/32\r\n");
+    $box->writeClient('wg0', 'notes', "nothing of a key in here\nPrivateKey = not-a-key\n");
+    $box->writeClient('wg0', 'empty', '');
+    symlink('/etc/hostname', "{$box->confDir}/clients/wg0/link.conf");
+    $box->writeClient('wg1', '10.0.43.2', "[Interface]\nPrivateKey = {$keys->genkey()}\n");
+
+    $run = $box->run(['client-keys', 'wg0']);
+
+    expect($run['exit'])->toBe(0, $run['stderr'])
+        ->and($run['stdout'])->toBe("stored {$keys->pubkey($stored)}\nlegacy {$keys->pubkey($legacy)}\nlegacy {$keys->pubkey($indented)}\nlegacy {$keys->pubkey($loose)}\n")
+        ->and($run['stdout'].$run['stderr'])->not->toContain($stored)->not->toContain($legacy)->not->toContain($indented)->not->toContain($loose)
+        ->and($box->run(['client-keys', 'wg9'])['stdout'])->toBe('', 'No client directory: no keys')
+        ->and($box->run(['client-keys', '../wg0'])['stderr'])->toContain('invalid link name');
+});
+
+it('stores the keys an older API left the app\'s way, for the peers the link has and that have none', function () {
+    $box = new HelperSandbox;
+    $box->withPubkeys();
+    $keys = new KeyManager;
+    [$peer, $disabled, $stored, $stranger] = [$keys->genkey(), $keys->genkey(), $keys->genkey(), $keys->genkey()];
+    $safe = fn (string $privkey) => KeyManager::pubkeyToSafe($keys->pubkey($privkey));
+    $conf = (new ConfigBuilder([], new LinuxDriver(new FakeShell, HelperSandbox::path())))->buildConfFile('10.0.42.1/24', $keys->genkey(), 62990, 'eth0', [
+        ['public_key' => $keys->pubkey($peer), 'allowed_ips' => '10.0.42.2/32'],
+        ['public_key' => $keys->pubkey($disabled), 'allowed_ips' => '10.0.42.3/32', 'enabled' => false],
+        ['public_key' => $keys->pubkey($stored), 'allowed_ips' => '10.0.42.4/32'],
+        ['public_key' => $keys->pubkey($keys->genkey()), 'allowed_ips' => '10.0.42.5/32'], // a key of its own: no file of it
+    ])."\n";
+    $box->writeConf('wg0', $conf);
+    $old = $box->writeClient('wg0', '10.0.42.2', "[Interface]\nPrivateKey = {$peer}\nAddress    = 10.0.42.2/32\n");
+    $box->writeClient('wg0', '10.0.42.3', "[Interface]\nPrivateKey = {$disabled}\n");
+    $box->writeClient('wg0', '10.0.42.4', "[Interface]\nPrivateKey = {$stored}\n");
+    $box->writeClient('wg0', '10.0.42.2-copy', "[Interface]\nPrivateKey = {$peer}\n");
+    $box->writeClient('wg0', '10.0.42.99', "[Interface]\nPrivateKey = {$stranger}\n"); // of a peer the link no longer has
+    $box->run(['client-write', 'wg0', $safe($stored)], $own = ConfigBuilder::clientKeyFile($stored)."\n");
+
+    $run = $box->run(['client-import', 'wg0']);
+
+    // By public key, for the link's peers only (the disabled one too); never one that is stored
+    expect($run['exit'])->toBe(0, $run['stderr'])
+        ->and($run['stdout'])->toBe("{$keys->pubkey($peer)}\n{$keys->pubkey($disabled)}\n")
+        ->and($run['stdout'].$run['stderr'])->not->toContain($peer)->not->toContain($disabled)
+        ->and(ConfigBuilder::clientPrivateKey($box->run(['client-read', 'wg0', $safe($peer)])['stdout']))->toBe($peer)
+        ->and(ConfigBuilder::clientPrivateKey($box->run(['client-read', 'wg0', $safe($disabled)])['stdout']))->toBe($disabled)
+        ->and(sprintf('%o', fileperms("{$box->confDir}/clients/wg0/{$safe($peer)}.conf") & 0777))->toBe('600')
+        ->and($box->run(['client-read', 'wg0', $safe($stored)])['stdout'])->toBe($own)
+        ->and($box->run(['client-read', 'wg0', $safe($stranger)])['exit'])->toBe(3)
+        // The old files stay as they were, and nothing else is left
+        ->and(file_get_contents($old))->toBe("[Interface]\nPrivateKey = {$peer}\nAddress    = 10.0.42.2/32\n")
+        ->and(glob("{$box->confDir}/clients/wg0/.wgla.*"))->toBe([])
+        // Asked again, there is nothing left to do
+        ->and($box->run(['client-import', 'wg0'])['stdout'])->toBe('')
+        ->and($box->run(['client-keys', 'wg0'])['stdout'])->toContain("stored {$keys->pubkey($peer)}\n", "legacy {$keys->pubkey($peer)}\n", "legacy {$keys->pubkey($stranger)}\n")
+        ->and($box->run(['client-import', 'wg9'])['exit'])->toBe(3, 'No config: no link to import for');
 });

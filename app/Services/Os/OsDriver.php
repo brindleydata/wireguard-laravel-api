@@ -116,10 +116,11 @@ interface OsDriver
     // ─── Link configs ───────────────────────────────────────────────
 
     /**
-     * The [Interface] section of a wg-quick config. With forward or NAT on, its PostUp/PostDown
-     * hooks call the helper's firewall commands (the only hooks the helper accepts).
+     * The [Interface] section of a wg-quick config. With forward or NAT on, or for a link with
+     * destinations ($scoped: they are firewall rules too), its PostUp/PostDown hooks call the
+     * helper's firewall commands (the only hooks the helper accepts).
      */
-    public function interfaceSection(string $address, string $privkey, int $port, string $ifout, bool $forward = false, bool $nat = false, ?int $mtu = null): string;
+    public function interfaceSection(string $address, string $privkey, int $port, string $ifout, bool $forward = false, bool $nat = false, ?int $mtu = null, bool $scoped = false): string;
 
     /**
      * Write a wg-quick .conf (0600). The helper rejects anything the app wouldn't generate.
@@ -139,6 +140,26 @@ interface OsDriver
     public function readConfig(string $name): ?string;
 
     public function configExists(string $name): bool;
+
+    /**
+     * Whether the helper would write this config (writeConfig()), without writing it. Throws
+     * CommandFailedException with its reason when it wouldn't.
+     */
+    public function checkConfig(string $name, string $content): void;
+
+    /**
+     * Put the app's version of a config in the place of one the app didn't write (an adoption).
+     * The helper checks it like any other, and keeps the one it replaces until
+     * confirmAdoptedConfig() or undoAdoptedConfig(): it can't be written back from here, as the
+     * helper never takes a config with hooks of its own from the app.
+     */
+    public function adoptConfig(string $name, string $content): void;
+
+    /** Put the config back that adoptConfig() replaced. */
+    public function undoAdoptedConfig(string $name): void;
+
+    /** The link runs with its adopted config: the one it replaced is no longer kept. Never throws. */
+    public function confirmAdoptedConfig(string $name): void;
 
     /**
      * Names of all links that have a .conf. Throws CommandFailedException when they can't be listed.
@@ -161,6 +182,23 @@ interface OsDriver
     public function deleteClientConfig(string $link, string $key): void;
 
     public function deleteClientConfigDir(string $link): void;
+
+    /**
+     * Whose private keys are in a link's client directory, by public key: `stored` the app's way
+     * (one file per peer, named by its public key), `legacy` in client configs an API before this
+     * one left there under other names.
+     *
+     * @return array{stored: list<string>, legacy: list<string>}
+     */
+    public function clientKeys(string $link): array;
+
+    /**
+     * Store the legacy keys of the link's peers the app's way, for those that have none stored.
+     * The old files stay.
+     *
+     * @return list<string> the public keys whose private key was stored
+     */
+    public function importLegacyClientKeys(string $link): array;
 
     // ─── Firewall ───────────────────────────────────────────────────
 

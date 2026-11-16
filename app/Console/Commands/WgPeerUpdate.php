@@ -43,7 +43,7 @@ class WgPeerUpdate extends WgCommand
             // None: the peer as it is, as PATCH {} answers
             $peer = $wg->updatePeer($link, $pubkey, $params);
         } catch (\Throwable $e) {
-            return $this->failed($e->getMessage());
+            return $this->failed($e);
         }
         if ($params === []) {
             return $this->respond($peer->toArray(), fn () => $this->warn('No options given: nothing to update.'));

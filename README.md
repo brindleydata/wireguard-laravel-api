@@ -63,15 +63,18 @@ After deploying another way (`git pull`, rsync), run `wgla install`. It notices 
 
 ## CLI
 
-`wgla <command>` runs `php artisan wg:<command>` as the user it belongs to: link and peer commands as the web user (like the API), `install` and `update` as the deploy user. `wgla` alone lists the commands, and `wgla help <command>` shows a command's options. The link and peer commands and `status` take `--json` and then print exactly what the API returns for the same thing; a failure is `{"error": "…"}` with a non-zero exit code. A public key can be given in either form, as `wg` prints it or as the API's URLs have it. In a checkout, `bin/wgla` also works without installing, e.g. on macOS for development. It then uses that project, the `php` on your `PATH`, the web user from `.env` (otherwise you), and the project's owner for `install` and `update`. Without an installed root helper, link and peer commands use the project's `bin/wgla-helper` through your own `sudo`, which asks for your password once.
+`wgla <command>` runs `php artisan wg:<command>` as the user it belongs to: link and peer commands as the web user (like the API), `install` and `update` as the deploy user. `wgla` alone lists the commands, and `wgla help <command>` shows a command's options. The link and peer commands and `status` take `--json` and then print exactly what the API returns for the same thing; a failure is `{"error": "…", "code": "…"}` (the API's [error codes](#errors)) with a non-zero exit code. A public key can be given in either form, as `wg` prints it or as the API's URLs have it. In a checkout, `bin/wgla` also works without installing, e.g. on macOS for development. It then uses that project, the `php` on your `PATH`, the web user from `.env` (otherwise you), and the project's owner for `install` and `update`. Without an installed root helper, link and peer commands use the project's `bin/wgla-helper` through your own `sudo`, which asks for your password once.
 
 ```text
 wgla status                              version, system, interfaces, root helper (fails when the helper isn't usable)
 wgla links                               link names
 wgla link wg0                            a link and its peers
 wgla link:create wg0 10.0.0.1/24 --address6=auto --forward=true --nat=true --endpoint=vpn.example.com
+wgla link:create pbx 10.0.42.1/24 --forward=true --nat=true --destinations=10.20.0.0/16,192.0.2.50    its peers get nowhere else
 wgla link:update wg0 --port=51821 --up=false     (--address6=none: IPv4 only; --dns="": the default again)
 wgla link:update wg0 --address=10.1.0.1/24 --move-peers    another subnet, peers keep their host number
+wgla link:adopt wg0 --dry-run            what taking a config written by hand, or by an older API, under management would keep and drop
+wgla link:adopt wg0 --forward=true --nat=true --destinations=10.20.0.0/16    ... and do it (the options of link:update, but address, port and up)
 wgla link:repair wg0                     put its forward/NAT rules back, if another tool removed them
 wgla link:rekey wg0                      new keys for the link itself; every client needs its new config
 wgla link:delete wg0
@@ -88,18 +91,19 @@ wgla restore <file|->
 
 ## API
 
-Every route except `GET /health` needs the `api-key` header. `{pubkey}` is the peer's public key in URL-safe base64 without padding (`+/` → `-_`, no `=`).
+Every route except `GET /health` needs the `api-key` header. `GET /health` says which app answers, so a client can check that a URL is one of these servers before it sends its key there. `{pubkey}` is the peer's public key in URL-safe base64 without padding (`+/` → `-_`, no `=`).
 
 | Route | |
 |-------|---|
-| `GET /health` | `200` or `503`, nothing else. Public |
+| `GET /health` | `200` `{"status": "ok", "app": "wgla"}`, or `503` with `"status": "unavailable"`. Nothing else. Public |
 | `GET /status` | Version, system stats, root helper state |
 | `GET /ip` | The server's public IPv4 and IPv6 |
 | `GET /interfaces` | The host's network interfaces, and the `default` one a link goes out through (for `ifout`) |
 | `GET /links` | Link names |
-| `POST /link` | `name`, `ip` (CIDR), and optionally `address6`, `port`, `ifout`, `mtu`, `dns`, `keepalive`, `allowed_ips`, `forward`, `nat`, `inbound`, `allow_default_route`, `allow_own_networks`, `endpoint`, `private_key`, `up` |
-| `GET /link/{name}` | The link and its peers. `endpoint` is where its clients connect, `client` has the `dns`, `keepalive` and `allowed_ips` of its own (`null`: the default), and `firewall` is `ok` or `missing` for a running link with forward or NAT |
-| `PATCH /link/{name}` | Any of the above but `private_key`, with `address` instead of `ip`, and `move_peers` to move the peers along to another subnet. `null` removes `address6`, takes the link's own `mtu`, `dns`, `keepalive` or `allowed_ips` out, back to the default, and detects the `endpoint` anew |
+| `POST /link` | `name`, `ip` (CIDR), and optionally `address6`, `port`, `ifout`, `mtu`, `dns`, `keepalive`, `allowed_ips`, `forward`, `nat`, `inbound`, `destinations`, `allow_default_route`, `allow_own_networks`, `endpoint`, `private_key`, `up` |
+| `GET /link/{name}` | The link and its peers. `endpoint` is where its clients connect, `client` has the `dns`, `keepalive` and `allowed_ips` of its own (`null`: the default), `destinations` are the only networks it forwards and NATs to (`null`: anywhere), `firewall` is `ok` or `missing` for a running link with forward, NAT or destinations, and `managed` is `false` for one the app shows but doesn't change (a [config written by hand](#adopting-a-config), an interface something else started) |
+| `PATCH /link/{name}` | Any of the above but `private_key`, with `address` instead of `ip`, and `move_peers` to move the peers along to another subnet. `null` removes `address6` and the `destinations` (anywhere again), takes the link's own `mtu`, `dns`, `keepalive` or `allowed_ips` out, back to the default, and detects the `endpoint` anew |
+| `POST /link/{name}/adopt` | Takes a [config written by hand, or by an older API](#adopting-a-config), under management. `ifout`, `forward`, `nat`, `inbound`, `destinations`, `allowed_ips`, `dns`, `keepalive`, `mtu`, `endpoint`, `allow_default_route`, `allow_own_networks`, and `dry_run`. Returns the link as `GET /link/{name}` does, with what was done under `adoption` |
 | `POST /link/{name}/repair` | Puts a running link's forward/NAT rules back in place |
 | `POST /link/{name}/rekey` | A new key pair for the link, applied live. Every client config changes |
 | `DELETE /link/{name}` | |
@@ -112,7 +116,27 @@ Every route except `GET /health` needs the `api-key` header. `{pubkey}` is the p
 | `GET /link/{link}/peer/{pubkey}/config` | The client config, as it is now |
 | `GET /link/{link}/peer/{pubkey}/qr` | The client config as a QR code (`image/svg+xml`), for the WireGuard apps. Not for a peer with keys of its own (`422`): its config has no private key |
 
-Errors are `{"error": "…"}`: `403` (API key), `404`, `409` (port, subnet or name taken), `422` (invalid input, or a field the route doesn't know; with `errors` per field when a field has the wrong type), `429` (10 wrong API keys from an address in a minute: the rest of that minute), `500` (a system command failed; the message says why).
+### Errors
+
+Every error is `{"error": "…", "code": "…"}`. The message is for people and may be reworded; the code is what a client goes by.
+
+| Status | `code` | |
+|--------|--------|---|
+| `403` | `unauthorized` | No API key, or a wrong one |
+| `404` | `link_not_found` | No link of that name |
+| `404` | `peer_not_found` | The link is there, the peer is not |
+| `404` | `route_not_found` | No such route. Nothing else answers `404`: a link or peer that isn't there always has its own code |
+| `405` | `method_not_allowed` | |
+| `409` | `conflict` | A port, subnet, name or route that is taken, or what the server's route policy doesn't allow |
+| `409` | `unmanaged_config` | The link's config has what the app doesn't write, so it isn't changed. [Adopt it](#adopting-a-config) |
+| `409` | `unmanaged_interface` | An interface something else started: shown, never changed |
+| `409` | `already_managed` | `adopt` for a link the app manages already: nothing to do, change it with `PATCH` |
+| `409` | `not_adoptable` | `adopt` for a config with something that can't be carried over. The message names it |
+| `422` | `invalid_input` | An invalid value, a field the route doesn't know (with `errors` per field when a field has the wrong type), or a malformed link name or public key in a change |
+| `429` | `rate_limited` | 10 wrong API keys from an address in a minute: the rest of that minute |
+| `500` | `system_error` | The host failed to do what was asked, or couldn't be asked (the message says why). Never a link that "isn't there" |
+
+A read of a link name or public key that can't be one (`GET /link/no.such.name`) is a plain `404` with `link_not_found` or `peer_not_found`. Anything else the framework refuses is `request_refused`.
 
 ### Links and peers
 
@@ -125,13 +149,45 @@ Errors are `{"error": "…"}`: `403` (API key), `404`, `409` (port, subnet or na
 - **New keys.** `rekey` gives a peer a new key pair and preshared key, in its place and with everything else it has. Its public key changes, and with it its URL. A link's `rekey` replaces its own key pair, live: its peers keep theirs, but every client needs its new config.
 - **Keys of their own.** A peer can come with its public key (and preshared key), for a device that made its key pair itself: its private key never reaches the server. Its client config then has no `PrivateKey` line, and there is no QR code of it. A link can be created with its own `private_key`, to move it here.
 - **No clashes.** Links can't share a listen port, overlap subnets or prefixes, or take the name of an existing interface. Without `port`, a free random one is picked.
-- **Rules that went missing.** A link's forward/NAT rules are installed when it starts. If another tool removes them (a ruleset reload that flushes everything, a firewall restart), the link reports `firewall: missing`, `repair` puts them back, and on Linux a timer does that by itself within a minute.
+- **Rules that went missing.** A link's forward/NAT rules, and those for its destinations, are installed when it starts. If another tool removes them (a ruleset reload that flushes everything, a firewall restart), the link reports `firewall: missing`, `repair` puts them back, and on Linux a timer does that by itself within a minute. Rules for other destinations than the link has now count as missing too.
 - **Forwarding and NAT** are per link and cover both families. Into the tunnel go only replies to connections peers started, unless the link has `inbound` (site-to-site, where the far side starts connections too). On Linux each link has an nftables table, `inet wg_<link>`, and NAT only masquerades the link's own subnet and prefix. On macOS each link has a pf anchor, `wg/<link>`. Where Docker or ufw drop forwarded traffic, the helper adds tagged accepts to iptables and ip6tables. firewalld isn't handled.
+- **Destinations.** By default a link forwards its peers' traffic anywhere, and NAT masquerades it to anywhere. Its peers hold their own keys, and can route whatever they like into the tunnel by changing `AllowedIPs` on their side: so a link that is only for some networks (a few PBXs, an office) should say so. `destinations` is a list of networks of either family (`"10.20.0.0/16, 2001:db8:a::/48"`, or a JSON array; a bare address is one host), and then traffic out of the tunnel is forwarded only to those, everything else from its peers is dropped, and NAT only applies to those. A family without a destination gets nowhere. This holds whether or not the link has `forward` or `nat`, and also between its own peers and for networks behind them: list the link's subnet or those networks to allow that. What a peer sends to the server itself, and replies to connections that came in for a peer, are not affected (on macOS those replies need `forward`). `null` is anywhere again; an empty list and `/0` are refused, because they could be taken for either. The rules are part of what `firewall` reports and what `repair` and the timer put back.
 - **Client configs** are not stored: only each peer's private key is. A config is built when it is asked for, so it always has the link's current endpoint, port, addresses and settings. Three settings come from the nearest place that has them: the peer's own, else its link's, else the fixed default (DNS `8.8.8.8`, keepalive `25`, all traffic through the tunnel: `0.0.0.0/0`, plus `::/0` on a dual-stack link). A link's and a peer's own are kept in the link config, next to the peer's name.
 - **A change the link doesn't start with is undone.** A new port, address or MTU, or networks behind a peer, restart a running link. If it then doesn't come up (the port is taken, wg-quick can't add a route), the previous config goes back, the link runs again as it did, and the request fails with the reason.
-- **Configs written by hand.** Any config in the WireGuard directory is listed and shown, and can be deleted. One that only uses what the app writes too is managed like the app's own. One with more (`Table`, `DNS`, hooks of its own, a keepalive other than 25, comments) is never changed, because the app regenerates configs whole and would drop those: changes answer `409` and name what is in the way.
+- **Configs written by hand.** Any config in the WireGuard directory is listed and shown, and can be deleted. One that only uses what the app writes too is managed like the app's own. One with more (`Table`, `DNS`, hooks of its own, a keepalive other than 25, comments) is never changed, because the app regenerates configs whole and would drop those: it is shown with `managed: false`, and changes answer `409` (`unmanaged_config`) and name what is in the way. Such a config can be [adopted](#adopting-a-config).
 - **Interfaces something else started.** A WireGuard interface that runs without a config in the WireGuard directory (started by `wg-quick` from another path, `ip link`, another tool) is listed and shown as well. Nothing about it is changed, stopped or deleted here (`409`): a peer added to it would be gone at its next start.
 - The server's private key is never returned, and listings don't show peers' preshared keys: those are in each peer's client config only.
+
+### Adopting a config
+
+`POST /link/{name}/adopt` (`wgla link:adopt <name>`) takes a config the app didn't write under its management, in place: one written by hand, or by the API before this one, whose configs have hooks that set up iptables and peers with a preshared key and a `/32` each.
+
+- **Kept exactly:** the link's private key (so its public key), listen port and addresses, an MTU, and every peer with its public key, preshared key and allowed IPs (its tunnel address and the networks behind it). No client has to change anything.
+- **Dropped:** what the app does itself. `PreUp`, `PostUp`, `PreDown` and `PostDown` hooks, comments, `SaveConfig`, and settings that only spell out wg-quick's default (`Table = auto`). The hooks are not read for what they did: the adopted link gets the `forward`, `nat` and `destinations` the request gives it, and none if it gives none (the answer warns of that). Old hooks that masqueraded only what went to some networks are what `destinations` is for.
+- **Refused** (`409`, `not_adoptable`, naming what is in the way, never quoting it): what the app has no place for. `Table`, `DNS`, `FwMark`, a second address, a keepalive the server sends a peer, a peer's `Endpoint` that is no `host:port`, a setting wg-quick doesn't know. And a peer the app couldn't address: one without a `/32` of its own in the link's subnet, or, on a dual-stack link, without the IPv6 address its IPv4 one gives it. A peer's `Endpoint` with a port becomes its `remote`. Put such a line right by hand first.
+- **Settings:** those of `PATCH /link/{name}` but `address`, `address6`, `port`, `up` and `move_peers`, which an adoption doesn't change. Without `endpoint` it is detected as for a new link, without `ifout` it is the default route's.
+- **Peers' private keys** are not in a link config. If the older API left a client config per peer in the link's client directory (`clients/<link>/<address>.conf`), their keys are taken over by public key, so those peers have a complete client config and QR code. Every other peer is one with a [key of its own](#links-and-peers): its config comes without `PrivateKey`. `adoption.keys` lists the public keys of each kind: `stored`, `imported`, `own`. The old files are left as they are.
+- **A running link restarts.** It stops with its own config still in place, so its own `PostDown` takes down what its `PostUp` set up, then starts with the new one and the app's rules. If it doesn't come up, the previous config goes back and the link runs again as it did, and the request fails with the reason (`500`). A stopped link stays stopped. One that still runs after its `wg-quick@<name>` unit was stopped was started another way, and isn't adopted (`409`).
+- **The config is what is adopted.** Where the running interface differs from it (a peer added or taken off with `wg set` and never saved), the restart makes it the config again, as any restart would, and `adoption.warnings` names those peers: look at a dry run first. The exception is a config with `SaveConfig = true`, which wg-quick writes from the interface when the link stops: for such a running link the interface has the peers that are adopted, and where they were last seen (`Endpoint`) is dropped.
+- **`dry_run`** checks everything the real call would (that `ifout` exists, the `endpoint`, `allowed_ips` and `destinations`, port and subnet clashes with other links, what its peers route, that the root helper takes the new config) and answers the same way, with the link as it would be, but changes nothing.
+- **Asked again** for a link that is managed, with or without `dry_run`, it answers `409` with `already_managed`, and doesn't apply the settings: use `PATCH`.
+
+```json
+{
+  "name": "pbx", "managed": true, "up": true, "listen_port": 62990, "forward": true, "nat": true, "destinations": "10.20.0.0/16", "...": "as GET /link/{name}",
+  "adoption": {
+    "dry_run": false,
+    "restarts": true,
+    "kept": {"public_key": "…", "listen_port": 62990, "address": "10.0.42.1/24", "address6": null, "peers": 100},
+    "dropped": {"PostUp": 1, "PostDown": 1},
+    "applied": {"ifout": "eth0", "forward": true, "nat": true, "inbound": false, "destinations": "10.20.0.0/16", "endpoint": "vpn.example.com", "mtu": null, "dns": null, "keepalive": null, "allowed_ips": null, "allow_default_route": false, "allow_own_networks": false},
+    "keys": {"stored": [], "imported": ["<public key>", "…"], "own": ["<public key>", "…"]},
+    "warnings": []
+  }
+}
+```
+
+`dropped` counts lines by key and never quotes them, as a line of a config may hold a secret.
 
 ## Backup and restore
 
@@ -146,6 +202,7 @@ A backup holds every link with its keys and its peers' private keys, encrypted w
 
 - Everything that needs root goes through `bin/wgla-helper`, installed root-owned. It's all the sudo rule allows: `www-data ALL=(root) NOPASSWD: /usr/local/sbin/wgla-helper`. The rule has no wildcards, so `sudo-rs` (Ubuntu 25.10+) takes it too.
 - The helper takes a fixed set of commands and validates every argument. It only writes configs the app would generate, the only hooks it allows are its own firewall commands, and those only set up rules for the link's own interface.
+- That holds for an adoption too. The helper replaces a config with the app's version of it only after checking that version like any other, and keeps the old one itself until the link runs: what goes back when it doesn't is what was there, never something the app hands in. Of the client configs an older API kept it prints public keys only, and it stores the private keys of the link's peers the way the app stores those it makes itself, which is where the API reads them from: that is what an adoption is asked to do.
 - The app refuses to use a helper that differs from the bundled one, and `wg:install` reinstalls it.
 - `wgla` is installed root-owned, with the app's path and users written into it. It only switches to the web user or the deploy user (with `sudo`) and runs `artisan`.
 - Updates are never unattended, because they install code that runs as root.

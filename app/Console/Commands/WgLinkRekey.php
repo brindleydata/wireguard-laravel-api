@@ -15,7 +15,7 @@ class WgLinkRekey extends WgCommand
         try {
             $link = $wg->rekeyLink($this->argument('link'));
         } catch (\Throwable $e) {
-            return $this->failed($e->getMessage());
+            return $this->failed($e);
         }
 
         return $this->respond($link->toArray(), function () use ($link) {

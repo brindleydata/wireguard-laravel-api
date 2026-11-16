@@ -104,7 +104,7 @@ abstract class BaseDriver implements OsDriver
 
     // ─── Link configs ───────────────────────────────────────────────
 
-    public function interfaceSection(string $address, string $privkey, int $port, string $ifout, bool $forward = false, bool $nat = false, ?int $mtu = null): string
+    public function interfaceSection(string $address, string $privkey, int $port, string $ifout, bool $forward = false, bool $nat = false, ?int $mtu = null, bool $scoped = false): string
     {
         $lines = [
             '[Interface]',
@@ -116,7 +116,7 @@ abstract class BaseDriver implements OsDriver
             $lines[] = "MTU = {$mtu}";
         }
 
-        if ($forward || $nat) {
+        if ($forward || $nat || $scoped) {
             [$link, $iface] = $this->hookPlaceholders();
             $lines[] = "PostUp = {$this->helperPath} firewall-up {$link} {$iface}";
             $lines[] = "PostDown = {$this->helperPath} firewall-down {$link}";
@@ -143,6 +143,28 @@ abstract class BaseDriver implements OsDriver
     public function configExists(string $name): bool
     {
         return $this->readConfig($name) !== null;
+    }
+
+    public function checkConfig(string $name, string $content): void
+    {
+        $this->helper('conf-check :name', ['name' => $name], $content."\n");
+    }
+
+    public function adoptConfig(string $name, string $content): void
+    {
+        $this->helper('conf-adopt :name', ['name' => $name], $content."\n");
+    }
+
+    public function undoAdoptedConfig(string $name): void
+    {
+        $this->helper('conf-adopt-undo :name', ['name' => $name]);
+    }
+
+    public function confirmAdoptedConfig(string $name): void
+    {
+        // Tidying up, as clearFirewall() does: the link runs with its new config either way
+        $this->assertHelperCurrent();
+        $this->shell->tryRun('sudo -n :helper conf-adopt-done :name', ['helper' => $this->helperPath, 'name' => $name]);
     }
 
     public function listConfigNames(): array
@@ -172,6 +194,27 @@ abstract class BaseDriver implements OsDriver
     public function deleteClientConfigDir(string $link): void
     {
         $this->helper('client-delete-all :link', ['link' => $link]);
+    }
+
+    public function clientKeys(string $link): array
+    {
+        // "stored <public key>" or "legacy <public key>" per line
+        $keys = ['stored' => [], 'legacy' => []];
+        foreach (explode("\n", $this->helper('client-keys :link', ['link' => $link])) as $line) {
+            [$kind, $pubkey] = array_pad(explode(' ', trim($line), 2), 2, '');
+            if (isset($keys[$kind]) && $pubkey !== '') {
+                $keys[$kind][] = $pubkey;
+            }
+        }
+
+        return array_map(fn (array $pubkeys) => array_values(array_unique($pubkeys)), $keys);
+    }
+
+    public function importLegacyClientKeys(string $link): array
+    {
+        $output = $this->helper('client-import :link', ['link' => $link]);
+
+        return $output === '' ? [] : array_values(array_unique(explode("\n", $output)));
     }
 
     // ─── Firewall ───────────────────────────────────────────────────

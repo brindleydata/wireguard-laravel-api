@@ -19,12 +19,9 @@ class WgLinkPeers extends WgCommand
         $name = $this->argument('link');
 
         try {
-            $link = $wg->getLink($name);
+            $link = $wg->linkOrFail($name);
         } catch (\Throwable $e) {
-            return $this->failed($e->getMessage());
-        }
-        if ($link === null) {
-            return $this->failed("Link does not exist: {$name}");
+            return $this->failed($e);
         }
 
         return $this->respond(array_map(fn (PeerInfo $peer) => $peer->toArray(), $link->peers), function () use ($link) {

@@ -23,7 +23,8 @@ class WgLinkUpdate extends WgCommand
         {--inbound= : With forward: let connections that start outside reach peers, not only replies (true/false)}
         {--allow-default-route= : Let peers route a default route, where the server allows it (true/false)}
         {--allow-own-networks= : Let peers route networks holding this server\'s own addresses, where the server allows it (true/false)}
-        {--endpoint= : Where its clients connect: a host, or host:port ("" detects it anew); every client needs its new config}';
+        {--endpoint= : Where its clients connect: a host, or host:port ("" detects it anew); every client needs its new config}
+        {--destinations= : The only networks traffic out of its tunnel is forwarded and NATed to, comma-separated ("": anywhere again)}';
 
     protected $description = 'Update a WireGuard link';
 
@@ -35,6 +36,7 @@ class WgLinkUpdate extends WgCommand
             $params = array_filter([
                 'dns' => $this->option('dns'),
                 'allowed_ips' => $this->option('allowed-ips'),
+                'destinations' => $this->option('destinations'),
                 'ifout' => $this->option('ifout'),
                 'port' => $this->number('port'),
                 'address' => $this->option('address'),
@@ -60,7 +62,7 @@ class WgLinkUpdate extends WgCommand
             // None: the link as it is, as PATCH {} answers
             $link = $wg->updateLink($name, $params);
         } catch (\Throwable $e) {
-            return $this->failed($e->getMessage());
+            return $this->failed($e);
         }
         if ($params === []) {
             return $this->respond($link->toArray(), fn () => $this->warn('No options given: nothing to update.'));
@@ -77,6 +79,7 @@ class WgLinkUpdate extends WgCommand
             $this->line('Forward: '.($link->forward ? 'enabled' : 'disabled'));
             $this->line('NAT: '.($link->nat ? 'enabled' : 'disabled'));
             $this->line('Inbound: '.($link->inbound ? 'connections from outside reach peers' : 'replies only'));
+            $this->line('Destinations: '.($link->destinations ?? 'anywhere'));
             $this->line('Peers may route: '.$this->routesAllowed($link));
             $this->line('Up: '.($link->up ? 'yes' : 'no'));
         });

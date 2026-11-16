@@ -22,7 +22,7 @@ class WgPeerRekey extends WgCommand
         try {
             $peer = $wg->rekeyPeer($link, $pubkey);
         } catch (\Throwable $e) {
-            return $this->failed($e->getMessage());
+            return $this->failed($e);
         }
 
         return $this->respond($peer->toArray(), function () use ($peer, $pubkey) {

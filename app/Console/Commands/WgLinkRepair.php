@@ -16,7 +16,7 @@ class WgLinkRepair extends WgCommand
         try {
             $link = $wg->repairLink($this->argument('link'));
         } catch (\Throwable $e) {
-            return $this->failed($e->getMessage());
+            return $this->failed($e);
         }
 
         $this->respond($link->toArray(), fn () => $this->info(match ($link->firewall) {

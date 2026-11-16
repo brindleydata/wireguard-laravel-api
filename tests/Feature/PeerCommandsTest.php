@@ -181,7 +181,7 @@ it('takes keys from files, never as options, and gives a link new keys', functio
         $peer = cliJson('wg:peer:create', ['link' => 'wg0', '--public-key' => $keys->pubkey($keys->genkey()), '--preshared-key-file' => $file, '--keepalive' => '0', '--enabled' => 'false']);
         expect($peer)->toMatchArray(['enabled' => false, 'client' => ['dns' => null, 'keepalive' => 0, 'allowed_ips' => null]])->not->toHaveKey('private_key')
             ->and($peer['client_config'])->toContain("PresharedKey = {$psk}\n")->not->toContain('PrivateKey');
-        expect(cliJson('wg:peer:create', ['link' => 'wg0', '--preshared-key-file' => '/nonexistent']))->toBe(['error' => "Can't read /nonexistent (--preshared-key-file)."]);
+        expect(cliJson('wg:peer:create', ['link' => 'wg0', '--preshared-key-file' => '/nonexistent']))->toBe(['error' => "Can't read /nonexistent (--preshared-key-file).", 'code' => 'invalid_input']);
 
         // Its config ends the output, the note that the device adds its key comes before it: from
         // [Interface] on, the output is a config (`wgla peer … | sed -n '/^\[Interface\]/,$p'`)
@@ -291,17 +291,21 @@ it('answers an update without options like PATCH {}: as it is, nothing written',
     $this->patchJson('/link/wg9', [], $auth)->assertNotFound();
 });
 
-it('fails with --json as {"error": …} and a non-zero exit code', function (string $command, array $arguments, string $error) {
+it('fails with --json as {"error": …, "code": …}, like the API, and a non-zero exit code', function (string $command, array $arguments, string $error, string $kind) {
     $code = Artisan::call($command, [...$arguments, '--json' => true]);
 
     expect($code)->toBe(1)
-        ->and(json_decode(Artisan::output(), true))->toBe(['error' => $error]);
+        ->and(json_decode(Artisan::output(), true))->toBe(['error' => $error, 'code' => $kind]);
 })->with([
-    ['wg:link', ['link' => 'nope'], 'Link does not exist: nope'],
-    ['wg:link:update', ['link' => 'wg0', '--up' => 'treu'], '--up must be true or false, not "treu".'],
-    ['wg:link:create', ['link' => 'wg0', 'ip' => '10.9.0.1/24'], 'Link already exists: wg0'],
-    ['wg:peer', ['link' => 'wg0', 'pubkey' => 'not-a-key'], 'Peer not-a-key not found on wg0.'],
-    ['wg:peer:create', ['link' => 'wg0', '--ip' => '10.5.0.2'], "Peer IP 10.5.0.2 is not within the interface's network range (10.0.0.1/24)."],
+    ['wg:link', ['link' => 'nope'], 'Link does not exist: nope', 'link_not_found'],
+    ['wg:link:peers', ['link' => 'nope'], 'Link does not exist: nope', 'link_not_found'],
+    ['wg:link:update', ['link' => 'wg0', '--up' => 'treu'], '--up must be true or false, not "treu".', 'invalid_input'],
+    ['wg:link:create', ['link' => 'wg0', 'ip' => '10.9.0.1/24'], 'Link already exists: wg0', 'conflict'],
+    ['wg:peer', ['link' => 'wg0', 'pubkey' => 'not-a-key'], 'Peer not found: not-a-key', 'peer_not_found'],
+    ['wg:peer', ['link' => 'nope', 'pubkey' => 'not-a-key'], 'Link does not exist: nope', 'link_not_found'],
+    ['wg:peer:delete', ['link' => 'wg0', 'pubkey' => 'not-a-key'], 'Invalid public key: a WireGuard key is 32 bytes in base64, as wg genkey and wg pubkey write it.', 'invalid_input'],
+    ['wg:peer:create', ['link' => 'wg0', '--ip' => '10.5.0.2'], "Peer IP 10.5.0.2 is not within the interface's network range (10.0.0.1/24).", 'invalid_input'],
+    ['wg:link:adopt', ['link' => 'wg0'], 'Link wg0 is managed already: there is nothing to adopt. Change it like any other link (PATCH /link/wg0, wgla link:update wg0).', 'already_managed'],
 ]);
 
 it('does not say deleted for what is still there', function () {

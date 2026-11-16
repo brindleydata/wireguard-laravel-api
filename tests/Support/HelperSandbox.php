@@ -119,6 +119,29 @@ final class HelperSandbox
         file_put_contents("{$this->dir}/rc/{$name}", (string) $exit);
     }
 
+    /**
+     * Make `wg pubkey` answer as wg does: the public key of the private key on its stdin (the
+     * stub would print nothing). Nothing else of `wg` is stubbed then.
+     */
+    public function withPubkeys(): void
+    {
+        $php = escapeshellarg(PHP_BINARY);
+        $code = escapeshellarg('echo base64_encode(sodium_crypto_scalarmult_base(base64_decode(trim(stream_get_contents(STDIN)))))."\n";');
+        file_put_contents("{$this->dir}/stubs/wg", "#!/bin/bash\nif [ \"\$1\" = pubkey ]; then exec {$php} -r {$code}; fi\necho \"wg \$*: not stubbed\" >&2\nexit 1\n");
+        chmod("{$this->dir}/stubs/wg", 0755);
+    }
+
+    /** A file in a link's client directory, as something other than the helper left it. */
+    public function writeClient(string $link, string $name, string $content): string
+    {
+        if (! is_dir("{$this->confDir}/clients/{$link}")) {
+            mkdir("{$this->confDir}/clients/{$link}", 0700, true);
+        }
+        file_put_contents($file = "{$this->confDir}/clients/{$link}/{$name}.conf", $content);
+
+        return $file;
+    }
+
     /** Take a command off the PATH, as if it weren't installed. */
     public function uninstall(string $name): void
     {

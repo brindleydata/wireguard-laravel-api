@@ -32,7 +32,7 @@ class WgPeerCreate extends WgCommand
                 $this->option('public-key'), $this->secretFrom('preshared-key-file'), $this->option('dns'), $this->number('keepalive'), $this->option('allowed-ips'),
                 $this->flag('enabled') ?? true);
         } catch (\Throwable $e) {
-            return $this->failed($e->getMessage());
+            return $this->failed($e);
         }
 
         return $this->respond($peer->toArray(), function () use ($peer) {

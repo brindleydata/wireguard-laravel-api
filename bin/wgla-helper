@@ -18,7 +18,7 @@ IFS=$' \t\n'
 # mean the same everywhere (under glibc's C.UTF-8, [[:cntrl:]] also matches U+2028 in a name)
 export LC_ALL=C
 
-VERSION=9
+VERSION=10
 SELF=$0
 MAX_SIZE=1048576
 
@@ -101,6 +101,20 @@ valid_link_address() {
         valid_cidr4 "$1"
     fi
 }
+# A link's destinations (where traffic out of its tunnel may go): networks of either family, each
+# with its mask, as the app writes them. Not everything (/0): that is a link without destinations.
+# They end up in firewall rules, so nothing but addresses passes.
+valid_destinations() {
+    local entry re='/[1-9][0-9]{0,2}$'
+    [[ $1 =~ $re_ips ]] || return 1
+    for entry in $(echo "$1" | tr ',' ' '); do
+        [[ $entry =~ $re ]] || return 1
+        case "$entry" in
+            *:*) valid_cidr6 "$entry" && ip6_expand "${entry%/*}" || return 1 ;;
+            *) valid_cidr4 "$entry" || return 1 ;;
+        esac
+    done
+}
 valid_port() { [[ $1 =~ $re_number ]] && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]; }
 valid_keepalive() { [[ $1 =~ $re_number ]] && [ "$1" -le 65535 ]; }
 valid_mtu() { [[ $1 =~ $re_number ]] && [ "$1" -ge 576 ] && [ "$1" -le 65535 ]; }
@@ -149,6 +163,7 @@ validate_meta() {
         dns) [[ $value =~ $re_dns ]] ;;
         keepalive) valid_keepalive "$value" ;;
         allowed_ips) [[ $value =~ $re_ips ]] ;;
+        destinations) valid_destinations "$value" ;;
         *) false ;;
     esac || die "metadata not allowed: $line"
 }
@@ -334,14 +349,18 @@ ip4_int() { local IFS=.; set -- $1; echo $((($1 << 24) | ($2 << 16) | ($3 << 8) 
 
 # An IPv6 address as 32 hex digits, or a failure for anything else. An IPv4 address at its end
 # (::ffff:192.0.2.1, as inet_ntop writes it) is two groups.
-ip6_hex() {
-    local addr=$1 head tail group out='' n=0 v4
+ip6_hex() { ip6_expand "$1" && echo "$REPLY"; }
+
+# The same, into REPLY: without a subshell, for where it runs once per rule (canon_net)
+ip6_expand() {
+    local addr=$1 head tail group hex out='' n=0 v4
     case "$addr" in
         *.*)
             v4=${addr##*:}
             valid_cidr4 "$v4/32" || return 1
-            v4=$(ip4_int "$v4")
-            addr="${addr%:*}:$(printf '%x:%x' $((v4 >> 16)) $((v4 & 65535)))"
+            v4=$(((BASH_REMATCH[1] << 24) | (BASH_REMATCH[2] << 16) | (BASH_REMATCH[3] << 8) | BASH_REMATCH[4]))
+            printf -v hex '%x:%x' $((v4 >> 16)) $((v4 & 65535))
+            addr="${addr%:*}:$hex"
             ;;
     esac
     case "$addr" in
@@ -349,15 +368,18 @@ ip6_hex() {
         *::*) head=${addr%%::*} tail=${addr#*::} ;;
         *) head=$addr tail='' ;;
     esac
-    for group in $(echo "$head $tail" | tr ':' ' '); do
+    # shellcheck disable=SC2086 # split on the colons on purpose
+    for group in ${head//:/ } ${tail//:/ }; do
         [[ $group =~ ^[0-9A-Fa-f]{1,4}$ ]] || return 1
         n=$((n + 1))
     done
     case "$addr" in *::*) [ "$n" -le 7 ] || return 1 ;; *) [ "$n" -eq 8 ] || return 1 ;; esac
-    for group in $(echo "$head" | tr ':' ' '); do out=$out$(printf '%04x' "0x$group"); done
+    # shellcheck disable=SC2086
+    for group in ${head//:/ }; do printf -v hex '%04x' "0x$group"; out=$out$hex; done
     while [ "$n" -lt 8 ]; do out=${out}0000; n=$((n + 1)); done
-    for group in $(echo "$tail" | tr ':' ' '); do out=$out$(printf '%04x' "0x$group"); done
-    echo "$out"
+    # shellcheck disable=SC2086
+    for group in ${tail//:/ }; do printf -v hex '%04x' "0x$group"; out=$out$hex; done
+    REPLY=$out
 }
 
 # Whether two 32-hex-digit addresses agree in their first $3 bits
@@ -367,6 +389,36 @@ hex_prefix_equal() {
     [ "$rest" -gt 0 ] || return 0
     mask=$(((0xF << (4 - rest)) & 0xF))
     [ $((16#${1:$nibbles:1} & mask)) -eq $((16#${2:$nibbles:1} & mask)) ]
+}
+
+# A network in one spelling, into REPLY: IPv4 as its network address and mask, IPv6 as 32 hex
+# digits with the host bits cleared and its mask. A bare address is a host (/32, /128). nft and
+# pfctl print a network their own way (host bits masked, a host without its mask, IPv6 shortened):
+# so what they list is compared with what a config asks for as networks, not as text.
+canon_net() {
+    local net=${1%/*} bits='' nibbles rest hex digit
+    case "$1" in */*) bits=${1##*/} ;; esac
+    case "$net" in
+        *:*)
+            bits=${bits:-128}
+            [[ $bits =~ ^(0|[1-9][0-9]{0,2})$ ]] && [ "$bits" -le 128 ] || return 1
+            ip6_expand "$net" || return 1
+            nibbles=$((bits / 4)) rest=$((bits % 4)) hex=${REPLY:0:$((bits / 4))}
+            if [ "$rest" -gt 0 ]; then
+                printf -v digit '%x' $((16#${REPLY:$nibbles:1} & (0xF << (4 - rest)) & 0xF))
+                hex=$hex$digit
+            fi
+            while [ "${#hex}" -lt 32 ]; do hex=${hex}0; done
+            REPLY="$hex/$bits"
+            ;;
+        *)
+            valid_cidr4 "$net/${bits:-32}" || return 1
+            bits=${BASH_REMATCH[5]}
+            net=$(((BASH_REMATCH[1] << 24) | (BASH_REMATCH[2] << 16) | (BASH_REMATCH[3] << 8) | BASH_REMATCH[4]))
+            net=$((net & ((0xFFFFFFFF << (32 - bits)) & 0xFFFFFFFF)))
+            REPLY="$(((net >> 24) & 255)).$(((net >> 16) & 255)).$(((net >> 8) & 255)).$((net & 255))/$bits"
+            ;;
+    esac
 }
 
 # ─── Files ───────────────────────────────────────────────────────────────────
@@ -390,6 +442,60 @@ install_input() {
 
 conf_file() { echo "$CONF_DIR/$1.conf"; }
 client_file() { echo "$CONF_DIR/clients/$1/$2.conf"; }
+# The config an adoption replaced, kept until its outcome is known. Hidden, and no .conf: neither
+# wg-quick nor conf-list takes it for a link.
+adopted_file() { echo "$CONF_DIR/.$1.conf.before-adopt"; }
+
+# The public keys of a config's peers, one per line: the enabled ones and the disabled (commented) ones
+conf_pubkeys() { sed -n 's|^[[:space:]]*#\{0,1\}[[:space:]]*PublicKey[[:space:]]*=[[:space:]]*\([A-Za-z0-9+/=]*\)[[:space:]]*$|\1|p' "$1"; }
+
+# The private keys an API before this one left in a link's client directory: whole client configs
+# under any name (it used the peer's address), where the app's own are named by public key and
+# hold the key alone. Each is told by the public key it belongs to, which is all that is printed:
+#   list:   "legacy <public key>" for every such file
+#   import: stores the key the app's way for each that is a peer in the link's config now and has
+#           none stored yet, and prints those public keys. The old files stay as they are.
+legacy_keys() {
+    local link=$1 mode=$2 dir="$CONF_DIR/clients/$1" file name line key pub safe n peers='' nl=$'\n'
+    # (As wg-quick reads a config: the key name in any case, a comment after the value)
+    local re_line='^[[:space:]]*[Pp][Rr][Ii][Vv][Aa][Tt][Ee][Kk][Ee][Yy][[:space:]]*=[[:space:]]*([A-Za-z0-9+/=]+)[[:space:]]*(#.*)?$'
+    [ -d "$dir" ] || return 0
+    if [ "$mode" = import ]; then peers=$(conf_pubkeys "$(conf_file "$link")"); fi
+
+    for file in "$dir"/*.conf; do
+        if [ ! -f "$file" ] || [ -L "$file" ]; then continue; fi
+        name=${file##*/}
+        name=${name%.conf}
+        if [[ $name =~ $re_safe_key ]]; then continue; fi
+        # Its first PrivateKey line, near the top (a client config is a dozen lines)
+        key='' n=0
+        while IFS= read -r line || [ -n "$line" ]; do
+            n=$((n + 1))
+            if [ "$n" -gt 100 ]; then break; fi
+            if [[ $line =~ $re_line ]]; then key=${BASH_REMATCH[1]}; break; fi
+        done < "$file"
+        if ! [[ $key =~ $re_key ]]; then continue; fi
+        # (On stdin: a key is never on a command line)
+        pub=$(printf '%s\n' "$key" | wg pubkey 2> /dev/null) || continue
+        if ! [[ $pub =~ $re_key ]]; then continue; fi
+
+        if [ "$mode" = import ]; then
+            case "$nl$peers$nl" in *"$nl$pub$nl"*) ;; *) continue ;; esac
+            safe=${pub//+/-}
+            safe=${safe//\//_}
+            safe=${safe%=}
+            if [ -e "$dir/$safe.conf" ]; then continue; fi
+            TMP=$(mktemp "$dir/.wgla.XXXXXX")
+            printf '%s\n' "# This peer's private key, taken over from the client config an older API kept ($name.conf)." "PrivateKey = $key" > "$TMP"
+            chmod 600 "$TMP"
+            mv -f "$TMP" "$dir/$safe.conf"
+            TMP=''
+            echo "$pub"
+        else
+            echo "legacy $pub"
+        fi
+    done
+}
 
 # Metadata value from a link config (validated again before use)
 meta() { sed -n "s/^# $2 = //p" "$1" | head -n 1; }
@@ -406,13 +512,19 @@ network_of() {
 #
 # Rules come from the link's saved config, so the PostUp hook and live updates install the
 # same thing. Linux: one nftables table per link (inet wg_<link>). macOS: pf anchor wg/<link>.
+#
+# A link's `destinations` are the only networks traffic out of its tunnel is forwarded to, and the
+# only ones its NAT covers: its peers hold their own keys and can route anything into the tunnel,
+# so what the link is for is enforced here. They hold with or without `forward` (which only says
+# whether the app opens forwarding where something else drops it, and what may come in). Without
+# destinations a link reaches anywhere.
 
 firewall_state() {
-    local conf
+    local conf entry
     conf=$(conf_file "$1")
     [ -f "$conf" ] || die "no config for link $1"
     FORWARD=$(meta "$conf" forward) NAT=$(meta "$conf" nat) IFOUT=$(meta "$conf" ifout) ADDRESS=$(meta "$conf" address)
-    ADDRESS6=$(meta "$conf" address6) INBOUND=$(meta "$conf" inbound)
+    ADDRESS6=$(meta "$conf" address6) INBOUND=$(meta "$conf" inbound) DESTINATIONS=$(meta "$conf" destinations)
     if ! valid_bool "${FORWARD:-false}" || ! valid_bool "${NAT:-false}" || ! valid_bool "${INBOUND:-false}"; then die "invalid forward/nat/inbound in $conf"; fi
     if [ "${NAT:-false}" = true ]; then
         [[ $IFOUT =~ $re_ifname ]] || die "invalid ifout in $conf"
@@ -422,6 +534,26 @@ firewall_state() {
         NETWORK=$(network_of "$ADDRESS")
         if [ -n "$ADDRESS6" ]; then valid_cidr6 "$ADDRESS6" || die "invalid address6 in $conf"; fi
     fi
+    # Its destinations, per family (space-separated: they go into one rule each)
+    DEST4='' DEST6=''
+    if [ -n "$DESTINATIONS" ]; then
+        valid_destinations "$DESTINATIONS" || die "invalid destinations in $conf"
+        for entry in $(echo "$DESTINATIONS" | tr ',' ' '); do
+            case "$entry" in *:*) DEST6="$DEST6 $entry" ;; *) DEST4="$DEST4 $entry" ;; esac
+        done
+    fi
+}
+
+# Whether the link's config asks for any rules at all
+has_rules() { [ "${FORWARD:-false}" = true ] || [ "${NAT:-false}" = true ] || [ -n "$DESTINATIONS" ]; }
+
+# The rules a function prints one per line, as one line: "rule; rule; " (nft)
+joined() {
+    local rule out=''
+    while IFS= read -r rule; do
+        if [ -n "$rule" ]; then out="$out$rule; "; fi
+    done <<< "$("$@")"
+    printf '%s' "$out"
 }
 
 # Firewalls driven by iptables (Docker, ufw) drop forwarded traffic in their own FORWARD
@@ -470,22 +602,18 @@ xtables_forward() {
 xtables_ours() { echo "^-A FORWARD -([io]) ([^ ]+)( -m conntrack --ctstate RELATED,ESTABLISHED)? -m comment --comment \"?wgla:$1\"? -j ACCEPT\$"; }
 
 firewall_up_linux() {
-    local link=$1 iface=$2 table="wg_$1" nat6 into rule
+    local link=$1 iface=$2 table="wg_$1"
     {
         # Creating then deleting makes the replace atomic and work whether or not it exists
         echo "table inet $table"
         echo "delete table inet $table"
-        if [ "${FORWARD:-false}" = true ] || [ "${NAT:-false}" = true ]; then
+        if has_rules; then
             echo "table inet $table {"
-            if [ "${FORWARD:-false}" = true ]; then
-                into=''
-                while IFS= read -r rule; do into="$into$rule; "; done <<< "$(forward_in "$iface")"
-                echo "    chain forward { type filter hook forward priority 0; iifname \"$iface\" accept; $into}"
+            if [ "${FORWARD:-false}" = true ] || [ -n "$DESTINATIONS" ]; then
+                echo "    chain forward { type filter hook forward priority 0; $(joined forward_out "$iface")$(joined forward_in "$iface")}"
             fi
             if [ "${NAT:-false}" = true ]; then
-                nat6=''
-                if [ -n "$ADDRESS6" ]; then nat6=" ip6 saddr $ADDRESS6 oifname \"$IFOUT\" masquerade;"; fi
-                echo "    chain postrouting { type nat hook postrouting priority 100; ip saddr $NETWORK oifname \"$IFOUT\" masquerade;$nat6 }"
+                echo "    chain postrouting { type nat hook postrouting priority 100; $(joined nat_rules)}"
             fi
             echo "}"
         fi
@@ -494,16 +622,49 @@ firewall_up_linux() {
     iptables_forward "$link" "$iface" "${FORWARD:-false}" "${INBOUND:-false}"
 }
 
+# The nft rules for traffic out of the tunnel, one per line: all of it with `forward`, or, for a
+# link with destinations, only what goes to them: a rule each, and the rest dropped (a drop here is
+# final, whatever another table accepts). Replies to what came in for its peers still go out: only
+# what a peer starts is held to the destinations. nft lists each network its own way (canon_net).
+forward_out() {
+    local entry
+    if [ -z "$DESTINATIONS" ]; then
+        if [ "${FORWARD:-false}" = true ]; then echo "iifname \"$1\" accept"; fi
+        return
+    fi
+    echo "iifname \"$1\" ct state established,related accept"
+    for entry in $DEST4; do echo "iifname \"$1\" ip daddr $entry accept"; done
+    for entry in $DEST6; do echo "iifname \"$1\" ip6 daddr $entry accept"; done
+    echo "iifname \"$1\" drop"
+}
+
 # The nft rules for traffic into the tunnel, one per line as `nft list` prints them: only replies
 # to what peers started, the rest dropped (the chain's policy accepts: without the drop, nothing
 # would be refused), unless the link takes connections that start outside (`inbound`,
 # site-to-site). Peers' own traffic comes in on the interface and is accepted before these.
+# Only with `forward`.
 forward_in() {
+    [ "${FORWARD:-false}" = true ] || return 0
     if [ "${INBOUND:-false}" = true ]; then
         echo "oifname \"$1\" accept"
     else
         echo "oifname \"$1\" ct state established,related accept"
         echo "oifname \"$1\" drop"
+    fi
+}
+
+# The nft rules that masquerade the link's subnet (and prefix) out of its ifout, one per line: to
+# anywhere, or one per destination of that family
+nat_rules() {
+    local entry
+    if [ -z "$DESTINATIONS" ]; then
+        echo "ip saddr $NETWORK oifname \"$IFOUT\" masquerade"
+        if [ -n "$ADDRESS6" ]; then echo "ip6 saddr $ADDRESS6 oifname \"$IFOUT\" masquerade"; fi
+        return
+    fi
+    for entry in $DEST4; do echo "ip saddr $NETWORK ip daddr $entry oifname \"$IFOUT\" masquerade"; done
+    if [ -n "$ADDRESS6" ]; then
+        for entry in $DEST6; do echo "ip6 saddr $ADDRESS6 ip6 daddr $entry oifname \"$IFOUT\" masquerade"; done
     fi
 }
 
@@ -513,14 +674,18 @@ firewall_down_linux() {
 }
 
 firewall_up_darwin() {
-    local link=$1 iface=$2 rules=''
+    local link=$1 iface=$2 rules='' nat
     # pf rejects a ruleset whose translation (nat) rules come after filter (pass) rules
     if [ "${NAT:-false}" = true ]; then
-        rules="nat on $IFOUT from $NETWORK to any -> ($IFOUT)"$'\n'
-        if [ -n "$ADDRESS6" ]; then rules="${rules}nat on $IFOUT inet6 from $ADDRESS6 to any -> ($IFOUT)"$'\n'; fi
+        nat=$(pf_nat)
+        if [ -n "$nat" ]; then rules="$nat"$'\n'; fi
+    fi
+    if [ -n "$DESTINATIONS" ]; then
+        rules="$rules$(pf_scope "$link" "$iface")"$'\n'
+    elif [ "${FORWARD:-false}" = true ]; then
+        rules="${rules}pass in on $iface all"$'\n'
     fi
     if [ "${FORWARD:-false}" = true ]; then
-        rules="${rules}pass in on $iface all"$'\n'
         if [ "${INBOUND:-false}" = true ]; then
             rules="${rules}pass out on $iface all"$'\n'
         else
@@ -538,15 +703,59 @@ firewall_up_darwin() {
 
 firewall_down_darwin() { pfctl -a "wg/$1" -F all > /dev/null 2>&1 || true; }
 
+# The pf rules that translate the link's subnet (and prefix) out of its ifout, one per line: to
+# anywhere, or one per destination of that family
+pf_nat() {
+    local entry
+    if [ -z "$DESTINATIONS" ]; then
+        echo "nat on $IFOUT from $NETWORK to any -> ($IFOUT)"
+        if [ -n "$ADDRESS6" ]; then echo "nat on $IFOUT inet6 from $ADDRESS6 to any -> ($IFOUT)"; fi
+        return
+    fi
+    for entry in $DEST4; do echo "nat on $IFOUT from $NETWORK to $entry -> ($IFOUT)"; done
+    if [ -n "$ADDRESS6" ]; then
+        for entry in $DEST6; do echo "nat on $IFOUT inet6 from $ADDRESS6 to $entry -> ($IFOUT)"; done
+    fi
+}
+
+# Out of the tunnel only to the link's destinations, on macOS, one rule per line. pf sees a
+# forwarded packet twice, coming in and going out, and one for this machine itself only coming in.
+# So what comes in from the tunnel is tagged, without state, and what is still tagged so when it
+# leaves through any interface is dropped: it was on its way elsewhere. `quick`, as pf goes by the
+# last rule that matches: a link that takes connections in has a `pass out on <utun> all` further
+# down (this link's own, for what goes to another peer of it, or another link's). What goes to a
+# destination gets another tag instead (a tag stays until one replaces it) and state, as before:
+# a tag per destination, so pfctl's optimizer has no rules it could fold into one or leave out, and
+# they are listed as they were loaded. Replies to what came in for a peer match the state that
+# made, which pf checks before any rule. (Without `forward` nothing here makes that state: then a
+# peer's replies to what started outside its destinations are dropped as well, unlike on Linux.)
+pf_scope() {
+    local link=$1 iface=$2 entry n=0
+    echo "pass in on $iface all no state tag wgla_no_$link"
+    for entry in $DEST4; do
+        n=$((n + 1))
+        echo "pass in on $iface inet from any to $entry tag wgla_to_${link}_$n"
+    done
+    for entry in $DEST6; do
+        n=$((n + 1))
+        echo "pass in on $iface inet6 from any to $entry tag wgla_to_${link}_$n"
+    done
+    echo "block drop out quick all tagged wgla_no_$link"
+}
+
 # Only replies into the tunnel on macOS, one rule per line as pfctl prints them. What comes in
 # elsewhere for the link's addresses is tagged, without state, so pf looks at it again on its way
 # out, where it is dropped. Replies to what peers started match the state `pass in on <utun>` made,
 # which pf checks before any rule. The server's own traffic to peers never came in: not tagged.
 # $3 = listed: as globs for `pfctl -s rules`, which prints the prefix with its host bits masked.
 pf_replies_only() {
-    local tag="wgla_in_$1" iface=$2 prefix=$ADDRESS6
-    if [ "${3:-}" = listed ]; then prefix="*:*/${ADDRESS6#*/}"; fi
-    echo "pass in on ! $iface inet from any to $NETWORK no state tag $tag"
+    local tag="wgla_in_$1" iface=$2 prefix=$ADDRESS6 network=$NETWORK
+    if [ "${3:-}" = listed ]; then
+        prefix="*:*/${ADDRESS6#*/}"
+        # (and a /32, the subnet of a link that is one address, without its mask)
+        network=${NETWORK%/32}
+    fi
+    echo "pass in on ! $iface inet from any to $network no state tag $tag"
     if [ -n "$ADDRESS6" ]; then echo "pass in on ! $iface inet6 from any to $prefix no state tag $tag"; fi
     echo "block drop out on $iface all tagged $tag"
 }
@@ -554,22 +763,44 @@ pf_replies_only() {
 firewall_up() { if [ "$OS" = Darwin ]; then firewall_up_darwin "$@"; else firewall_up_linux "$@"; fi; }
 
 # Whether the rules firewall-up installs are there, as the link's config asks for them now: NAT for
-# its subnet (and prefix) out of its current ifout, forwarding into the tunnel replies-only or not.
+# its subnet (and prefix) out of its current ifout, forwarding into the tunnel replies-only or not,
+# and out of it to anywhere or to exactly its destinations: neither one missing nor one too many.
 # Another tool can take them away (`nft -f` of a ruleset that starts with "flush ruleset", a
-# firewall restart). Each rule is matched as a whole line of the listing, as the tool prints it.
+# firewall restart). Each rule is matched as a whole line of the listing, as the tool prints it
+# (a /32, the subnet of a link that is one address, without its mask).
 firewall_present() {
     local link=$1 iface=$2 rules rule
-    if [ "${FORWARD:-false}" != true ] && [ "${NAT:-false}" != true ]; then return 0; fi
+    has_rules || return 0
 
     if [ "$OS" = Darwin ]; then
         if [ "${NAT:-false}" = true ]; then
             rules=$(pfctl -a "wg/$link" -s nat 2> /dev/null) || return 1
-            has_line "$rules" "nat on $IFOUT inet from $NETWORK to any *" || return 1
-            if [ -n "$ADDRESS6" ]; then has_line "$rules" "nat on $IFOUT inet6 from *:* to any *" || return 1; fi
+            if [ -z "$DESTINATIONS" ]; then
+                has_line "$rules" "nat on $IFOUT inet from ${NETWORK%/32} to any *" || return 1
+                if [ -n "$ADDRESS6" ]; then has_line "$rules" "nat on $IFOUT inet6 from *:* to any *" || return 1; fi
+            else
+                has_line "$rules" "nat on $IFOUT inet* from * to any *" && return 1
+                lists_exactly "$rules" "nat on $IFOUT inet from ${NETWORK%/32} to " " -> *" "$DEST4" || return 1
+                if [ -n "$ADDRESS6" ]; then lists_exactly "$rules" "nat on $IFOUT inet6 from *:* to " " -> *" "$DEST6" || return 1; fi
+            fi
+        fi
+        if [ "${FORWARD:-false}" = true ] || [ -n "$DESTINATIONS" ]; then
+            rules=$(pfctl -a "wg/$link" -s rules 2> /dev/null) || return 1
+            if [ -n "$DESTINATIONS" ]; then
+                # Nothing passed in from the tunnel as it is, to anywhere
+                has_line "$rules" "pass in on $iface all flags*" && return 1
+                has_line "$rules" "pass in on $iface all keep state*" && return 1
+                has_line "$rules" "pass in on $iface all no state tag wgla_no_$link" || return 1
+                lists_exactly "$rules" "pass in on $iface inet from any to " " *tag wgla_to_${link}_*" "$DEST4" || return 1
+                lists_exactly "$rules" "pass in on $iface inet6 from any to " " *tag wgla_to_${link}_*" "$DEST6" || return 1
+                has_line "$rules" "block drop out quick all tagged wgla_no_$link" || return 1
+            else
+                has_line "$rules" "pass in on $iface all*" || return 1
+                # (No destinations any more: nothing of them left that drops)
+                has_line "$rules" "block drop out quick all tagged wgla_no_$link" && return 1
+            fi
         fi
         if [ "${FORWARD:-false}" = true ]; then
-            rules=$(pfctl -a "wg/$link" -s rules 2> /dev/null) || return 1
-            has_line "$rules" "pass in on $iface all*" || return 1
             if [ "${INBOUND:-false}" = true ]; then
                 has_line "$rules" "pass out on $iface all*" || return 1
             else
@@ -584,17 +815,62 @@ firewall_present() {
 
     rules=$(nft list table inet "wg_$link" 2> /dev/null) || return 1
     if [ "${NAT:-false}" = true ]; then
-        has_line "$rules" "ip saddr $NETWORK oifname \"$IFOUT\" masquerade" || return 1
-        # nft prints the prefix with the host bits masked: only its length is known here
-        if [ -n "$ADDRESS6" ]; then has_line "$rules" "ip6 saddr *:*/${ADDRESS6#*/} oifname \"$IFOUT\" masquerade" || return 1; fi
+        if [ -z "$DESTINATIONS" ]; then
+            has_line "$rules" "ip saddr ${NETWORK%/32} oifname \"$IFOUT\" masquerade" || return 1
+            # nft prints the prefix with the host bits masked: only its length is known here
+            if [ -n "$ADDRESS6" ]; then has_line "$rules" "ip6 saddr *:*/${ADDRESS6#*/} oifname \"$IFOUT\" masquerade" || return 1; fi
+        else
+            # Nothing masqueraded to anywhere (no rule with only a source), and a rule for each
+            # destination and no other
+            lists_exactly "$rules" "ip saddr " " oifname \"*\" masquerade" '' || return 1
+            lists_exactly "$rules" "ip6 saddr " " oifname \"*\" masquerade" '' || return 1
+            lists_exactly "$rules" "ip saddr ${NETWORK%/32} ip daddr " " oifname \"$IFOUT\" masquerade" "$DEST4" || return 1
+            if [ -n "$ADDRESS6" ]; then
+                lists_exactly "$rules" "ip6 saddr *:*/${ADDRESS6#*/} ip6 daddr " " oifname \"$IFOUT\" masquerade" "$DEST6" || return 1
+            fi
+        fi
+    fi
+    if [ -n "$DESTINATIONS" ]; then
+        # Out of the tunnel to its destinations and nowhere else
+        has_line "$rules" "iifname \"$iface\" accept" && return 1
+        has_line "$rules" "iifname \"$iface\" ct state established,related accept" || return 1
+        lists_exactly "$rules" "iifname \"$iface\" ip daddr " " accept" "$DEST4" || return 1
+        lists_exactly "$rules" "iifname \"$iface\" ip6 daddr " " accept" "$DEST6" || return 1
+        has_line "$rules" "iifname \"$iface\" drop" || return 1
+    elif [ "${FORWARD:-false}" = true ]; then
+        has_line "$rules" "iifname \"$iface\" accept" || return 1
+        # (No destinations any more: nothing of them left that drops)
+        has_line "$rules" "iifname \"$iface\" drop" && return 1
     fi
     if [ "${FORWARD:-false}" = true ]; then
-        has_line "$rules" "iifname \"$iface\" accept" || return 1
         while IFS= read -r rule; do has_line "$rules" "$rule" || return 1; done <<< "$(forward_in "$iface")"
         # And, where iptables drops forwarded traffic, our accepts there
         xtables_present iptables "$link" "$iface" || return 1
         xtables_present ip6tables "$link" "$iface" || return 1
     fi
+}
+
+# Whether the listing $1 has a rule for each of the networks $4, written between $2 and $3, and no
+# such rule for any other network. ($2 and $3 are globs, built from validated values only.)
+lists_exactly() {
+    local line token listed='' wanted='' entry
+    while IFS= read -r line; do
+        line=${line#"${line%%[![:space:]]*}"}
+        # shellcheck disable=SC2053,SC2295 # $2 and $3 are globs on purpose
+        if [[ $line == $2*$3 ]]; then
+            token=${line#$2}
+            token=${token%%$3}
+            # One of ours has exactly a network there: anything else between is another rule
+            [[ $token =~ ^[0-9A-Fa-f.:/]+$ ]] || continue
+            canon_net "$token" || return 1
+            listed="$listed$REPLY"$'\n'
+        fi
+    done <<< "$1"
+    for entry in $4; do
+        canon_net "$entry" || return 1
+        wanted="$wanted$REPLY"$'\n'
+    done
+    [ "$(printf '%s' "$listed" | sort)" = "$(printf '%s' "$wanted" | sort)" ]
 }
 
 # Whether a line of $1 (leading whitespace aside) matches the glob $2. The globs above are built
@@ -726,9 +1002,45 @@ case "$command" in
         args 1 $# "$command"; name_arg "$1"
         install_input "$(conf_file "$1")" validate_conf
         ;;
+    conf-check)
+        # Whether conf-write would take this config. Nothing is written: for a change that has to
+        # stop a link before it can write (an adoption), and for a dry run
+        args 1 $# "$command"; name_arg "$1"
+        TMP=$(mktemp "${TMPDIR:-/tmp}/wgla.XXXXXX")
+        read_input "$TMP"
+        validate_conf "$TMP"
+        ;;
     conf-delete)
         args 1 $# "$command"; name_arg "$1"
-        rm -f "$(conf_file "$1")"
+        rm -f "$(conf_file "$1")" "$(adopted_file "$1")"
+        ;;
+
+    # Adoption: a config the app didn't write (by hand, by an older API: hooks of its own) gives
+    # way to the app's version of it. The new one is checked like any other. The one it replaces
+    # is kept beside it until the link runs with the new one (conf-adopt-done), and goes back if
+    # it doesn't (conf-adopt-undo). What goes back is only ever what was here: a config with hooks
+    # of its own is never the caller's to hand in.
+    conf-adopt)
+        args 1 $# "$command"; name_arg "$1"
+        file=$(conf_file "$1")
+        [ -f "$file" ] || missing "no config for link $1"
+        TMP=$(mktemp "$CONF_DIR/.wgla.XXXXXX")
+        read_input "$TMP"
+        validate_conf "$TMP"
+        chmod 600 "$TMP"
+        rm -f "$(adopted_file "$1")"
+        cp "$file" "$(adopted_file "$1")"
+        mv -f "$TMP" "$file"
+        TMP=''
+        ;;
+    conf-adopt-undo)
+        args 1 $# "$command"; name_arg "$1"
+        [ -f "$(adopted_file "$1")" ] || die "no config of link $1 from before an adoption is kept: nothing to put back"
+        mv -f "$(adopted_file "$1")" "$(conf_file "$1")"
+        ;;
+    conf-adopt-done)
+        args 1 $# "$command"; name_arg "$1"
+        rm -f "$(adopted_file "$1")"
         ;;
 
     # Client (peer) configs: served to clients, never run here, so only paths are checked
@@ -749,6 +1061,27 @@ case "$command" in
     client-delete-all)
         args 1 $# "$command"; name_arg "$1"
         rm -rf "${CONF_DIR:?}/clients/$1"
+        ;;
+    client-keys)
+        # Whose private keys the link's client directory holds, by public key (and nothing but
+        # public keys): "stored" the app's way, in a file named by that key, or "legacy" in a
+        # client config an older API left there
+        args 1 $# "$command"; name_arg "$1"
+        for file in "$CONF_DIR/clients/$1"/*.conf; do
+            name=${file##*/}
+            name=${name%.conf}
+            if [ -f "$file" ] && [[ $name =~ $re_safe_key ]]; then
+                pub=${name//-/+}
+                echo "stored ${pub//_//}="
+            fi
+        done
+        legacy_keys "$1" list
+        ;;
+    client-import)
+        # Those of the link's peers, stored the app's way. Prints the public keys it stored.
+        args 1 $# "$command"; name_arg "$1"
+        [ -f "$(conf_file "$1")" ] || missing "no config for link $1"
+        legacy_keys "$1" import
         ;;
 
     # Lifecycle

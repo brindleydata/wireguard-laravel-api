@@ -18,7 +18,7 @@ class WgPeerDelete extends WgCommand
         try {
             $wg->removePeer($link, $pubkey);
         } catch (\Throwable $e) {
-            return $this->failed($e->getMessage());
+            return $this->failed($e);
         }
 
         return $this->respond(['message' => "Removed peer from {$link}"], fn () => $this->info("Removed peer {$pubkey} from {$link}"));

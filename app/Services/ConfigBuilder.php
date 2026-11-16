@@ -50,8 +50,10 @@ class ConfigBuilder
      * @param  bool  $allow_default_route  peers may route a default route, as far as the server's policy lets them
      * @param  bool  $allow_own_networks  peers may route networks that hold the server's own addresses, likewise
      * @param  string|null  $endpoint  where clients connect: a host, or host:port (WireGuardValidator::endpoint())
+     * @param  string|null  $destinations  the only networks traffic out of the tunnel is forwarded (and NATed) to, as
+     *                                     `a, b` (WireGuardValidator::destinations()); null: anywhere
      */
-    public function buildConfFile(string $address, string $privkey, int $port, string $ifout, array $peers = [], ?string $dns = null, ?int $keepalive = null, ?string $allowed_ips = null, bool $forward = false, bool $nat = false, ?string $address6 = null, ?int $mtu = null, bool $inbound = false, bool $allow_default_route = false, bool $allow_own_networks = false, ?string $endpoint = null): string
+    public function buildConfFile(string $address, string $privkey, int $port, string $ifout, array $peers = [], ?string $dns = null, ?int $keepalive = null, ?string $allowed_ips = null, bool $forward = false, bool $nat = false, ?string $address6 = null, ?int $mtu = null, bool $inbound = false, bool $allow_default_route = false, bool $allow_own_networks = false, ?string $endpoint = null, ?string $destinations = null): string
     {
         // Metadata comments (address and ifout always written)
         $lines = [];
@@ -66,6 +68,10 @@ class ConfigBuilder
         $lines[] = '# forward = '.($forward ? 'true' : 'false');
         $lines[] = '# nat = '.($nat ? 'true' : 'false');
         $lines[] = '# inbound = '.($inbound ? 'true' : 'false');
+        // Only when it has any: the root helper builds the link's firewall rules from them
+        if ($destinations !== null) {
+            $lines[] = "# destinations = {$destinations}";
+        }
         // Only when on: the root helper checks peers' AllowedIPs against these (and the server's policy)
         if ($allow_default_route) {
             $lines[] = '# allow_default_route = true';
@@ -85,7 +91,7 @@ class ConfigBuilder
         }
 
         // Interface section from OS driver
-        $lines[] = $this->os->interfaceSection($address6 === null ? $address : "{$address}, {$address6}", $privkey, $port, $ifout, $forward, $nat, $mtu);
+        $lines[] = $this->os->interfaceSection($address6 === null ? $address : "{$address}, {$address6}", $privkey, $port, $ifout, $forward, $nat, $mtu, $destinations !== null);
 
         // Peer sections. A disabled peer is commented out, so wg-quick doesn't load it; its name
         // and its own client settings are comments either way.

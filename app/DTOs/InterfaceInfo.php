@@ -30,6 +30,8 @@ class InterfaceInfo
         public readonly bool $allow_default_route = false,  // its peers may route a default route (as far as the server allows)
         public readonly bool $allow_own_networks = false,  // its peers may route networks holding the server's own addresses (likewise)
         public readonly ?string $endpoint = null,  // where its clients connect: host, or host:port; null: detected when a config is built
+        public readonly ?string $destinations = null,  // the only networks traffic out of its tunnel is forwarded (and NATed) to; null: anywhere
+        public readonly bool $managed = true,  // false: a config with what the app doesn't write (adopt it), or an interface without a config here
     ) {}
 
     /** A copy with some properties replaced. */
@@ -63,10 +65,12 @@ class InterfaceInfo
             'forward' => $this->forward,
             'nat' => $this->nat,
             'inbound' => $this->inbound,
+            'destinations' => $this->destinations,
             'allow_default_route' => $this->allow_default_route,
             'allow_own_networks' => $this->allow_own_networks,
             'firewall' => $this->firewall,
             'up' => $this->up,
+            'managed' => $this->managed,
             'client' => $this->clientSettings(),
             'peers' => array_map(fn (PeerInfo $p) => $p->toArray(), $this->peers),
         ];

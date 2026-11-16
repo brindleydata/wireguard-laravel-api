@@ -3,6 +3,7 @@
 namespace App\Console\Commands;
 
 use App\DTOs\InterfaceInfo;
+use App\Exceptions\ErrorCode;
 use App\Services\Server;
 use App\Services\WireGuard;
 use Closure;
@@ -79,11 +80,16 @@ class WgCommand extends Command
         return self::SUCCESS;
     }
 
-    /** What went wrong: for people, or as {"error": …} with --json. */
-    protected function failed(string $message): int
+    /**
+     * What went wrong: for people, or with --json as the API answers it, {"error": …, "code": …}.
+     * An exception brings its own code; a message of the command's own says which it is.
+     */
+    protected function failed(string|\Throwable $error, string $code = ErrorCode::SYSTEM_ERROR): int
     {
+        [$message, $code] = $error instanceof \Throwable ? [$error->getMessage(), ErrorCode::of($error)] : [$error, $code];
+
         $this->json()
-            ? $this->line(json_encode(['error' => $message], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE))
+            ? $this->line(json_encode(['error' => $message, 'code' => $code], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE))
             : $this->error($message);
 
         return self::FAILURE;

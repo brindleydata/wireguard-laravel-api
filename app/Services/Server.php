@@ -10,6 +10,9 @@ use RecursiveIteratorIterator;
 
 class Server
 {
+    /** What this app calls itself to a client that asks who answers (GET /health): never configurable. */
+    public const APP = 'wgla';
+
     /** The code this process (an Octane worker: for its whole life) booted with. */
     protected static ?string $runningCode = null;
 

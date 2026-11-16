@@ -18,12 +18,15 @@ class WireGuard extends Controller
         protected Server $server,
     ) {}
 
-    /** 200 or 503, nothing else: it's public. */
+    /**
+     * 200 or 503, and which app answers: it's public, so nothing else. The `app` lets a client
+     * make sure the URL is one of these servers before it sends its API key there.
+     */
     public function health(): JsonResponse
     {
         $healthy = $this->server->healthy();
 
-        return response()->json(['status' => $healthy ? 'ok' : 'unavailable'], $healthy ? 200 : 503);
+        return response()->json(['status' => $healthy ? 'ok' : 'unavailable', 'app' => Server::APP], $healthy ? 200 : 503);
     }
 
     public function status(): array
@@ -56,6 +59,23 @@ class WireGuard extends Controller
         return $request->validate($rules);
     }
 
+    /**
+     * A link's `destinations` as the service takes them: the comma-separated list the API's other
+     * lists are, which is also what it answers with. A JSON array of networks is taken too. An
+     * empty one is refused: it could mean nowhere as well as anywhere, and null says anywhere.
+     */
+    protected function destinations(mixed $value): ?string
+    {
+        if ($value === null || is_string($value)) {
+            return $value;
+        }
+        if (! is_array($value) || $value === [] || ! array_is_list($value) || array_filter($value, fn (mixed $entry) => ! is_string($entry)) !== []) {
+            throw new InvalidArgumentException('destinations must be networks, as a comma-separated list or an array of them (e.g. ["10.1.0.0/16", "2001:db8::/32"]). For anywhere, send null.');
+        }
+
+        return implode(', ', $value);
+    }
+
     public function links(): array
     {
         return $this->wg->listLinks();
@@ -63,13 +83,7 @@ class WireGuard extends Controller
 
     public function link(string $name): array
     {
-        $link = $this->wg->getLink($name);
-
-        if ($link === null) {
-            abort(404, "Link not found: {$name}");
-        }
-
-        return $link->toArray();
+        return $this->wg->linkOrFail($name)->toArray();
     }
 
     public function linkCreate(Request $request): JsonResponse
@@ -92,6 +106,7 @@ class WireGuard extends Controller
             'allow_own_networks' => 'nullable|boolean',   // peers may route the server's own networks (likewise)
             'endpoint' => 'nullable|string',      // where its clients connect, host or host:port (else detected now, and kept)
             'private_key' => 'nullable|string',   // its own key, to move a link here (else a new one)
+            'destinations' => 'nullable',         // the only networks out of its tunnel, "a, b" or an array (else anywhere)
         ]);
 
         $link = $this->wg->createLink(
@@ -112,6 +127,7 @@ class WireGuard extends Controller
             (bool) ($data['allow_own_networks'] ?? false),
             $data['endpoint'] ?? null,
             $data['private_key'] ?? null,
+            $this->destinations($data['destinations'] ?? null),
         );
 
         return response()->json($link->toArray(), 201);
@@ -143,20 +159,64 @@ class WireGuard extends Controller
             'allow_default_route' => 'nullable|boolean',
             'allow_own_networks' => 'nullable|boolean',
             'endpoint' => 'nullable|string',  // null: detected anew
+            'destinations' => 'nullable',     // "a, b" or an array; null: anywhere again
         ]);
 
-        // Only the fields that were sent. For most a null says nothing; for these it is a value:
-        // no IPv6 address, or the global default instead of the link's own
+        $link = $this->wg->updateLink($name, $this->linkParams($request, $data, ['address6', 'dns', 'keepalive', 'allowed_ips', 'mtu', 'endpoint', 'destinations']));
+
+        return $link->toArray();
+    }
+
+    /**
+     * A link's settings as the service takes them: only the fields that were sent. For most a
+     * null says nothing; for $nullable ones it is a value: no IPv6 address, anywhere instead of
+     * destinations, or the default instead of the link's own.
+     */
+    protected function linkParams(Request $request, array $data, array $nullable): array
+    {
+        if (array_key_exists('destinations', $data)) {
+            $data['destinations'] = $this->destinations($data['destinations']);
+        }
+
         $params = array_filter($data, fn ($v) => $v !== null);
-        foreach (['address6', 'dns', 'keepalive', 'allowed_ips', 'mtu', 'endpoint'] as $field) {
+        foreach ($nullable as $field) {
             if ($request->exists($field)) {
                 $params[$field] = $data[$field] ?? null;
             }
         }
 
-        $link = $this->wg->updateLink($name, $params);
+        return $params;
+    }
 
-        return $link->toArray();
+    /**
+     * Take a config the app didn't write (by hand, or by the API before this one) under its
+     * management, with these settings. Answers with the link as GET /link/{name} does, and under
+     * `adoption` what was kept, dropped and applied, and whose private keys are here. With
+     * `dry_run` it only says what it would do, and changes nothing.
+     */
+    public function linkAdopt(Request $request, string $name): array
+    {
+        $data = $this->fields($request, [
+            'ifout' => 'nullable|string|max:15',
+            'forward' => 'nullable|boolean',
+            'nat' => 'nullable|boolean',
+            'inbound' => 'nullable|boolean',
+            'destinations' => 'nullable',
+            'allowed_ips' => 'nullable|string',
+            'dns' => 'nullable|string',
+            'keepalive' => 'nullable|integer|min:0|max:65535',
+            'mtu' => 'nullable|integer|min:576|max:65535',
+            'endpoint' => 'nullable|string',
+            'allow_default_route' => 'nullable|boolean',
+            'allow_own_networks' => 'nullable|boolean',
+            'dry_run' => 'nullable|boolean',
+        ]);
+        $dry_run = (bool) ($data['dry_run'] ?? false);
+        unset($data['dry_run']);
+
+        $result = $this->wg->adoptLink($name, $this->linkParams($request, $data, ['dns', 'keepalive', 'allowed_ips', 'mtu', 'endpoint', 'destinations']), $dry_run);
+
+        return [...$result['link']->toArray(), 'adoption' => $result['adoption']];
     }
 
     /** New keys for a link (its own key pair). Every client needs its new config: the link's public key is in it. */
@@ -173,24 +233,13 @@ class WireGuard extends Controller
 
     public function peers(string $link): array
     {
-        $info = $this->wg->getLink($link);
-
-        if ($info === null) {
-            abort(404, "Link not found: {$link}");
-        }
-
-        return array_map(fn ($p) => $p->toArray(), $info->peers);
+        return array_map(fn ($p) => $p->toArray(), $this->wg->linkOrFail($link)->peers);
     }
 
+    /** 404 says which isn't there: the link (`link_not_found`) or the peer (`peer_not_found`). */
     public function peer(string $link, string $pubkey): array
     {
-        $peer = $this->wg->getPeer($link, $pubkey);
-
-        if ($peer === null) {
-            abort(404, "Peer not found on {$link}");
-        }
-
-        return $peer->toArray();
+        return $this->wg->peerOrFail($link, $pubkey)->toArray();
     }
 
     public function peerCreate(Request $request, string $link): JsonResponse
@@ -254,24 +303,14 @@ class WireGuard extends Controller
 
     public function peerConfig(string $link, string $pubkey): array
     {
-        $config = $this->wg->getPeerConfig($link, $pubkey);
-
-        if ($config === null) {
-            abort(404, "Configuration not found for peer on {$link}");
-        }
-
-        return ['config' => $config];
+        return ['config' => $this->wg->peerConfigOrFail($link, $pubkey)];
     }
 
     /** The client config as a QR code (SVG) for the WireGuard apps. It holds the private key. */
     public function peerQr(QrCode $qr, string $link, string $pubkey): Response
     {
         // The whole config, its private key included: a peer with a key of its own has none (422)
-        $config = $this->wg->getPeerConfig($link, $pubkey, with_key: true);
-
-        if ($config === null) {
-            abort(404, "Configuration not found for peer on {$link}");
-        }
+        $config = $this->wg->peerConfigOrFail($link, $pubkey, with_key: true);
 
         return response($qr->svg($config), 200, ['Content-Type' => 'image/svg+xml', 'Cache-Control' => 'no-store']);
     }

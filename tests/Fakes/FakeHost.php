@@ -13,6 +13,10 @@ use LogicException;
  *
  * Starting a link rejects config lines wg-quick couldn't parse. The PostUp/PostDown hooks call the
  * helper's firewall commands, so their effect is modelled from the config's metadata.
+ *
+ * A config the app didn't write (hooks of its own, SaveConfig) behaves as wg-quick makes it: its
+ * hooks run when its link starts and stops (see $hooks), and with SaveConfig the interface is
+ * written into it when the link stops.
  */
 class FakeHost
 {
@@ -28,8 +32,14 @@ class FakeHost
     /** @var array<string, array{link: ?string, private_key: string, port: int, address: string, peers: array<string, array{psk: ?string, allowed_ips: string}>}> */
     public array $interfaces = [];
 
-    /** @var array<string, array{forward: bool, nat: bool, nat6?: string, inbound?: true}> live firewall state per link (nat6: the masqueraded IPv6 prefix; inbound: connections into the tunnel, not only replies) */
+    /** @var array<string, array{forward: bool, nat: bool, nat6?: string, inbound?: true, destinations?: string}> live firewall state per link (nat6: the masqueraded IPv6 prefix; inbound: connections into the tunnel, not only replies; destinations: where traffic out of it may go) */
     public array $firewall = [];
+
+    /** @var array<string, string> link => what a hook of its own (not the helper's) set up when the link started, until its PostDown ran */
+    public array $hooks = [];
+
+    /** @var array<string, string> link => the config an adoption replaced, while the helper keeps it */
+    public array $kept = [];
 
     /** @var array{allow_default_route: bool, allow_own_networks: bool} the server's route policy (the helper's `policy`) */
     public array $policy = ['allow_default_route' => false, 'allow_own_networks' => false];
@@ -66,10 +76,15 @@ class FakeHost
         return $this->confs[$link] ?? null;
     }
 
-    /** Everything stored on the host: configs, client configs and macOS name files. */
+    /** Everything stored on the host: configs, client configs, macOS name files, and a config an adoption left behind. */
     public function files(): array
     {
-        return [...$this->confs, ...$this->clients, ...$this->names];
+        $kept = [];
+        foreach ($this->kept as $link => $conf) {
+            $kept[".{$link}.conf.before-adopt"] = $conf;
+        }
+
+        return [...$this->confs, ...$this->clients, ...$this->names, ...$kept];
     }
 
     /** The OS interface a link runs as, or null when it is down. */
@@ -179,7 +194,27 @@ class FakeHost
             return '';
         });
         $helper('conf-delete :name', function (array $b) {
-            unset($this->confs[$b['name']]);
+            unset($this->confs[$b['name']], $this->kept[$b['name']]);
+
+            return '';
+        });
+        // Adoption: the helper checks a config without writing it, and keeps the one a new one
+        // replaces until it is told the outcome
+        $helper('conf-check :name', fn () => '');
+        $helper('conf-adopt :name', function (array $b, ?string $input) {
+            $this->kept[$b['name']] = $this->confs[$b['name']] ?? $this->missing("no config for link {$b['name']}");
+            $this->confs[$b['name']] = (string) $input;
+
+            return '';
+        });
+        $helper('conf-adopt-undo :name', function (array $b) {
+            $this->confs[$b['name']] = $this->kept[$b['name']] ?? $this->fail("no config of link {$b['name']} from before an adoption is kept");
+            unset($this->kept[$b['name']]);
+
+            return '';
+        });
+        $helper('conf-adopt-done :name', function (array $b) {
+            unset($this->kept[$b['name']]);
 
             return '';
         });
@@ -195,6 +230,32 @@ class FakeHost
             unset($this->clients["{$b['link']}/{$b['key']}"]);
 
             return '';
+        });
+        // Whose keys a link's client directory has: the app's files are named by public key, an
+        // older API's by anything else (the peer's address)
+        $helper('client-keys :link', function (array $b) {
+            $lines = [];
+            foreach ($this->clientKeys($b['link']) as $file => [$kind, $pubkey]) {
+                $lines[] = "{$kind} {$pubkey}";
+            }
+
+            return implode("\n", $lines);
+        });
+        $helper('client-import :link', function (array $b) {
+            $conf = $this->confs[$b['link']] ?? $this->missing("no config for link {$b['link']}");
+            preg_match_all('/^(?:# )?PublicKey = (\S+)$/m', $conf, $peers);
+            $stored = array_column(array_filter($this->clientKeys($b['link']), fn (array $key) => $key[0] === 'stored'), 1);
+
+            $imported = [];
+            foreach ($this->clientKeys($b['link']) as $file => [$kind, $pubkey]) {
+                if ($kind === 'legacy' && in_array($pubkey, $peers[1], true) && ! in_array($pubkey, [...$stored, ...$imported], true)) {
+                    preg_match('/^\s*PrivateKey\s*=\s*(\S+)/m', $this->clients[$file], $key);
+                    $this->clients["{$b['link']}/".rtrim(strtr($pubkey, '+/', '-_'), '=')] = "# This peer's private key, taken over.\nPrivateKey = {$key[1]}\n";
+                    $imported[] = $pubkey;
+                }
+            }
+
+            return implode("\n", $imported);
         });
         $helper('client-delete-all :link', function (array $b) {
             foreach (array_keys($this->clients) as $key) {
@@ -234,12 +295,31 @@ class FakeHost
         });
     }
 
+    /** @return array<string, array{0: string, 1: string}> "link/file" => ['stored'|'legacy', public key] */
+    protected function clientKeys(string $link): array
+    {
+        $keys = [];
+        foreach ($this->clients as $file => $content) {
+            if (! str_starts_with($file, "{$link}/")) {
+                continue;
+            }
+            $name = substr($file, strlen($link) + 1);
+            if (preg_match('/^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$/', $name)) {
+                $keys[$file] = ['stored', strtr($name, '-_', '+/').'='];
+            } elseif (preg_match('/^\s*PrivateKey\s*=\s*([A-Za-z0-9+\/]{42}[AEIMQUYcgkosw048]=)\s*$/m', $content, $key)) {
+                $keys[$file] = ['legacy', base64_encode(sodium_crypto_scalarmult_base(base64_decode($key[1])))];
+            }
+        }
+
+        return $keys;
+    }
+
     protected function dump(string $iface): string
     {
         $interface = $this->requireInterface($iface);
         $public_key = base64_encode(sodium_crypto_scalarmult_base(base64_decode($interface['private_key'])));
 
-        $lines = ["{$interface['private_key']}\t{$public_key}\t{$interface['port']}\toff"];
+        $lines = ["{$interface['private_key']}\t{$public_key}\t{$interface['port']}\t".($interface['fwmark'] ?? 'off')];
         foreach ($interface['peers'] as $pubkey => $peer) {
             $stats = $peer['stats'] ?? ['endpoint' => '(none)', 'handshake' => 0, 'rx' => 0, 'tx' => 0];
             // As wg prints them: comma-separated, no spaces
@@ -278,8 +358,12 @@ class FakeHost
         if ($state['forward'] && ($meta['inbound'] ?? 'false') === 'true') {
             $state['inbound'] = true;
         }
+        // Out of the tunnel (and NAT) only to these, whatever forward says
+        if (isset($meta['destinations'])) {
+            $state['destinations'] = $meta['destinations'];
+        }
 
-        return $state['forward'] || $state['nat'] ? $state : null;
+        return $state['forward'] || $state['nat'] || isset($state['destinations']) ? $state : null;
     }
 
     // ─── wg-quick ────────────────────────────────────────────────────
@@ -344,20 +428,55 @@ class FakeHost
             'peers' => $peers,
         ];
 
-        // PostUp = <helper> firewall-up …
-        if (isset($parsed['interface']['PostUp'])) {
+        // PostUp = <helper> firewall-up …, or a hook of the config's own
+        if (str_contains($parsed['interface']['PostUp'] ?? '', ' firewall-up ')) {
             $this->applyFirewall($link);
+        } elseif (isset($parsed['interface']['PostUp'])) {
+            $this->hooks[$link] = $parsed['interface']['PostUp'];
         }
     }
 
     protected function bringDown(string $link, string $iface): void
     {
+        $interface = $this->interfaces[$iface];
         unset($this->interfaces[$iface]);
+        $parsed = $this->parse($this->conf($link) ?? '');
 
-        // PostDown = <helper> firewall-down …
-        if (isset($this->parse($this->conf($link) ?? '')['interface']['PostDown'])) {
+        // PostDown = <helper> firewall-down …, or a hook of the config's own: the one of the
+        // config as it is now, which only undoes what its own PostUp did
+        if (str_contains($parsed['interface']['PostDown'] ?? '', ' firewall-down ')) {
             unset($this->firewall[$link]);
+        } elseif (isset($parsed['interface']['PostDown'])) {
+            unset($this->hooks[$link]);
         }
+        // SaveConfig = true: wg-quick writes the config from the interface (`wg showconf`)
+        if (($parsed['interface']['SaveConfig'] ?? '') === 'true') {
+            $this->confs[$link] = $this->savedConfig($parsed['interface'], $interface);
+        }
+    }
+
+    /** A config as wg-quick saves it: its own lines first, then what `wg showconf` prints. */
+    protected function savedConfig(array $own, array $interface): string
+    {
+        $lines = ['[Interface]', "Address = {$own['Address']}", 'SaveConfig = true'];
+        foreach (['PostUp', 'PostDown'] as $hook) {
+            if (isset($own[$hook])) {
+                $lines[] = "{$hook} = {$own[$hook]}";
+            }
+        }
+        array_push($lines, "ListenPort = {$interface['port']}", "PrivateKey = {$interface['private_key']}");
+        foreach ($interface['peers'] as $pubkey => $peer) {
+            array_push($lines, '', '[Peer]', "PublicKey = {$pubkey}");
+            if ($peer['psk'] !== null) {
+                $lines[] = "PresharedKey = {$peer['psk']}";
+            }
+            $lines[] = 'AllowedIPs = '.implode(', ', array_map('trim', explode(',', $peer['allowed_ips'])));
+            if (isset($peer['stats']['endpoint'])) {
+                $lines[] = "Endpoint = {$peer['stats']['endpoint']}";
+            }
+        }
+
+        return implode("\n", $lines)."\n";
     }
 
     /**

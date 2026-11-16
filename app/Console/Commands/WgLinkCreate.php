@@ -23,7 +23,8 @@ class WgLinkCreate extends WgCommand
         {--allow-default-route= : Let peers route a default route, where the server allows it (true/false, default: false)}
         {--allow-own-networks= : Let peers route networks holding this server\'s own addresses, where the server allows it (true/false, default: false)}
         {--endpoint= : Where its clients connect: a host, or host:port (default: this server\'s name or public IP, detected now and kept)}
-        {--private-key-file= : Its own private key, from this file (- for stdin), to move a link here (default: a new one)}';
+        {--private-key-file= : Its own private key, from this file (- for stdin), to move a link here (default: a new one)}
+        {--destinations= : The only networks traffic out of its tunnel is forwarded and NATed to, comma-separated (default: anywhere)}';
 
     protected $description = 'Create a WireGuard link';
 
@@ -49,9 +50,10 @@ class WgLinkCreate extends WgCommand
                 $this->flag('allow-own-networks') ?? false,
                 $this->option('endpoint') ?: null,
                 $this->secretFrom('private-key-file'),
+                $this->option('destinations') ?: null,
             );
         } catch (\Throwable $e) {
-            return $this->failed($e->getMessage());
+            return $this->failed($e);
         }
 
         return $this->respond($link->toArray(), function () use ($link) {
@@ -62,6 +64,9 @@ class WgLinkCreate extends WgCommand
             $this->line("Address: {$link->address}");
             if ($link->address6 !== null) {
                 $this->line("IPv6 Address: {$link->address6}");
+            }
+            if ($link->destinations !== null) {
+                $this->line("Destinations: {$link->destinations}");
             }
         });
     }

@@ -176,3 +176,49 @@ it('only reports a public IP of the asked family', function (string $flag, strin
     'IPv6 when asked for IPv4' => ['-4', '2001:db8::7', null],
     'an error page' => ['-4', '<html>502 Bad Gateway</html>', null],
 ]);
+
+it('hooks the helper firewall for a link with destinations too: they are rules that come and go with it', function () {
+    $driver = helperDriver(new FakeShell);
+
+    expect($driver->interfaceSection('10.0.0.1/24', 'KEY', 51820, 'eth0', scoped: true))
+        ->toContain('PostUp = /usr/local/sbin/wgla-helper firewall-up %i %i', 'PostDown = /usr/local/sbin/wgla-helper firewall-down %i')
+        ->and($driver->interfaceSection('10.0.0.1/24', 'KEY', 51820, 'eth0'))->not->toContain('PostUp');
+});
+
+it('adopts a config through the helper, which keeps the one it replaces', function () {
+    $shell = (new FakeShell)->otherwise(fn () => '');
+    $driver = helperDriver($shell);
+
+    $driver->checkConfig('wg0', 'new config');
+    $driver->adoptConfig('wg0', 'new config');
+    $driver->undoAdoptedConfig('wg0');
+    $driver->confirmAdoptedConfig('wg0');
+
+    // The new one on stdin; the old one is never the app's to hand in
+    expect(array_column($shell->calls, 'bound'))->toBe([
+        "sudo -n '/usr/local/sbin/wgla-helper' conf-check 'wg0'",
+        "sudo -n '/usr/local/sbin/wgla-helper' conf-adopt 'wg0'",
+        "sudo -n '/usr/local/sbin/wgla-helper' conf-adopt-undo 'wg0'",
+        "sudo -n '/usr/local/sbin/wgla-helper' conf-adopt-done 'wg0'",
+    ])->and(array_column($shell->calls, 'input'))->toBe(["new config\n", "new config\n", null, null]);
+
+    // Tidying up after a link that runs with its new config never fails the adoption
+    $shell->otherwise(fn () => throw new CommandFailed('rm: Read-only file system'));
+    $driver->confirmAdoptedConfig('wg0');
+    expect(fn () => $driver->undoAdoptedConfig('wg0'))->toThrow(CommandFailed::class)
+        ->and(fn () => $driver->checkConfig('wg0', 'x'))->toThrow(CommandFailed::class);
+});
+
+it('reads whose keys a link\'s client directory has, and which the helper took over', function () {
+    $shell = (new FakeShell)
+        ->on('sudo -n :helper client-keys :link', fn () => "stored AAA=\nlegacy BBB=\nlegacy BBB=\nlegacy CCC=\nsomething else\n")
+        ->on('sudo -n :helper client-import :link', fn (array $b) => $b['link'] === 'wg0' ? "BBB=\nCCC=" : '');
+    $driver = helperDriver($shell);
+
+    expect($driver->clientKeys('wg0'))->toBe(['stored' => ['AAA='], 'legacy' => ['BBB=', 'CCC=']])
+        ->and($driver->importLegacyClientKeys('wg0'))->toBe(['BBB=', 'CCC='])
+        ->and($driver->importLegacyClientKeys('wg1'))->toBe([]);
+
+    $shell->on('sudo -n :helper client-keys :link', fn () => '');
+    expect($driver->clientKeys('wg0'))->toBe(['stored' => [], 'legacy' => []]);
+});

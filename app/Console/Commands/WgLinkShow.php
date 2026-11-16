@@ -18,12 +18,9 @@ class WgLinkShow extends WgCommand
         $name = $this->argument('link');
 
         try {
-            $link = $wg->getLink($name);
+            $link = $wg->linkOrFail($name);
         } catch (\Throwable $e) {
-            return $this->failed($e->getMessage());
-        }
-        if ($link === null) {
-            return $this->failed("Link does not exist: {$name}");
+            return $this->failed($e);
         }
 
         return $this->respond($link->toArray(), function () use ($link) {
@@ -41,7 +38,11 @@ class WgLinkShow extends WgCommand
             $this->line('Forward: '.($link->forward ? 'enabled' : 'disabled'));
             $this->line('NAT: '.($link->nat ? 'enabled' : 'disabled'));
             $this->line('Inbound: '.($link->inbound ? 'connections from outside reach peers' : 'replies only'));
+            $this->line('Destinations: '.($link->destinations ?? 'anywhere'));
             $this->line('Peers may route: '.$this->routesAllowed($link));
+            if (! $link->managed) {
+                $this->warn("Not managed here: its config has what this app doesn't write, or it runs without a config here. A config can be taken under management: wgla link:adopt {$link->name} --dry-run");
+            }
             if ($link->firewall === 'missing') {
                 $this->error("Its firewall rules are missing. Put them back with: wgla link:repair {$link->name}");
             }

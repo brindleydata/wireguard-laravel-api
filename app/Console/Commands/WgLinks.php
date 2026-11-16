@@ -2,6 +2,7 @@
 
 namespace App\Console\Commands;
 
+use App\Exceptions\ErrorCode;
 use App\Services\WireGuard;
 
 class WgLinks extends WgCommand
@@ -15,7 +16,7 @@ class WgLinks extends WgCommand
         try {
             $links = $wg->listLinks();
         } catch (\Throwable $e) {
-            return $this->failed('Could not retrieve WireGuard links: '.$e->getMessage());
+            return $this->failed('Could not retrieve WireGuard links: '.$e->getMessage(), ErrorCode::of($e));
         }
 
         return $this->respond($links, function () use ($links) {

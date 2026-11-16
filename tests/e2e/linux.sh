@@ -64,6 +64,8 @@ cleanup() {
     for link in e2e0 e2e1 e2e2 e2e3; do "${ART[@]}" wg:link:delete "$link" > /dev/null 2>&1; done
     ip netns del e2e-client 2>/dev/null; ip netns del e2e-far 2>/dev/null
     ip link del e2e-h 2>/dev/null; ip link del e2e-fh 2>/dev/null; ip link del e2ex 2>/dev/null
+    # What the hooks of the legacy config (adoption) set up, should a failed run have left it
+    nft delete table ip e2e_legacy 2>/dev/null
     [ -n "$FORWARD_POLICY" ] && iptables -P FORWARD "$FORWARD_POLICY"
     [ -n "$FORWARD6_POLICY" ] && ip6tables -P FORWARD "$FORWARD6_POLICY"
     rm -f /tmp/wgla-e2e-*
@@ -84,6 +86,7 @@ check "... so it never runs" "! as_web sudo -n $HELPER up e2eevil && [ ! -e /tmp
 check "a config that isn't there is exit status 3 through sudo" "as_web sudo -n $HELPER conf-read e2enone; [ \$? -eq 3 ]"
 check "the API reports the helper ok" "[ \"\$(api $URL/status)\" = 200 ] && grep -q '\"state\":\"ok\"' /tmp/wgla-e2e-body"
 check "/health is public and ok" "[ \"\$(curl -s ${CURL_OPTS[*]} -o /dev/null -w '%{http_code}' $URL/health)\" = 200 ]"
+check "... and says which app answers, before any key is sent" "curl -s ${CURL_OPTS[*]} $URL/health | grep -q '\"app\":\"wgla\"'"
 check "/status needs the API key" "[ \"\$(curl -s ${CURL_OPTS[*]} -o /dev/null -w '%{http_code}' $URL/status)\" = 403 ]"
 if [ "$(env_get WGLA_SERVER_TLS)" = http ]; then
     # Behind a proxy: whatever Host header it passes on, and on the bind address only. (An IP in
@@ -157,6 +160,30 @@ cli wg:link:update e2e0 --inbound=true > /dev/null
 check "... with --inbound=true it does" "ip netns exec e2e-far ping -c1 -W3 10.80.0.2 && nft list table inet wg_e2e0 | grep -q 'oifname \"e2e0\" accept'"
 cli wg:link:update e2e0 --inbound=false > /dev/null
 check "... and not again with --inbound=false" "! ip netns exec e2e-far ping -c1 -W2 10.80.0.2"
+
+step "Destinations: a link that only forwards and NATs to the networks it is for"
+# A second network beyond the far one, which the link is not for
+ip netns exec e2e-far sh -c 'ip addr add 10.97.0.2/24 dev lo; ip -6 addr add fd97::2/64 dev lo'
+ip route add 10.97.0.0/24 via 10.98.0.2; ip -6 route add fd97::/64 via fd98::2
+ip netns exec e2e-client sh -c 'ip route add 10.97.0.0/24 dev e2ec0; ip -6 route add fd97::/64 dev e2ec0'
+check "without destinations the peer reaches any network" "ip netns exec e2e-client ping -c1 -W3 10.97.0.2 && ip netns exec e2e-client ping -6 -c1 -W3 fd97::2"
+cli wg:link:update e2e0 --destinations=10.98.0.0/24,fd98::/64 > /dev/null
+check "nftables: a rule per destination, the rest out of the tunnel dropped" "nft list table inet wg_e2e0 | grep -q 'iifname \"e2e0\" ip daddr 10.98.0.0/24 accept' && nft list table inet wg_e2e0 | grep -q 'iifname \"e2e0\" ip6 daddr fd98::/64 accept' && nft list table inet wg_e2e0 | grep -q 'iifname \"e2e0\" drop'"
+check "nftables: NAT only to the destinations" "nft list table inet wg_e2e0 | grep -q 'ip saddr 10.80.0.0/24 ip daddr 10.98.0.0/24 oifname \"e2e-fh\" masquerade' && ! nft list table inet wg_e2e0 | grep -q 'ip saddr 10.80.0.0/24 oifname'"
+check "the peer still reaches its destinations" "ip netns exec e2e-client ping -c1 -W3 10.98.0.2 && ip netns exec e2e-client ping -6 -c1 -W3 fd98::2"
+check "... and nothing else, whatever it routes into the tunnel" "! ip netns exec e2e-client ping -c1 -W2 10.97.0.2 && ! ip netns exec e2e-client ping -6 -c1 -W2 fd97::2"
+check "... but the server itself" "ip netns exec e2e-client ping -c1 -W3 10.80.0.1"
+check "the API shows them, and the rules in place" "[ \"\$(api $URL/link/e2e0)\" = 200 ] && grep -q '\"destinations\":\"10.98.0.0' /tmp/wgla-e2e-body && grep -q '\"firewall\":\"ok\"' /tmp/wgla-e2e-body"
+systemctl stop wgla-firewall.timer
+nft add rule inet wg_e2e0 forward iifname e2e0 ip daddr 10.97.0.0/24 accept
+check "a rule for a destination the link doesn't have is not its rules" "[ \"\$(api $URL/link/e2e0)\" = 200 ] && grep -q '\"firewall\":\"missing\"' /tmp/wgla-e2e-body"
+systemctl start wgla-firewall.service
+check "what the timer runs puts the link's own back" "! nft list table inet wg_e2e0 | grep -q 10.97.0.0 && [ \"\$(api $URL/link/e2e0)\" = 200 ] && grep -q '\"firewall\":\"ok\"' /tmp/wgla-e2e-body"
+systemctl start wgla-firewall.timer
+systemctl restart wg-quick@e2e0
+check "a restart (PostUp) installs them again" "nft list table inet wg_e2e0 | grep -q 'iifname \"e2e0\" drop' && for i in \$(seq 25); do ip netns exec e2e-client ping -c1 -W1 10.98.0.2 && break; done && ! ip netns exec e2e-client ping -c1 -W2 10.97.0.2"
+check "everything as a destination is refused: that is a link without any" "[ \"\$(api -X PATCH $URL/link/e2e0 -d '{\"destinations\":[\"0.0.0.0/0\"]}')\" = 422 ] && [ \"\$(api -X PATCH $URL/link/e2e0 -d '{\"destinations\":[]}')\" = 422 ]"
+check "null takes them away: anywhere again" "[ \"\$(api -X PATCH $URL/link/e2e0 -d '{\"destinations\":null}')\" = 200 ] && grep -q '\"destinations\":null' /tmp/wgla-e2e-body && ip netns exec e2e-client ping -c1 -W3 10.97.0.2 && nft list table inet wg_e2e0 | grep -q 'iifname \"e2e0\" accept'"
 
 step "A FORWARD DROP policy like Docker or ufw set"
 # Docker and ufw bring iptables; a host without it has nothing that drops forwarded traffic
@@ -265,6 +292,52 @@ check "but not changed: that would drop its Table setting" "! \"\${ART[@]}\" wg:
 cli wg:link:delete e2e3 > /dev/null
 check "and can be deleted" "[ ! -e /etc/wireguard/e2e3.conf ]"
 
+step "A config the API before this one wrote, adopted in place"
+# As that API left a link: hooks of its own that masquerade what goes to the link's network,
+# peers with a /32 each, a client config per peer it made the keys for. (Its hooks used iptables;
+# these use nft, which wg-quick may run wherever AppArmor confines it.)
+LKEY=$(wg genkey); LPUB=$(echo "$LKEY" | wg pubkey)
+CKEY=$(wg genkey); CPUB=$(echo "$CKEY" | wg pubkey); CPSK=$(wg genpsk)
+# As the API's JSON has a key: with its slashes escaped
+CPUB_JSON=$(printf '%s' "$CPUB" | sed 's|/|\\/|g')
+OPUB=$(wg genkey | wg pubkey)
+{
+    printf '[Interface]\nAddress = 10.83.0.1/24\nListenPort = 51883\nPrivateKey = %s\n' "$LKEY"
+    printf '%s\n' "PostUp = nft add table ip e2e_legacy; nft 'add chain ip e2e_legacy post { type nat hook postrouting priority 100; }'; nft add rule ip e2e_legacy post ip daddr 10.98.0.0/24 oifname e2e-fh masquerade"
+    printf '%s\n' 'PostDown = nft delete table ip e2e_legacy'
+    printf '\n[Peer]\nPublicKey = %s\nPresharedKey = %s\nAllowedIPs = 10.83.0.2/32\n' "$CPUB" "$CPSK"
+    printf '\n[Peer]\nPublicKey = %s\nAllowedIPs = 10.83.0.3/32\n' "$OPUB"
+} > /etc/wireguard/e2e3.conf
+chmod 600 /etc/wireguard/e2e3.conf
+cp /etc/wireguard/e2e3.conf /tmp/wgla-e2e-legacy.conf
+mkdir -p /etc/wireguard/clients/e2e3
+printf '[Interface]\nPrivateKey = %s\nAddress    = 10.83.0.2/32\nDNS        = 8.8.8.8\n\n[Peer]\nPublicKey    = %s\nPresharedKey = %s\nAllowedIPs   = 10.98.0.0/24\n' "$CKEY" "$LPUB" "$CPSK" > /etc/wireguard/clients/e2e3/10.83.0.2.conf
+systemctl enable --now wg-quick@e2e3 > /dev/null 2>&1
+# Its client, with the config it has had all along
+ip netns exec e2e-client ip link add e2ec3 type wireguard
+printf '[Interface]\nPrivateKey = %s\n\n[Peer]\nPublicKey = %s\nPresharedKey = %s\nAllowedIPs = 0.0.0.0/0\nEndpoint = 10.99.0.1:51883\nPersistentKeepalive = 1\n' "$CKEY" "$LPUB" "$CPSK" \
+    | ip netns exec e2e-client wg setconf e2ec3 /dev/stdin
+ip netns exec e2e-client sh -c 'ip addr add 10.83.0.2/32 dev e2ec3; ip link set e2ec3 up; ip route add 10.83.0.0/24 dev e2ec3; ip route add 10.98.0.2/32 dev e2ec3; ip route add 10.97.0.2/32 dev e2ec3'
+check "it runs with its own hooks, and its client connects through it" "nft list table ip e2e_legacy | grep -q masquerade && ip netns exec e2e-client ping -c1 -W3 10.83.0.1 && ip netns exec e2e-client ping -c1 -W3 10.98.0.2"
+check "it is shown as not managed, and not changed" "[ \"\$(api $URL/link/e2e3)\" = 200 ] && grep -q '\"managed\":false' /tmp/wgla-e2e-body && [ \"\$(api -X PATCH $URL/link/e2e3 -d '{\"nat\":true}')\" = 409 ] && grep -q '\"code\":\"unmanaged_config\"' /tmp/wgla-e2e-body"
+check "a dry run says what would be kept and dropped" "cli wg:link:adopt e2e3 --dry-run --forward=true --nat=true --ifout=e2e-fh --destinations=10.98.0.0/24 > /tmp/wgla-e2e-dry && grep -q 'Dropped: PostUp ×1, PostDown ×1' /tmp/wgla-e2e-dry && grep -q '2 peers with their keys' /tmp/wgla-e2e-dry && grep -q \"Taken over: $CPUB\" /tmp/wgla-e2e-dry && grep -q \"Not here: $OPUB\" /tmp/wgla-e2e-dry"
+check "... and changes nothing" "cmp -s /etc/wireguard/e2e3.conf /tmp/wgla-e2e-legacy.conf && nft list table ip e2e_legacy | grep -q masquerade && ! nft list table inet wg_e2e3 && ! ls /etc/wireguard/clients/e2e3 | grep -qv '^10.83.0.2.conf\$'"
+check "what it can't carry over is refused by name" "sed -i 's/^ListenPort = 51883\$/ListenPort = 51883\\nTable = off/' /etc/wireguard/e2e3.conf && [ \"\$(api -X POST $URL/link/e2e3/adopt -d '{\"dry_run\":true}')\" = 409 ] && grep -q '\"code\":\"not_adoptable\"' /tmp/wgla-e2e-body && grep -q '(Table)' /tmp/wgla-e2e-body"
+cp /tmp/wgla-e2e-legacy.conf /etc/wireguard/e2e3.conf
+check "POST /link/{name}/adopt -> 200, managed, with whose keys were taken over" "[ \"\$(api -X POST $URL/link/e2e3/adopt -d '{\"forward\":true,\"nat\":true,\"ifout\":\"e2e-fh\",\"destinations\":[\"10.98.0.0/24\"]}')\" = 200 ] && grep -q '\"managed\":true' /tmp/wgla-e2e-body && grep -qF '\"imported\":[\"$CPUB_JSON\"]' /tmp/wgla-e2e-body && ! grep -qF \"$LKEY\" /tmp/wgla-e2e-body && ! grep -qF \"$CPSK\" /tmp/wgla-e2e-body"
+check "the same link: key, port, address, peers and their preshared key" "[ \"\$(wg show e2e3 public-key)\" = \"$LPUB\" ] && [ \"\$(wg show e2e3 listen-port)\" = 51883 ] && ip -4 addr show dev e2e3 | grep -q '10.83.0.1/24' && wg show e2e3 allowed-ips | grep -q \"$CPUB.*10.83.0.2/32\" && wg show e2e3 allowed-ips | grep -q \"$OPUB.*10.83.0.3/32\" && wg show e2e3 preshared-keys | grep -qF \"$CPSK\""
+check "its own PostDown took its rules along; the app's are in their place" "! nft list table ip e2e_legacy && nft list table inet wg_e2e3 | grep -q 'ip saddr 10.83.0.0/24 ip daddr 10.98.0.0/24 oifname \"e2e-fh\" masquerade'"
+check "its config is the app's now, and the old one is not kept" "grep -qx 'PostUp = $HELPER firewall-up %i %i' /etc/wireguard/e2e3.conf && ! grep -q e2e_legacy /etc/wireguard/e2e3.conf && [ \"\$(stat -c %a:%U /etc/wireguard/e2e3.conf)\" = 600:root ] && [ ! -e /etc/wireguard/.e2e3.conf.before-adopt ] && systemctl is-active -q wg-quick@e2e3 && systemctl is-enabled -q wg-quick@e2e3"
+check "its client reconnects with the config it has, and reaches the link's network" "for i in \$(seq 25); do ip netns exec e2e-client ping -c1 -W1 10.83.0.1 && break; done && ip netns exec e2e-client ping -c1 -W3 10.98.0.2"
+check "... and no other (destinations)" "! ip netns exec e2e-client ping -c1 -W2 10.97.0.2"
+check "the peer whose key the old API kept has a complete client config" "cli wg:peer e2e3 \"$CPUB\" | grep -qxF \"PrivateKey = $CKEY\" && cli wg:peer e2e3 \"$CPUB\" | grep -qx 'Address = 10.83.0.2/32'"
+check "the other is a peer with a key of its own" "! cli wg:peer e2e3 \"$OPUB\" | grep -q '^PrivateKey'"
+check "it is a link like any other now" "cli wg:peer:create e2e3 > /dev/null && [ \"\$(wg show e2e3 peers | wc -l)\" = 3 ]"
+check "adopting it again -> 409 already_managed" "[ \"\$(api -X POST $URL/link/e2e3/adopt -d '{}')\" = 409 ] && grep -q '\"code\":\"already_managed\"' /tmp/wgla-e2e-body"
+ip netns exec e2e-client ip link del e2ec3
+cli wg:link:delete e2e3 > /dev/null
+check "deleted like any other, with its old client configs" "[ ! -e /etc/wireguard/e2e3.conf ] && [ ! -e /etc/wireguard/clients/e2e3 ] && ! nft list table inet wg_e2e3"
+
 step "A WireGuard interface that something else started"
 ip link add e2ex type wireguard
 check "is listed and shown" "cli wg:links | grep -qw e2ex && cli wg:link e2ex | grep -q 'Interface: e2ex'"
@@ -273,13 +346,16 @@ check "and it isn't 'deleted' while it runs on" "! \"\${ART[@]}\" wg:link:delete
 ip link del e2ex
 
 step "HTTP API ($URL)"
-check "a link that isn't there -> 404" "[ \"\$(api $URL/link/e2enone)\" = 404 ]"
+check "a link that isn't there -> 404 link_not_found" "[ \"\$(api $URL/link/e2enone)\" = 404 ] && grep -q '\"code\":\"link_not_found\"' /tmp/wgla-e2e-body"
+check "a peer that isn't there -> 404 peer_not_found" "[ \"\$(api $URL/link/e2e0/peer/\$(safe \"\$(wg genkey | wg pubkey)\"))\" = 404 ] && grep -q '\"code\":\"peer_not_found\"' /tmp/wgla-e2e-body"
+check "a route that isn't there -> 404 route_not_found" "[ \"\$(api $URL/nope)\" = 404 ] && grep -q '\"code\":\"route_not_found\"' /tmp/wgla-e2e-body"
+check "a malformed name or key in a change -> 422, not 404" "[ \"\$(api -X DELETE $URL/link/no.such.link)\" = 422 ] && grep -q '\"code\":\"invalid_input\"' /tmp/wgla-e2e-body && [ \"\$(api -X DELETE $URL/link/e2e0/peer/not-a-key)\" = 422 ]"
 check "GET /link has the interface, no private key" "[ \"\$(api $URL/link/e2e0)\" = 200 ] && grep -q '\"interface\":\"e2e0\"' /tmp/wgla-e2e-body && ! grep -q private_key /tmp/wgla-e2e-body"
 check "POST /link -> 201" "[ \"\$(api -X POST $URL/link -d '{\"name\":\"e2e2\",\"ip\":\"10.82.0.1/24\",\"port\":51882}')\" = 201 ]"
 check "a port clash -> 409" "[ \"\$(api -X POST $URL/link -d '{\"name\":\"e2e3\",\"ip\":\"10.83.0.1/24\",\"port\":51882}')\" = 409 ]"
 check "a line break in dns -> 422" "[ \"\$(api -X POST $URL/link -d '{\"name\":\"e2e3\",\"ip\":\"10.83.0.1/24\",\"dns\":\"1.1.1.1\\\\nPostUp = id\"}')\" = 422 ]"
 check "a misspelled field -> 422, not a silent 200" "[ \"\$(api -X PATCH $URL/link/e2e0 -d '{\"forwrad\":true}')\" = 422 ] && grep -q 'Unknown field: forwrad' /tmp/wgla-e2e-body"
-check "no API key -> 403" "[ \"\$(curl -s ${CURL_OPTS[*]} -o /dev/null -w '%{http_code}' $URL/links)\" = 403 ]"
+check "no API key -> 403 unauthorized" "[ \"\$(curl -s ${CURL_OPTS[*]} -o /tmp/wgla-e2e-body -w '%{http_code}' $URL/links)\" = 403 ] && grep -q '\"code\":\"unauthorized\"' /tmp/wgla-e2e-body"
 check "DELETE /link/e2e2 -> 200" "[ \"\$(api -X DELETE $URL/link/e2e2)\" = 200 ]"
 
 step "Backup and restore"

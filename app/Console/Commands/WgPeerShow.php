@@ -21,13 +21,11 @@ class WgPeerShow extends WgCommand
         $pubkey = $this->argument('pubkey');
 
         try {
-            $peer = $wg->getPeer($link, $pubkey);
-            $config = $peer === null ? null : $wg->getPeerConfig($link, $pubkey);
+            // Says which isn't there, the link or the peer
+            $peer = $wg->peerOrFail($link, $pubkey);
+            $config = $wg->getPeerConfig($link, $pubkey);
         } catch (\Throwable $e) {
-            return $this->failed($e->getMessage());
-        }
-        if ($peer === null) {
-            return $this->failed("Peer {$pubkey} not found on {$link}.");
+            return $this->failed($e);
         }
 
         if ($this->option('qr') && ! $this->json()) {
@@ -37,7 +35,7 @@ class WgPeerShow extends WgCommand
                     ?? throw new \InvalidArgumentException("There is no client config of a peer of {$link}: it runs without a config here.");
                 $this->line(app(QrCode::class)->terminal($config));
             } catch (\InvalidArgumentException $e) {
-                return $this->failed($e->getMessage());
+                return $this->failed($e);
             }
 
             return Command::SUCCESS;

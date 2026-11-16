@@ -17,7 +17,7 @@ class WgLinkDelete extends WgCommand
         try {
             $wg->deleteLink($name);
         } catch (\Throwable $e) {
-            return $this->failed($e->getMessage());
+            return $this->failed($e);
         }
 
         return $this->respond(['message' => "Deleted link: {$name}"], fn () => $this->info("Deleted link {$name}"));

@@ -82,7 +82,8 @@ it('keeps .env values out of the process environment, so a reload picks up chang
 });
 
 it('shows only health publicly, and status and IP behind the API key', function () {
-    $this->getJson('/health')->assertOk()->assertExactJson(['status' => 'ok']);
+    // Who answers, too: a client can tell it is one of these servers before it sends its API key
+    $this->getJson('/health')->assertOk()->assertExactJson(['status' => 'ok', 'app' => 'wgla']);
 
     $this->getJson('/status')->assertForbidden();
     $this->getJson('/ip')->assertForbidden();
@@ -92,7 +93,7 @@ it('shows only health publicly, and status and IP behind the API key', function 
 it('reports itself unavailable when the root helper is not usable', function () {
     config(['wireguard.helper' => '/nonexistent/wgla-helper']);
 
-    $this->getJson('/health')->assertStatus(503)->assertExactJson(['status' => 'unavailable']);
+    $this->getJson('/health')->assertStatus(503)->assertExactJson(['status' => 'unavailable', 'app' => 'wgla']);
 });
 
 it('rejects requests without the right API key', function () {
@@ -358,17 +359,113 @@ it('maps errors to status codes with a message', function () {
     $this->deleteJson('/link/wg0', [], $this->auth)->assertOk();
 });
 
-it('answers every error as {"error": …}, whoever refuses the request', function () {
-    $this->getJson('/links')->assertForbidden()->assertExactJson(['error' => 'Access denied.']);
-    $this->putJson('/links', [], $this->auth)->assertStatus(405)->assertJsonStructure(['error'])->assertJsonMissingPath('message');
-    $this->getJson('/nope', $this->auth)->assertNotFound()->assertJsonStructure(['error']);
+it('answers every error as {"error": …, "code": …}, whoever refuses the request', function () {
+    $this->getJson('/links')->assertForbidden()->assertExactJson(['error' => 'Access denied.', 'code' => 'unauthorized']);
+    $this->putJson('/links', [], $this->auth)->assertStatus(405)->assertJsonStructure(['error'])->assertJsonPath('code', 'method_not_allowed')->assertJsonMissingPath('message');
+    // No such route is not a link or a peer that isn't there
+    $this->getJson('/nope', $this->auth)->assertNotFound()->assertJsonStructure(['error'])->assertJsonPath('code', 'route_not_found');
+    $this->getJson('/link/wg0/nope', $this->auth)->assertNotFound()->assertJsonPath('code', 'route_not_found');
 
     // A request that fails its field rules also says which fields
     $this->postJson('/link', ['name' => 'wg0', 'port' => 'high'], $this->auth)
         ->assertUnprocessable()
         ->assertJsonPath('error', 'The ip field is required.')
+        ->assertJsonPath('code', 'invalid_input')
         ->assertJsonPath('errors.port.0', 'The port field must be an integer.')
         ->assertJsonMissingPath('message');
+});
+
+it('tells a link or a peer that is not there from everything else that answers 404', function () {
+    $this->postJson('/link', ['name' => 'wg0', 'ip' => '10.0.0.1/24', 'port' => 51820], $this->auth)->assertCreated();
+    $safe = KeyManager::pubkeyToSafe($this->postJson('/link/wg0/peers', [], $this->auth)->json('public_key'));
+    $nobody = KeyManager::pubkeyToSafe((new KeyManager)->pubkey((new KeyManager)->genkey()));
+    $answers = fn (string $method, string $uri, array $body = []) => $this->json($method, $uri, $body, $this->auth)->assertNotFound()->json('code');
+
+    // The link isn't there, whatever is asked of it or of a peer of it
+    foreach ([['GET', '/link/wg9'], ['PATCH', '/link/wg9', ['dns' => '1.1.1.1']], ['PATCH', '/link/wg9'], ['DELETE', '/link/wg9'], ['POST', '/link/wg9/repair'], ['POST', '/link/wg9/rekey'],
+        ['POST', '/link/wg9/adopt'], ['GET', '/link/wg9/peers'], ['POST', '/link/wg9/peers'], ['GET', "/link/wg9/peer/{$safe}"], ['GET', "/link/wg9/peer/{$safe}/config"],
+        ['GET', "/link/wg9/peer/{$safe}/qr"], ['PATCH', "/link/wg9/peer/{$safe}", ['name' => 'x']], ['PATCH', "/link/wg9/peer/{$safe}"], ['DELETE', "/link/wg9/peer/{$safe}"],
+        ['POST', "/link/wg9/peer/{$safe}/rekey"]] as $request) {
+        expect($answers(...$request))->toBe('link_not_found', implode(' ', array_slice($request, 0, 2)));
+    }
+    $this->getJson('/link/wg9', $this->auth)->assertJsonPath('error', 'Link does not exist: wg9');
+
+    // The link is there, the peer is not
+    foreach ([['GET', "/link/wg0/peer/{$nobody}"], ['GET', "/link/wg0/peer/{$nobody}/config"], ['GET', "/link/wg0/peer/{$nobody}/qr"], ['PATCH', "/link/wg0/peer/{$nobody}", ['name' => 'x']],
+        ['PATCH', "/link/wg0/peer/{$nobody}"], ['DELETE', "/link/wg0/peer/{$nobody}"], ['POST', "/link/wg0/peer/{$nobody}/rekey"]] as $request) {
+        expect($answers(...$request))->toBe('peer_not_found', implode(' ', array_slice($request, 0, 2)));
+    }
+
+    // What can't be a link or a key is simply not there either, to a read
+    expect($answers('GET', '/link/no.such.link'))->toBe('link_not_found')
+        ->and($answers('GET', '/link/no.such.link/peers'))->toBe('link_not_found')
+        ->and($answers('GET', '/link/wg0/peer/not.a.key'))->toBe('peer_not_found')
+        ->and($answers('GET', '/link/wg0/peer/not.a.key/config'))->toBe('peer_not_found');
+});
+
+it('answers a malformed link name or public key in a change with 422, not 404', function (string $method, string $uri, array $body = []) {
+    $this->postJson('/link', ['name' => 'wg0', 'ip' => '10.0.0.1/24', 'port' => 51820], $this->auth)->assertCreated();
+    $safe = KeyManager::pubkeyToSafe($this->postJson('/link/wg0/peers', [], $this->auth)->json('public_key'));
+    $before = $this->host->conf('wg0');
+
+    $this->json($method, str_replace('{peer}', $safe, $uri), $body, $this->auth)->assertUnprocessable()->assertJsonPath('code', 'invalid_input');
+
+    expect($this->host->conf('wg0'))->toBe($before);
+})->with([
+    'deleting a link' => ['DELETE', '/link/no.such.link'],
+    'changing a link' => ['PATCH', '/link/no.such.link', ['dns' => '1.1.1.1']],
+    'changing nothing of a link' => ['PATCH', '/link/no.such.link'],
+    'repairing a link' => ['POST', '/link/no.such.link/repair'],
+    'new keys for a link' => ['POST', '/link/no.such.link/rekey'],
+    'adopting a link' => ['POST', '/link/no.such.link/adopt'],
+    'a name too long for an interface' => ['DELETE', '/link/a-name-of-sixteen'],
+    'adding a peer' => ['POST', '/link/no.such.link/peers'],
+    'a peer of such a link' => ['DELETE', '/link/no.such.link/peer/{peer}'],
+    'changing a peer' => ['PATCH', '/link/wg0/peer/not.a.key', ['name' => 'x']],
+    'changing nothing of a peer' => ['PATCH', '/link/wg0/peer/not-a-key'],
+    'deleting a peer' => ['DELETE', '/link/wg0/peer/not-a-key'],
+    'new keys for a peer' => ['POST', '/link/wg0/peer/AAAA/rekey'],
+]);
+
+it('gives each kind of refusal its code', function () {
+    $this->postJson('/link', ['name' => 'wg0', 'ip' => '10.0.0.1/24', 'port' => 51820], $this->auth)->assertCreated();
+    $this->host->confs['office'] = handWrittenConf();
+    $this->host->addUnmanagedInterface('wg9');
+
+    $this->postJson('/link', ['name' => 'wg0', 'ip' => '10.1.0.1/24'], $this->auth)->assertConflict()->assertJsonPath('code', 'conflict');
+    $this->postJson('/link', ['name' => 'wg1', 'ip' => '10.1.0.1/24', 'port' => 51820], $this->auth)->assertConflict()->assertJsonPath('code', 'conflict');
+    $this->patchJson('/link/office', ['dns' => '1.1.1.1'], $this->auth)->assertConflict()->assertJsonPath('code', 'unmanaged_config')
+        ->assertJsonPath('error', fn (string $error) => str_contains($error, 'wgla link:adopt office --dry-run'));
+    $this->postJson('/link/office/peers', [], $this->auth)->assertConflict()->assertJsonPath('code', 'unmanaged_config');
+    $this->deleteJson('/link/wg9', [], $this->auth)->assertConflict()->assertJsonPath('code', 'unmanaged_interface');
+    $this->postJson('/link/wg9/adopt', [], $this->auth)->assertConflict()->assertJsonPath('code', 'unmanaged_interface');
+    $this->postJson('/link', ['name' => 'wg1', 'ip' => 'nowhere'], $this->auth)->assertUnprocessable()->assertJsonPath('code', 'invalid_input');
+    $this->patchJson('/link/wg0', ['forwrad' => true], $this->auth)->assertUnprocessable()->assertJsonPath('code', 'invalid_input');
+
+    for ($i = 0; $i < AuthenticateByApiKey::ATTEMPTS; $i++) {
+        $this->getJson('/links', ['api-key' => 'guess'])->assertForbidden()->assertJsonPath('code', 'unauthorized');
+    }
+    $this->getJson('/links', ['api-key' => 'guess'])->assertStatus(429)->assertJsonPath('code', 'rate_limited');
+});
+
+it('answers a host that fails with 500 system_error, never with a link that is not there', function () {
+    $this->postJson('/link', ['name' => 'wg0', 'ip' => '10.0.0.1/24', 'port' => 51820], $this->auth)->assertCreated();
+    $safe = KeyManager::pubkeyToSafe($this->postJson('/link/wg0/peers', [], $this->auth)->json('public_key'));
+
+    // The interface is there, but can't be read (`wg show … dump` fails): this used to be a 404
+    $this->host->shell->on('sudo -n :helper dump :iface', fn () => throw new CommandFailed('Unable to access interface: Operation not permitted'));
+    foreach (['/link/wg0', '/link/wg0/peers', "/link/wg0/peer/{$safe}", "/link/wg0/peer/{$safe}/config"] as $route) {
+        $this->getJson($route, $this->auth)->assertInternalServerError()->assertJsonPath('code', 'system_error')
+            ->assertJsonPath('error', 'Unable to access interface: Operation not permitted');
+    }
+    $this->patchJson("/link/wg0/peer/{$safe}", ['name' => 'x'], $this->auth)->assertInternalServerError()->assertJsonPath('code', 'system_error');
+
+    // The helper itself failing, and anything nobody saw coming: the same shape, without its details
+    config(['app.debug' => false]);
+    $this->host->shell->on('sudo -n :helper interfaces', fn () => throw new CommandFailed('sudo: a password is required'));
+    $this->getJson('/link/wg0', $this->auth)->assertInternalServerError()->assertJsonPath('code', 'system_error');
+    $this->host->shell->on('sudo -n :helper interfaces', fn () => throw new LogicException('a bug with /etc/wireguard/wg0.conf in its message'));
+    $this->getJson('/links', $this->auth)->assertInternalServerError()->assertExactJson(['error' => 'Internal server error.', 'code' => 'system_error']);
 });
 
 it('has no public route but /health', function () {

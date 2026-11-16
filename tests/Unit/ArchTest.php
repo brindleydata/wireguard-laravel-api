@@ -13,6 +13,7 @@ arch('frontends only use the WireGuard, Server and Backup services')
         'App\Services\Backup',
         'App\Services\QrCode', // presentation only: no system access
         'App\DTOs',
+        'App\Exceptions', // what the services throw: the frontends turn it into a status, an exit code and a `code`
         'App\Console\Commands', // the WgCommand base class
         'App\Setup', // wg:install / wg:update: setting up the host is their job
         'Laravel\Prompts',

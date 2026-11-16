@@ -176,6 +176,34 @@ class WireGuardValidator
         return array_values(array_unique($result));
     }
 
+    /**
+     * Where traffic out of a link's tunnel may go, and what its NAT covers: a comma-separated
+     * list of networks of either family. Returns them as the firewall lists them: network
+     * addresses with their mask (10.1.0.5/16 → 10.1.0.0/16, a bare address is a host), without
+     * duplicates. Not everything (/0): a link reaches anywhere when it has no destinations.
+     *
+     * @return list<string>
+     */
+    public function destinations(string $destinations): array
+    {
+        $this->validateAllowedIps($destinations);
+
+        $result = [];
+        foreach ($this->entries($destinations) as $entry) {
+            $network = IpAllocator::networkCidr($entry);
+            if (IpAllocator::isDefaultRoute($network)) {
+                throw new InvalidArgumentException("{$entry} is every address: a link without destinations reaches anywhere already, so leave them out (null) for that.");
+            }
+            // inet_ntop() writes an IPv4 address inside an IPv6 one with dots, which no firewall rule takes
+            if (str_contains($network, ':') && str_contains($network, '.')) {
+                throw new InvalidArgumentException("{$entry} is an IPv4 address written as an IPv6 one: give the IPv4 network.");
+            }
+            $result[] = $network;
+        }
+
+        return array_values(array_unique($result));
+    }
+
     public function validatePort(int $port): void
     {
         if ($port < 1 || $port > 65535) {

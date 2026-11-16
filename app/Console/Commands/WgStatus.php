@@ -25,7 +25,7 @@ class WgStatus extends WgCommand
             $ip = $server->ip();
             $interfaces = $server->interfaces();
         } catch (\Throwable $e) {
-            return $this->failed($e->getMessage());
+            return $this->failed($e);
         }
         $helper = $status->helper;
 
