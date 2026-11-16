@@ -17,7 +17,7 @@ cd /srv/wgla && composer install --no-dev --optimize-autoloader
 php artisan wg:install
 ```
 
-This needs PHP 8.5+ with `sodium`, `mbstring` and `dom`, Composer and git. The installer adds the rest. For each step it checks the machine, shows the commands that would fix it, then runs them (with `sudo`), lets you run them yourself, or skips the step:
+This needs PHP 8.5+ with the `sodium` extension, Composer and git. The installer adds the rest. For each step it checks the machine, shows the commands that would fix it, then runs them (with `sudo`), lets you run them yourself, or skips the step:
 
 | Step | Sets up |
 |------|---------|
