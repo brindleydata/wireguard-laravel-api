@@ -123,12 +123,15 @@ class Installer
         }
     }
 
-    /** Make sure sudo works for the checks and fixes: ask for the password once, or require it to be passwordless. */
+    /**
+     * Make sure sudo works for the checks and fixes: passwordless as it is, or by asking for the
+     * password once. Never `sudo -v` first: it asks unless every sudoers entry of the user has
+     * NOPASSWD (verifypw defaults to `all`), also where no command needs a password.
+     */
     public function sudoReady(bool $interactive): bool
     {
-        return $interactive
-            ? $this->shell->interactive('sudo -v') === 0
-            : $this->shell->tryRun('sudo -n true') !== null;
+        return $this->shell->tryRun('sudo -n true') !== null
+            || ($interactive && $this->shell->interactive('sudo -v') === 0);
     }
 
     public function run(Action $action, Context $ctx): bool

@@ -133,6 +133,30 @@ it('needs passwordless sudo to fix things without asking', function () {
         ->assertFailed();
 });
 
+it('asks for no password where sudo needs none, though `sudo -v` would', function () {
+    // `sudo -v` wants a password unless every sudoers entry of the user has NOPASSWD (verifypw
+    // defaults to `all`): not with `%wheel ALL=(ALL) ALL` beside `deploy ALL=(ALL) NOPASSWD: ALL`,
+    // where every command runs without one
+    $this->installer->steps = [];
+    setupShell($this->shell)->on('sudo -n true', fn () => '');
+
+    $this->artisan('wg:install')->assertSuccessful();
+
+    expect($this->shell->interactive)->toBe([], 'sudo -v never ran');
+});
+
+it('asks for the sudo password once where sudo needs one', function () {
+    $this->installer->steps = [];
+    setupShell($this->shell)->on('sudo -n true', fn () => throw new CommandFailed('sudo: a password is required'));
+
+    $this->artisan('wg:install')->assertSuccessful();
+    expect($this->shell->interactive)->toBe(['sudo -v']);
+
+    // A wrong password, or none given
+    $this->shell->onInteractive(fn () => 1);
+    $this->artisan('wg:install')->expectsOutputToContain('This needs sudo.')->assertFailed();
+});
+
 it('names a missing answer in non-interactive runs', function () {
     setupShell($this->shell);
 
